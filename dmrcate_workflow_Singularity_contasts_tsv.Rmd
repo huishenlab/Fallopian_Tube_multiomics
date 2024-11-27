@@ -1,0 +1,2181 @@
+---
+title: "DMRcate Workflow - Singularity - contrasts.tsv - Canary"
+author: "Ian Beddows"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+params:
+  rmd: ""
+output:
+  html_document:
+    dev: png
+    code_folding: hide
+    self_contained: yes
+    toc: true
+    toc_depth: 2
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    df_print: paged
+    css: styles.css
+    editor_options: 
+      chunk_output_type: console
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(yaml)
+  library(xtable)
+  library(kableExtra)
+  library(tidyverse)
+  library(reshape2)
+  library(matrixStats)
+  library(ggplot2)
+  library(ggrepel)
+  # library(biscuiteer)
+  library(patchwork)
+  library(ggrepel)
+  library(bsseq)
+  library(ComplexHeatmap)
+  library(DMRcate)
+  library(Gviz)
+  # library(tictoc)
+  library(BiocParallel) # for BSmooth
+})
+
+meta <- as.data.frame(readRDS('meta_N103.Rds'))
+
+
+# important to establish 'group' variable for BRCA_v_NON contrast
+meta$group <- ifelse(meta$groupBRCA=='NON-BRCA','NON-BRCA','BRCAmut')
+
+
+# now make the new groups, given what we know about composition, LMP and pre/post being the major drivers
+
+# set up a new group for the Black vs. white without pregnant people
+useThese <- dplyr::filter(meta,groupBRCA=='NON-BRCA' & is.na(LMP_explanation))$sample
+meta$tmpContrast <- ifelse(meta$sample %in% useThese,'use','no_use')
+useThese1 <- dplyr::filter(meta,is.na(LMP_explanation))$sample
+meta$tmpContrast2 <- ifelse(meta$sample %in% useThese1,'use','no_use')
+# table(meta$tmpContrast)
+# table(meta$tmpContrast2)
+
+# make the sample the SVC
+meta$sample <- meta$SVC
+
+#git clone https://github.com/ianbed/biscuiteer_adjacent_R_functions.git
+
+source("biscuiteer_adjacent_R_functions/methFunctions.R")
+config <- yaml::yaml.load_file("../Biscuit_Snakemake_Workflow/config/config.yaml")
+
+# get_contrasts
+
+contrast_master.df <- read.delim('contrasts.tsv',sep="\t")
+
+cat(nrow(contrast_master.df),'contrasts available!\n')
+
+index2run <- c(6,8,10)
+###
+
+
+# cat(paste0("\n\n## Diff. Expr.",identifiers[index2grep]), "\n\n")
+# print(cat("Running contrasts for",identifiers[index2grep],"\n"))
+print(cat("Running contrasts:\n"))
+
+DT::datatable(contrast_master.df[index2run,])
+
+```
+
+# Find DMRs {.tabset}
+
+COMMANDS TO RUN THIS WITH SINGULARITY (uncomment):
+
+<!-- TWO COMMANDS BETTER THAN NONE -->
+
+/varidata/research/software/singularity/singularity-ce-3.8.2/bin/singularity shell -B /varidata/researchtemp/hpctmp/ian.beddows/R_local_lib_4.1/:/usr/local/lib/R/site-library -B /varidata/researchtemp/hpctmp/ian.beddows/canary_WGBS_snakemake/:/home/ian.beddows/ /varidata/researchtemp/hpctmp/ian.beddows/latest_bioconductor_singularity.sif
+
+R -e "rmarkdown::render('canary_meth_Rproj/dmrcate_workflow_Singularity_contasts_tsv.Rmd')"
+
+<!-- ### -->
+
+<!-- ### -->
+
+<!-- ONE COMMAND TO RULE THEM ALL -->
+
+/varidata/research/software/singularity/singularity-ce-3.8.2/bin/singularity exec -B /varidata/researchtemp/hpctmp/ian.beddows/R_local_lib_4.1/:/usr/local/lib/R/site-library -B /varidata/researchtemp/hpctmp/ian.beddows/canary_WGBS_snakemake/:/home/ian.beddows/ /varidata/researchtemp/hpctmp/ian.beddows/latest_bioconductor_singularity.sif R -e "rmarkdown::render("canary_meth_Rproj/dmrcate_workflow_Singularity_contasts_tsv.Rmd")"
+
+
+```{r make_BSSEQ,eval=TRUE}
+
+# contrast.name <- 'N85' # pilot B & C
+# contrast.name <- 'N18' # pilot D
+contrast.name <- 'N103' # pilot B-D
+# sampNames <- meta$sample
+sampNames <- dplyr::filter(meta,Pilot=='D')$sample
+myRDSunion <- paste0(contrast.name,"_bsseq.Rds")
+# myRDSunionSmooth <- paste0(contrast.name,"smoothed_bsseq.Rds")
+
+myBS <- NULL
+if(!file.exists(myRDSunion)){
+  for(i in 1:length(sampNames)){
+    print(cat('sample',sampNames[i],i,"\n"))
+    bs_list <- biscuiteer::readBiscuit(
+      BEDfile = paste0('../Biscuit_Snakemake_Workflow/analysis/pileup/',sampNames[i],"_mergecg.bed.gz"),
+      VCFfile = paste0('../Biscuit_Snakemake_Workflow/analysis/pileup/',sampNames[i],".vcf.gz"),          genome = config$ref$fasta,
+      merged = TRUE,
+      which = NULL
+    )
+    if(i==1 & is.null(myBS)){
+      myBS <- bs_list
+    }else{
+      myBS <- biscuiteer::unionize(myBS,bs_list)
+    }
+  
+    
+  } # go to next sample
+  
+  colnames(myBS) <- gsub('.sorted.markdup','',colnames(myBS))
+  saveRDS(object = myBS,file = myRDSunion)
+}else{
+  # load file that exists
+  myBS <- readRDS(myRDSunion)
+  
+  # smooth and resave
+  # library(BiocParallel)
+  # myBSmooth <- BSmooth(myBS,BPPARAM = MulticoreParam(workers = 25)) 
+  # saveRDS(object = myBSmooth,file = myRDSunionSmooth)
+  
+}
+
+class(myBS)
+
+# make some checks
+
+stopifnot(all(colnames(myBS)%in%meta$sample))
+if(!all(colnames(myBS)==meta$sample)){
+  meta <- meta[match(colnames(myBS),meta$sample),]
+  # meta$sample[match(colnames(myBS),meta$sample)]==colnames(myBS)
+}
+stopifnot(all(colnames(myBS)==meta$sample))
+```
+
+```{r getChromosomeInfo,results='asis',fig.height=7,fig.width=7}
+
+# step 1, read in biscuit
+# chromsDF <- GenomeInfoDb::getChromInfoFromUCSC(genome = 'hg19')[1:25,] # hg388 not working but surprisingly # of chromosomes hasn't changed ;)
+
+# saveRDS(chromsDF,file='chromsDF.Rds')
+chromsDF <- readRDS('chromsDF.Rds')
+chroms <- unique(chromsDF$chr)
+
+
+```
+
+Try with bsseq:findDMRs instead - 12/20/22 -- gave similar results DMRcate failed to find any Race-based differences
+
+```{r dmrcate.masterChunk,results='asis',fig.height=7,fig.width=7,eval=TRUE}
+
+for(i in index2run){
+
+  groupRelative <- contrast_master.df[i,'relative']; print(cat(paste('Group Relative:',groupRelative,"\n")))
+  groupBaseline <- contrast_master.df[i,'baseline']; print(cat(paste('Group Baseline:',groupBaseline,"\n")))
+  groupColumn <- contrast_master.df[i,'meta_col']
+  groupColumnIndex <- which(colnames(meta)==groupColumn); stopifnot(length(groupColumnIndex)==1)
+  filterColumn <- contrast_master.df[i,'filterColumn']
+  filterColumnIndex <- which(colnames(meta)==filterColumn); stopifnot(length(filterColumnIndex)==1)
+  contrast.name = contrast_master.df[i,'name']
+  cat(paste0("\n\n## ",contrast.name), "\n\n")
+  samplesInIndex <- which(meta[,groupColumnIndex] %in% c(groupRelative,groupBaseline) & meta[,filterColumnIndex] == contrast_master.df[i,'filterArg'])
+  .meta <- droplevels(meta[samplesInIndex,])
+  dim(.meta)
+ table(unlist(.meta[,groupColumnIndex]),unlist(.meta[,filterColumnIndex]))
+  # done getting information for the contrast
+  # now go through each chromosome
+    
+  for(chr in chroms){
+    # Subset the BS to correct chromosome
+    ..myBS <- myBS[seqnames(myBS) == chr]
+    
+    
+    ### FILTER THE BSSEQ FOR ADEQUATE COVERAGE IN OUR SAMPLES, >  
+    # keep <- which(
+    #   apply(getCoverage(..myBS,type='Cov'),1,FUN=function(x){return(round(length(which(is.na(x)))/length(x),2))}) < 0.2 # <20% missing data
+    # )
+    # 
+    # .myBS <- ..myBS[keep,]
+    ###
+    ###
+    ### Configure the contrast
+    ###
+    ###
+  
+    .myBS <- ..myBS #@$%%&##
+    pData(.myBS) <- meta
+    rownames(colData(.myBS)) <- meta$sample # needed for DMRcate::sequencing.annotate
+    
+    # subset to correct samples
+    .myBS <- .myBS[,colData(.myBS)$sample %in% .meta$sample]
+  
+    
+    # The DMRcate experimental setup mirrors that of limma, so all you have to do is pass your design matrix (with covariates), contrast matrix (optional) and coefficient of interest to cpg.annotate(), which contains the calls to lmFit() and contrasts.fit() internally. So if you have a binary contrast "mytype" with types "1" and "2" and your covariates "mycovariate1", "mycovariate2" and so on, some boilerplate would be:
+    # design = model.matrix(formula(paste("~0 + ",groupColumn," + MIR200cAvgBeta")),  data = .meta)
+    if(i %in% 1:4){
+      # design = model.matrix(formula(paste("~0 + ",groupColumn," + MIR200cAvgBeta + ReproductiveStatus + Race")),  data = .meta) # this is the contrast used for BRCA group diffs. Dec 20 2022
+      # design = model.matrix(formula(paste("~0 + ",groupColumn)),  data = .meta) # this is the contrast used for null model to match rna+protein
+      design = model.matrix(formula(paste("~0 + ",groupColumn," + MIR200cAvgBeta")),  data = .meta) # this is the contrast used for BRCA group diffs. Sep 5 2023
+    }else if(i==5){
+      design = model.matrix(formula(paste("~0 + ",groupColumn," + MIR200cAvgBeta + ReproductiveStatus")),  data = .meta) # this is the contrast used for racial diffs. Dec 20 2022
+    }else if(i==6){ # this is the pre vs. post null model
+      design = model.matrix(formula(paste("~0 + ",groupColumn)),  data = .meta)
+    }else if(i %in% c(8,9,10)){
+      design = model.matrix(formula(paste("~0 + ",groupColumn," + MIR200cAvgBeta")),  data = .meta)
+    }else if(i==10){
+      design = model.matrix(formula(paste("~0 + ",groupColumn," + MIR200cAvgBeta + Race")),  data = .meta)
+    }
+    stopifnot(paste0(groupColumn,groupRelative) %in% colnames(design))
+    
+    colnames(design) <- gsub(groupColumn,'',colnames(design)); colnames(design) <- make.names(colnames(design))
+    
+    
+    methdesign <- edgeR::modelMatrixMeth(design)
+    
+    methdesign
+   
+    cont.mat = limma::makeContrasts(
+        paste(make.names(groupRelative),'-',make.names(groupBaseline)),
+        levels=methdesign
+    )
+    
+    seq_annot_FILE <- paste0("seq_annot.",contrast.name,"_",chr,".Rds")
+    if(!file.exists(seq_annot_FILE)){
+      seq_annot <- DMRcate::sequencing.annotate(.myBS, 
+                                                methdesign, 
+                                                all.cov = TRUE,
+                                                contrasts = TRUE, 
+                                                cont.matrix = cont.mat,
+                                                coef = paste(make.names(groupRelative),'-',make.names(groupBaseline)),
+                                                fdr=0.05
+      )
+      
+      # change FDR of CpGannotated class after the fact
+      # seq_annot <- changeFDR(seq_annot, 0.01)  
+      
+      print(
+        seq_annot
+      )
+      
+      saveRDS(object = seq_annot,file = seq_annot_FILE)
+      
+    }else{
+      seq_annot <- readRDS(seq_annot_FILE)
+      cat("Loaded seq_annot from:",seq_annot_FILE,"\n")
+      print(
+        seq_annot
+      )
+      print(paste("Found",length(which(seq_annot@ranges$is.sig==TRUE)),"Significant CpGs on chr",chr,"\n"))
+    }
+    
+    if((length(which(seq_annot@ranges$is.sig==TRUE))>1) & !file.exists(paste0("dmr.ranges.",contrast.name,"_",chr,".Rds"))){
+      dmrcate.res <- dmrcate(seq_annot,
+                             C=2, 
+                             betacutoff=0.1,# doesn't work for bsseq
+                             min.cpgs = 1
+      )
+      
+      saveRDS(dmrcate.res,paste0("dmrcate.res.",contrast.name,"_",chr,".Rds"))
+      
+      print(
+        dmrcate.res
+      )
+      if(length(dmrcate.res@coord)){
+        dmr.ranges <- extractRanges(dmrcate.res,genome='hg38')
+        saveRDS(dmr.ranges,paste0("dmr.ranges.",contrast.name,"_",chr,".Rds"))
+        # dmr.ranges <- readRDS(paste0("dmr.ranges.",contrast.name,".Rds"))
+        cols <- as.character(
+          plyr::mapvalues(
+            .meta[,groupColumnIndex], unique(.meta[,groupColumnIndex]),
+            # viridis::rocket(n=length(unique(BRCA_status_for_model))))
+            # viridis::mako(n=4)[c(2,4)]
+            c('#38AAACFF','#342346FF')
+          )
+        )
+        names(cols) <- .meta[,groupColumnIndex]
+        
+        print(cat("\n\n"))
+        
+        
+        # THIS IS NOT WORKING BECAUSE GVIZ NOT PLAYING NICELY WITH DMRCATE
+        
+        # for(i in 1:length(dmr.ranges)){
+          # print(
+  
+          ##### This is not working due to Gviz Ideogram track not
+          ##### fetching the chromosomes correctly
+          options(ucscChromosomeNames=FALSE)
+          # dmr.plot.modified( # from methFunctions.R
+          #     ranges=dmr.ranges,
+          #     dmr = i,
+          #     CpGs=myBS, # A BSseq object containing per-CpG methylation and coverage counts for the samples to be plotted
+          #     phen.col = cols,
+          #     genome="hg38"#,
+          #     # what="Beta"
+          # )
+        # }
+      }else{ # end IF length(which(seq_annot@ranges$is.sig==TRUE))
+        print(cat('No significant DMRs\n'))
+      }
+    }else{ # end IF length(which(seq_annot@ranges$is.sig==TRUE))
+      print(cat('Most likely dmr.ranges exist, else 0 significant CpGs following adjustment\n'))
+    }
+
+  } # go to next chromosome  
+} # done, go to next index2run
+
+```
+
+```{r bsseq_findDMRs_masterchunk,results='asis',fig.height=7,fig.width=7,eval=FALSE}
+
+for(i in index2run){
+
+  groupRelative <- contrast_master.df[i,'relative']; print(cat(paste('Group Relative:',groupRelative,"\n")))
+  groupBaseline <- contrast_master.df[i,'baseline']; print(cat(paste('Group Baseline:',groupBaseline,"\n")))
+  groupColumn <- contrast_master.df[i,'meta_col']
+  groupColumnIndex <- which(colnames(meta)==groupColumn); stopifnot(length(groupColumnIndex)==1)
+  filterColumn <- contrast_master.df[i,'filterColumn']
+  filterColumnIndex <- which(colnames(meta)==filterColumn); stopifnot(length(filterColumnIndex)==1)
+  contrast.name = contrast_master.df[i,'name']
+  cat(paste0("\n\n## ",contrast.name), "\n\n")
+  samplesInIndex <- which(meta[,groupColumnIndex] %in% c(groupRelative,groupBaseline) & meta[,filterColumnIndex] == contrast_master.df[i,'filterArg'])
+  .meta <- droplevels(meta[samplesInIndex,])
+  dim(.meta)
+ table(unlist(.meta[,groupColumnIndex]),unlist(.meta[,filterColumnIndex]))
+  # done getting information for the contrast
+  # now go through each chromosome
+    
+  for(chr in chroms){
+    # Subset the BS to correct chromosome
+    ..myBS <- myBS[seqnames(myBS) == chr]
+
+    
+    ### FILTER THE BSSEQ FOR ADEQUATE COVERAGE IN OUR SAMPLES, >  
+    # keep <- which(
+      # apply(getCoverage(..myBS,type='Cov'),1,FUN=function(x){return(round(length(which(x>0))/length(x),2))})   > 0.8
+    # )
+    .myBS <- ..myBS
+    # .myBS <- ..myBS[keep,]
+    ###
+    ###
+    ### Configure the contrast
+    ###
+    ###
+  
+    
+    pData(.myBS) <- meta
+    rownames(colData(.myBS)) <- meta$sample # needed for DMRcate::sequencing.annotate
+    
+    # subset to correct samples
+    .myBS <- .myBS[,colData(.myBS)$sample %in% .meta$sample]
+  
+    .BSmooth <- BSmooth(.myBS,BPPARAM = MulticoreParam(workers = 25)) 
+    
+     myBS.tstat <- BSmooth.tstat(.BSmooth,
+                                 group1=which(.meta$Race==groupRelative),
+                                 group2=which(.meta$Race==groupBaseline),
+                                 estimate.var = "group2"
+     ) 
+
+  } # go to next chromosome  
+}# done, go to next index2run
+```
+
+# Plot DMRs as heatmap
+
+```{r FUNCTIONS_FOR_FOLLOW_UP}
+  
+HeatmapFromBed <- function(query,nameArg){
+  
+    
+    heatmapColorPal <- colorRampPalette(c('blue','yellow'))(20)
+    pal = c(
+      viridis::viridis(n=3),
+      viridis::rocket(n=5)[2:4],
+      viridis::turbo(n=5)[c(2,4)]
+    )
+    pal2 = viridis::turbo(n=5)  
+    pal3 = viridis::magma(n=4)
+    ## GET THE BETA MATRIX from the bsseq
+    grOut <- subsetByOverlaps(myBS, query)
+    
+    # returns a list with one element, that element is the matrix
+    betaMatrix <- bsseq::getMeth(BSseq = grOut,regions = query,what='perBase',type='raw')[[1]] 
+    # class(betaMatrix[[1]])
+    
+    rownames(betaMatrix) <- paste0(grOut@rowRanges@seqnames,'_',grOut@rowRanges@ranges)
+    colnames(betaMatrix) <- rownames(grOut@colData)
+    
+    ### arrange the order
+    meta.tmp <- dplyr::arrange(meta,`ReproductiveStatus`,DaysSinceLMP)
+    meta.tmp$groupBRCA = factor(meta.tmp$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+    
+    betaMatrix <- betaMatrix[,meta.tmp$sample]
+    stopifnot(all(colnames(betaMatrix)==meta.tmp$sample))
+    
+    betaMatrix <- t(betaMatrix)
+    stopifnot(all(rownames(betaMatrix)==meta.tmp$sample))
+  
+    
+    ### REMAKE THE ANNOTATION SINCE THE ORDER IS CHANGED
+    haRowMasterFUNCTION <- rowAnnotation(
+      `MIR200c` = meta.tmp$MIR200cAvgBeta,
+      `Reproductive Status` = meta.tmp$ReproductiveStatus,
+      # DaysSinceLMP = meta.tmp$DaysSinceLMP,
+      `Postpartum` = meta.tmp$Pregnancy,
+      `Age` = meta.tmp$`Age at time of surgery`,
+      `BRCA Mutation` = meta.tmp$groupBRCA,
+      `Race` = meta.tmp$Race,
+      col = list(
+        `MIR200c` = circlize::colorRamp2(
+                                  breaks = seq(from = 0, to = 1, length = 20),
+                                  colors = viridis::cividis(20)
+        ),
+        Pilot = c(
+          'A' = pal[1],
+          'B' = pal[2]
+        ),
+        `Reproductive Status` = c(
+          'Pre' = "#28BBECFF",
+          'Post' = "#FB8022FF"
+        ),
+    
+        `BRCA Mutation` = c(
+          'BRCA1' = '#40498e',
+          'BRCA2' = '#38aaac',
+          'NON-BRCA' = 'black'
+        ),
+        Race = c(
+          'Asian' = pal2[1],
+          'Black' = pal2[2],
+          'East Indian' = pal2[3],
+          'Hispanic Latino/White' = pal2[4],
+          'White' = pal2[5],
+          'Other' = 'grey44'
+        ),
+        `Age` = circlize::colorRamp2(
+                                  breaks = seq(from = 20, to = 72, length = 20),
+                                  colors = colorRampPalette(c("gray75", "gray10"))(20)
+        ),
+        `DaysSinceLMP` = circlize::colorRamp2(
+                                  breaks = seq(from = -6, to = -368, length = 50),
+                                  colors = colorRampPalette(c("white", "blue"))(50)
+        ),
+        `Postpartum` = c(
+          'Normal' = 'grey22',
+          'Pregnant' = 'pink'
+        )
+      )
+    )
+    
+    
+    
+    # new_order <- match(ordered,rownames(betaMatrix))
+    # betaMatrix2 <- betaMatrix[new_order,]
+    myHM <- ComplexHeatmap::Heatmap(
+      betaMatrix,
+      show_column_names = TRUE,
+      col=viridis::cividis(20),
+      cluster_rows = TRUE,
+      cluster_columns = FALSE,
+      heatmap_legend_param = list(title='Beta'),
+      row_title_gp = gpar(fontsize = 9),
+      row_names_gp = gpar(fontsize = 7),
+      column_names_rot = 90,
+      column_names_gp = gpar(
+        fontsize = 8#,
+        # col = myPosColors
+      ),
+      column_title = nameArg, 
+      column_title_gp = gpar(fontsize = 12),
+      # right_annotation = haRowMIR200,
+      right_annotation = haRowMasterFUNCTION,
+      # top_annotation = haCol_MIR141,
+      heatmap_width = unit(9, "in"),  
+      heatmap_height = unit(7, "in"),  
+      # row_split = ifelse(i<5,meta.tmp$groupBRCA,ifelse(i==5,meta.tmp$Race,ifelse(i==6,meta.tmp$ReproductiveStatus))),
+      # row_split = meta.tmp$Race,
+      # row_split = meta.tmp$groupBRCA,
+      # row_split = meta.tmp$group,
+      row_split = meta.tmp$ReproductiveStatus,
+      # row_split = paste0(meta.tmp$Race),
+      # row_split = paste0(meta$ReproductiveStatus,'\n',meta$groupBRCA),
+      row_title_rot = 0
+    )
+  
+    print(
+      myHM
+    )
+    
+    return(
+      list(matrix=betaMatrix,heatmap=myHM)
+    )
+  }
+  
+heatmap_top_DMRs <- function(i,RESDF){
+    
+    for(j in 1:min(2,nrow(RESDF))){
+      myCaption <- paste0(contrast_master.df$name[i],'_DMR_by_min_smoothed_fdr_number',j)
+      
+      query <- GRanges(seqnames=RESDF$seqnames[j],
+                     ranges=IRanges(RESDF$start[j],width = (RESDF$end[j]-RESDF$start[j]+1))
+      )
+      
+      # myResultList[[1]] is the matrix
+      # myResultList[[2]] is the heatmap
+      myResultList <- HeatmapFromBed(query = query,
+                         nameArg = myCaption
+      )
+      
+      # print it to a pdf
+      pdf(paste0(myCaption,'_heatmap.pdf'),height=11,width=11); print(myResultList[[2]]) ; dev.off()
+    
+      x <- data.frame(rowMeans(myResultList[[1]],na.rm = TRUE))
+      colnames(x) <- c('DMR_beta')
+      x$SVC <- rownames(x)
+      x <- dplyr::left_join(x,meta)
+      
+      res344 <- x %>% dplyr::group_by(ReproductiveStatus) %>% summarize(mean=mean(DMR_beta))
+      print(res344)
+      
+      g0 <- ggplot(x,aes(x=ReproductiveStatus,y=DMR_beta)) +
+      
+      # g0 <- ggplot(x,aes(x=group,y=DMR_beta)) +
+      # g0 <- dplyr::filter(x,Race%in%c('White','Black')) %>% ggplot(aes(x=Race,y=DMR_beta)) +
+          geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+          geom_jitter(size = 2, alpha = 1, width = 0.1) +
+        # geom_boxplot() +
+        theme_bw() + scale_fill_viridis_d(option='turbo') +
+        ylim(c(0,1)) + theme(legend.position='none') #,axis.text.x = element_text(angle=45,hjust=1)) + 
+    
+      pdf(paste0(myCaption,'_boxplot.pdf'),height=5,width=5); print(g0); dev.off()
+    
+    }
+  
+  }
+
+```
+
+## Get results of contrast to resDF
+
+```{r generic_get_results_dmrcate,eval=FALSE}
+library(DMRcate)
+
+# this function works based on the index2run!
+i <- index2run
+# subdir <- 'DMR_result_BRCAmut_v_NonBRCA_no_covariates' # this needs to match index! MANUAL
+# subdir <- 'DMR_result_BRCAmut_v_NonBRCA_mir200_adjusted' # this needs to match index! MANUAL
+subdir <- 'DMR_result_BRCAmut_v_NonBRCA_mir200_adjusted_excl_postpartum' # this needs to match index! MANUAL
+# subdir <- 'DMR_result_BRCAmut_v_NonBRCA_mir200_race_adjusted_excl_postpartum' # this needs to match index  11
+# subdir <- 'DMR_result_Pre_vs_Post_no_covariates' # this needs to match index 6
+# subdir <- 'DMR_result_Pre_vs_Post_mir200_adjusted' # this needs to match index 8
+# subdir <- 'DMR_result_Pre_vs_Post_mir200_adjusted_excl_postpartum' # this needs to match index 10
+
+contrast.name = contrast_master.df[i,'name']; print(paste("Getting DMR results from",contrast.name,"\n"))
+chromsDF <- readRDS('chromsDF.Rds'); chroms <- unique(chromsDF$chr)
+
+# get all seq_annot objects into one resList
+resList <- list()
+total.indiv.signif.cpgs <- 0
+for(chr in chroms){
+  expected.file <- paste0(subdir,"/dmrcate.res.",contrast.name,"_",chr,".Rds") # null model files
+  
+  if(file.exists(expected.file)){
+    res <- readRDS(expected.file)
+    res.ranges <- extractRanges(res,genome='hg38') # this was causing the bad annotation!
+    resList <- c(resList,res.ranges)
+    seq_annot <- readRDS(paste0(subdir,"/seq_annot.",contrast.name,"_",chr,".Rds"))
+  # print(paste("Found",length(which(seq_annot@ranges$is.sig==TRUE)),"Significant CpGs on chr",chr,"\n"))
+    total.indiv.signif.cpgs <- total.indiv.signif.cpgs + length(which(seq_annot@ranges$is.sig==TRUE))
+  }
+  
+}
+print(paste("Found",total.indiv.signif.cpgs,"Significant CpGs for contrast",contrast.name,"\n"))
+
+length(resList)
+res <- resList[[1]]
+for(k in 2:length(resList)){
+  res <- c(res,resList[[k]])
+}
+length(res)
+# table(res@seqnames)
+length(res)
+resDF.byFDR <- data.frame(res) %>% dplyr::arrange(min_smoothed_fdr)
+dim(resDF.byFDR)
+resDF.byMeanDiff  <- data.frame(res) %>% dplyr::arrange(desc(abs(meandiff)))
+write.table(resDF.byMeanDiff,file=paste0('DMR_result_table',contrast.name,'.tsv'),sep="\t",quote=FALSE,row.names=FALSE)
+# now get some info
+# summary(resDF.byFDR$meandiff)
+# table(sign(resDF.byFDR$maxdiff))
+# ggplot(resDF.byFDR,aes(meandiff)) + geom_histogram(bins = 100) + theme_minimal()
+
+################
+saveRDS(resDF.byFDR,file = paste0(contrast.name,'_resDF.Rds'))
+# resDF.byFDR <- readRDS(paste0(contrast.name,'_resDF.Rds'))
+##
+  #. print heatmap of top DMRs
+heatmap_top_DMRs(i=i,RESDF=resDF.byMeanDiff)
+
+
+
+# quick test for enrichment
+# library(org.Hs.eg.db)
+# res2 <- clusterProfiler::enrichGO(gene=unlist(unique(resDF.byMeanDiff$overlapping.genes)),OrgDb = org.Hs.eg.db,keyType = 'SYMBOL')
+# res2@result
+
+```
+
+
+# Get DMR plot modified from DMRcate
+
+
+```{r func}
+
+dmr.plot.modified <- function (ranges, dmr, CpGs, widthX=250,main_title, what = c("Beta", "M"), arraytype = c("EPIC","450K"), phen.col, genome = c("hg19", "hg38", "mm10"), ...){
+  require(Gviz)
+  options(ucscChromosomeNames=FALSE)
+  eh = ExperimentHub()
+  what <- match.arg(what)
+  arraytype <- match.arg(arraytype)
+  genome <- match.arg(genome)
+  stopifnot(class(CpGs)[1] %in% c("matrix", "BSseq", "GenomicRatioSet"))
+  stopifnot(dmr %in% 1:length(ranges))
+  group <- unique(names(phen.col))
+  if (is(CpGs, "matrix") | is(CpGs, "GenomicRatioSet")) {
+    if (is(CpGs, "matrix")) {
+      if (arraytype == "450K") {
+        grset <- makeGenomicRatioSetFromMatrix(CpGs, 
+                                               array = "IlluminaHumanMethylation450k", annotation = "ilmn12.hg19", 
+                                               mergeManifest = TRUE, what = what)
+      }
+      if (arraytype == "EPIC") {
+        grset <- makeGenomicRatioSetFromMatrix(CpGs, 
+                                               array = "IlluminaHumanMethylationEPIC", annotation = "ilm10b4.hg19", 
+                                               mergeManifest = TRUE, what = what)
+      }
+    }
+    else {
+      grset <- CpGs
+    }
+    CpGs <- getBeta(grset)
+    RSanno <- getAnnotation(grset)
+    RSanno <- RSanno[order(RSanno$chr, RSanno$pos), ]
+    CpGs <- CpGs[rownames(RSanno), ]
+    cpgs.ranges <- GRanges(RSanno$chr, IRanges(RSanno$pos, 
+                                               RSanno$pos))
+    values(cpgs.ranges) <- CpGs
+    isbsseq <- FALSE
+  }
+  else {
+    if (any(width(CpGs) > 1)) {
+      stop("Error: all ranges in the BSseq object must be single nucleotides with width 1.")
+    }
+    if (is.null(rownames(colData(CpGs)))) {
+      stop("Error: BSseq object must be annotated with colData with sample IDs as rownames of the data.frame.")
+    }
+    stopifnot(ncol(CpGs) == length(phen.col))
+    cpgs.ranges <- CpGs
+    isbsseq <- TRUE
+  }
+  ranges$ID <- paste0("DMR_", 1:length(ranges))
+  ranges.reduce <- GenomicRanges::reduce(ranges + widthX)
+  dmrs.inplot <- ranges[ranges %over% ranges.reduce[subjectHits(findOverlaps(ranges[dmr], 
+                                                                             ranges.reduce))]]
+  ranges.inplot <- ranges.reduce[ranges.reduce %over% dmrs.inplot]
+  cpgs.ranges <- subsetByOverlaps(cpgs.ranges, ranges.inplot)
+  if (isbsseq) {
+    methRatios <- GRanges(seqnames(cpgs.ranges), ranges(cpgs.ranges), 
+                          mcols = as.matrix(getCoverage(cpgs.ranges, type = "M"))/as.matrix(getCoverage(cpgs.ranges, 
+                                                                                                        type = "Cov")))
+    coverage <- GRanges(seqnames(cpgs.ranges), ranges(cpgs.ranges), 
+                          mcols = as.matrix(getCoverage(cpgs.ranges, type = "Cov")))
+  }
+  else {
+    methRatios <- cpgs.ranges
+  }
+  values(methRatios) <- as.matrix(values(methRatios))
+  colnames(values(methRatios)) <- gsub("mcols.", "", colnames(values(methRatios)))
+  dt.group <- lapply(unique(names(phen.col)), function(i) DataTrack(cex.axis=0.5,methRatios[, 
+                                                                               names(phen.col) %in% i], name = i, background.title = phen.col[i], 
+                                                                    type = "heatmap", showSampleNames = TRUE, ylim = c(0, 
+                                                                                                                       1), genome = genome, gradient = c("#00204DFF", "#FFEA46FF")))
+  dt.group <- c(dt.group, list(DataTrack(methRatios, groups = names(phen.col), # span=0.1,degree=3,
+                                         type = "smooth",  aggregateGroups = TRUE, aggregation = function(x) mean(x, 
+                                                                                                                 na.rm = TRUE), col = phen.col[sort(group)], ylim = c(0, 
+                                                                                                                                                                      1), name = "Smoothed\n group means", na.rm = TRUE)))
+  
+  dt.group <- c(dt.group, list(DataTrack(coverage, groups = names(phen.col), # span=0.1,degree=3,
+                                         type = "smooth",  aggregateGroups = TRUE, aggregation = function(x) mean(x, 
+                                                                                                                 na.rm = TRUE), col = phen.col[sort(group)], ylim = c(0, 
+                                                                                                                                                                      30), name = "Coverage\n group means", na.rm = TRUE)))
+  switch(genome, hg19 = {
+    grt = eh[["EH3133"]]
+  }, hg38 = {
+    grt = eh[["EH3135"]]
+  }, mm10 = {
+    grt = eh[["EH3137"]]
+  })
+  chromosome(grt) <- as.character(seqnames(methRatios)[1])
+  extras <- list(AnnotationTrack(dmrs.inplot, name = "DMRs", 
+                                 showFeatureId = TRUE, col = NULL, fill = "purple", id = dmrs.inplot$ID, 
+                                 fontcolor = "black"))
+  values(cpgs.ranges) <- NULL
+  
+  # manual hg19!
+  basetracks <- list(IdeogramTrack(genome = 'hg19', chromosome = as.character(seqnames(ranges.inplot))), 
+                     GenomeAxisTrack(), grt, AnnotationTrack(GRanges(seqnames(cpgs.ranges), 
+                                                                     ranges(cpgs.ranges)), name = "CpGs", fill = "green", 
+                                                             col = NULL, stacking = "dense"))
+  print(length(c(basetracks, extras, dt.group)))
+  pdf('test_dmr.pdf',height = 7,width=7)
+  print(
+    suppressWarnings(plotTracks(c(basetracks, extras, dt.group), 
+                              from = start(ranges.inplot), to = end(ranges.inplot),
+                              main=main_title,cex.main=0.8,sizes=c(0.2,0.5,0.2,0.2,0.2,1,2,1,1),
+                              ...))
+  )
+  dev.off()
+}
+
+
+```
+
+for brca
+```{r run_func_dmr_plot.modified}
+
+cols <- as.character(
+      plyr::mapvalues(
+        meta$groupBRCA, unique(meta$groupBRCA),
+        c('black','#40498e','#38aaac')
+      )
+)
+names(cols) <- meta$groupBRCA
+
+dmr.plot.modified(ranges=res,dmr=5,CpGs=myBS,
+          phen.col = cols,
+          genome="hg38",
+          widthX=2000,
+          what="Beta")
+
+
+
+
+```
+
+for pre vs. post
+```{r run_func_dmr_plot.modified}
+
+cols <- as.character(
+      plyr::mapvalues(
+        meta$ReproductiveStatus, unique(meta$ReproductiveStatus),
+        c("#FB8022FF","#28BBECFF")
+      )
+)
+names(cols) <- meta$ReproductiveStatus
+
+dmr.plot.modified(ranges=res,dmr=1,CpGs=myBS,
+          phen.col = cols,
+          genome="hg38",
+          widthX=2000,
+          what="Beta")
+
+
+
+
+```
+
+# meandiff
+
+getting to the bottom of what meandiff means!
+
+first get the regions by subsetting myBS
+```{r meandiff}
+
+# load up the dmr bedfile
+# regions <- read.delim('DMR_result_tablePre_vs_Post_no_covariates_N39155.tsv',sep="\t")
+# regions <- read.delim('DMR_result_table_BRCAmut_v_NonBRCA_no_covariates_N63.tsv',sep="\t")
+# regions <- read.delim('DMR_result_tableBRCA_v_NON-BRCA_noPreg_mir200c_race_adjusted_N1.tsv',sep="\t")
+regions <- read.delim('DMR_result_table_BRCAmut_v_NonBRCA_no_covariates_N63.tsv',sep="\t")
+regions$brca.true.mean.beta <- NULL
+regions$non.brca.true.mean.beta <- NULL
+regions$pre.true.mean.beta <- NULL
+regions$post.true.mean.beta <- NULL
+
+gr <- makeGRangesFromDataFrame(regions)
+# gr
+bs39155 <- subsetByOverlaps(myBS,gr)
+tmp <- as.data.frame(bsseq::getMeth(bs39155,type='raw'))
+
+tmp$seqnames <- as.vector(bs39155@rowRanges@seqnames)
+tmp$start <- as.vector(bs39155@rowRanges@ranges@start)
+# tmp$end <- bs39155@rowRanges@ranges@end # not needed
+
+tmp <- tmp |> dplyr::relocate(seqnames,start)
+
+stoppifnot(all(colnames(tmp)==meta$SVC))
+
+brca.samples <- which(colnames(tmp) %in% dplyr::filter(meta,groupBRCA!='NON-BRCA')$SVC)
+non.brca.samples <- which(colnames(tmp) %in% dplyr::filter(meta,groupBRCA=='NON-BRCA')$SVC)
+pre.samples <- which(colnames(tmp) %in% dplyr::filter(meta,ReproductiveStatus=='Pre')$SVC)
+post.samples <- which(colnames(tmp) %in% dplyr::filter(meta,ReproductiveStatus=='Post')$SVC)
+
+
+for(i in 1:nrow(regions)){
+  tmp2 <- filter(tmp,seqnames==regions$seqnames[i] & start>=regions$start[i] & start<=regions$end[i])
+  
+  # check that the number of dmrs we are finding is the same as DMRcate reports
+  # stopifnot(nrow(tmp2)==regions$no.cpgs[i])
+  
+  # now get the groupBRCA-specific values
+  regions$brca.true.mean.beta[i] <- mean(rowMeans(tmp2[,brca.samples],na.rm=TRUE))
+  regions$non.brca.true.mean.beta[i] <- mean(rowMeans(tmp2[,non.brca.samples],na.rm=TRUE))
+  regions$pre.true.mean.beta[i] <- mean(rowMeans(tmp2[,pre.samples],na.rm=TRUE))
+  regions$post.true.mean.beta[i] <- mean(rowMeans(tmp2[,post.samples],na.rm=TRUE))
+
+  if(i %% 100 == 0){
+    print(cat("On DMR",i,"\n"))
+  }
+}
+
+# saveRDS(regions,'regions_DMRs_pre_v_post_N39155_with_means.Rds')
+# saveRDS(regions,'regions_DMRs_BRCAmut_v_NonBRCA_no_covariates_N63_with_means.Rds')
+# saveRDS(regions,'regions_DMRs_BRCA_v_NON-BRCA_noPreg_mir200c_race_adjusted_N1_with_means.Rds')
+saveRDS(regions,'regions_DMRs_DMR_result_table_BRCAmut_v_NonBRCA_no_covariates_N63_with_means.Rds')
+```
+
+now for the plotting comparing meandiff
+```{r meandiff2}
+
+regions0 <- readRDS('regions_DMRs_pre_v_post_N39155_with_means.Rds')
+regions1 <- readRDS('regions_DMRs_BRCAmut_v_NonBRCA_no_covariates_N63_with_means.Rds')
+regions2 <- readRDS('regions_DMRs_BRCA_v_NON-BRCA_noPreg_mir200c_race_adjusted_N1_with_means.Rds')
+
+a <- regions0[sample(1:nrow(regions),size=2000),] %>% 
+ggplot(aes(x=meandiff,y=(post.true.mean.beta-pre.true.mean.beta))) + geom_point() + ylim(c(-0.3,0.3))  + xlim(c(-2,2)) +
+  xlab('meandiff DMRs_pre_v_post_N39155')
+b <- regions1 %>% 
+ggplot(aes(x=meandiff,y=(non.brca.true.mean.beta-brca.true.mean.beta))) + geom_point() + ylim(c(-0.3,0.3)) + xlim(c(-2,2)) +
+  xlab('meandiff BRCAmut_v_NonBRCA_no_covariates_N63')
+c <- regions2 %>% 
+ggplot(aes(x=meandiff,y=(non.brca.true.mean.beta-brca.true.mean.beta))) + geom_point() + ylim(c(-0.3,0.3)) + xlim(c(-2,2)) +
+  xlab('meandiff BRCA_v_NON-BRCA_noPreg_mir200c_race_adjusted_N1')
+
+# tmp <- data.frame(
+#   meandiffs = sample(x=-2:2,500,replace=TRUE)
+# )
+# tmp$log2_meandiffs <- log2(meandiffs)
+# tmp$log10_meandiffs <- log10(meandiffs)
+# 
+# c <- ggplot(tmp,aes(x=meandiffs,y=log2_meandiffs)) + geom_point() #+ ylim(c(-0.3,0.3)) + xlim(c(-2,2))
+# d <- ggplot(tmp,aes(x=meandiffs,y=log10_meandiffs)) + geom_point() #+ ylim(c(-0.3,0.3))  + xlim(c(-2,2))
+
+pdf('DMRcate_meandiff_vs_true_beta_diff.pdf',height = 5,width = 16)
+library(patchwork)
+a + b + c #+ d
+dev.off()
+```
+
+now trying a volcano-esque plot
+```{r volcano-esque}
+regions0 <- readRDS('regions_DMRs_pre_v_post_N39155_with_means.Rds')
+regions1 <- readRDS('regions_DMRs_BRCAmut_v_NonBRCA_no_covariates_N63_with_means.Rds')
+regions2 <- readRDS('regions_DMRs_BRCA_v_NON-BRCA_noPreg_mir200c_race_adjusted_N1_with_means.Rds')
+# regions3 <- readRDS('regions_DMRs_DMR_result_table_BRCAmut_v_NonBRCA_no_covariates_N63_with_means.Rds')
+
+# ggplot(regions0[sample(1:nrow(regions0),10000),],aes(x=(pre.true.mean.beta-post.true.mean.beta),y=-log10(HMFDR))) + geom_point() + theme_bw()
+a <- ggplot(regions0,aes(x=(pre.true.mean.beta-post.true.mean.beta),y=-log10(HMFDR))) + geom_point() + theme_bw() + xlim(c(-0.3,0.3)) + ylim(c(0,10)) + ggtitle('Pre vs. Post DMRs - NO COvARIATES')
+
+
+b <- ggplot(regions1,aes(x=(brca.true.mean.beta-non.brca.true.mean.beta),y=-log10(HMFDR))) + geom_point() + theme_bw() + xlim(c(-0.3,0.3)) + ylim(c(0,10)) + ggtitle('BRCAmut vs. Non-BRCAm DMRs - NO COvARIATES')
+
+c <- ggplot(regions2,aes(x=(brca.true.mean.beta-non.brca.true.mean.beta),y=-log10(HMFDR))) + geom_point() + theme_bw() + xlim(c(-0.3,0.3)) + ylim(c(0,10)) + ggtitle('BRCAmut vs. Non-BRCAm DMRs WITH COVARIATES')
+
+library(patchwork)
+pdf('DMRs_volcano_pre_v_post_and_brcamut_v_nonbrcam.pdf',height = 5,width = 15); a + b + c; dev.off()
+
+```
+
+
+# Pre vs. Post DMR results volcano - Fig. 6
+
+# Volcano
+
+```{r Pre_v_Post_nonPreg_WithMIR200adj_N174}
+
+regions <- read.delim('DMR_result_tablePre_v_Post_nonPreg_WithMIR200adj_N174.tsv',sep="\t")
+# regions <- dplyr::filter(regions,seqnames=='chr1' & start==93566415); dim(regions) # BCRA1 DMR
+regions$brca.true.mean.beta <- NULL
+regions$non.brca.true.mean.beta <- NULL
+regions$pre.true.mean.beta <- NULL
+regions$post.true.mean.beta <- NULL
+
+gr <- makeGRangesFromDataFrame(regions)
+# gr
+bs39155 <- subsetByOverlaps(myBS,gr)
+tmp <- as.data.frame(bsseq::getMeth(bs39155,type='raw'))
+
+rownames(tmp) <- paste(
+  as.vector(bs39155@rowRanges@seqnames),
+  as.vector(bs39155@rowRanges@ranges@start),
+  sep="_"
+)
+saveRDS(tmp,'BCRA1_DMR_N14cpgs.Rds')
+
+tmp$seqnames <- as.vector(bs39155@rowRanges@seqnames)
+tmp$start <- as.vector(bs39155@rowRanges@ranges@start)
+# tmp$end <- bs39155@rowRanges@ranges@end # not needed
+
+tmp <- tmp |> dplyr::relocate(seqnames,start)
+
+stoppifnot(all(colnames(tmp)==meta$SVC))
+
+brca.samples <- which(colnames(tmp) %in% dplyr::filter(meta,groupBRCA!='NON-BRCA')$SVC)
+non.brca.samples <- which(colnames(tmp) %in% dplyr::filter(meta,groupBRCA=='NON-BRCA')$SVC)
+pre.samples <- which(colnames(tmp) %in% dplyr::filter(meta,ReproductiveStatus=='Pre')$SVC)
+post.samples <- which(colnames(tmp) %in% dplyr::filter(meta,ReproductiveStatus=='Post')$SVC)
+
+
+for(i in 1:nrow(regions)){
+  tmp2 <- filter(tmp,seqnames==regions$seqnames[i] & start>=regions$start[i] & start<=regions$end[i])
+  
+  # check that the number of dmrs we are finding is the same as DMRcate reports
+  # stopifnot(nrow(tmp2)==regions$no.cpgs[i])
+  
+  # now get the groupBRCA-specific values
+  regions$brca.true.mean.beta[i] <- mean(rowMeans(tmp2[,brca.samples],na.rm=TRUE))
+  regions$non.brca.true.mean.beta[i] <- mean(rowMeans(tmp2[,non.brca.samples],na.rm=TRUE))
+  regions$pre.true.mean.beta[i] <- mean(rowMeans(tmp2[,pre.samples],na.rm=TRUE))
+  regions$post.true.mean.beta[i] <- mean(rowMeans(tmp2[,post.samples],na.rm=TRUE))
+
+  if(i %% 100 == 0){
+    print(cat("On DMR",i,"\n"))
+  }
+}
+
+
+saveRDS(regions,'regions_DMRs_DMR_result_table_Pre_v_Post_nonPreg_WithMIR200adj_N174_with_means.Rds')
+
+# now back to local
+
+regions <- readRDS('regions_DMRs_DMR_result_table_Pre_v_Post_nonPreg_WithMIR200adj_N174_with_means.Rds')
+
+
+# DMR volcano plot
+a <- ggplot(regions,aes(x=(pre.true.mean.beta-post.true.mean.beta),label=overlapping.genes,y=-log10(HMFDR))) + geom_point(size=0.5) + theme_bw() + xlim(c(-0.3,0.3)) + ylim(c(0,5)) + ggtitle('Pre vs. Post nonPreg WithMIR200adjustment N174 DMRs - ') + ggrepel::geom_text_repel(size=1,max.overlaps = 15)
+
+# equivalent DGE volcano plot
+degTable <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Table2_Tables/rna_Pre_v_Post_with_MIR200C_nonPreg.DGE_N1769.tsv',sep="\t"); dim(degTable)
+degTable <- dplyr::filter(degTable,FDR<0.05)
+b <- ggplot(degTable,aes(x=logFC,y=-log10(PValue),label=ext_gene)) + geom_point(size=0.5) + theme_bw() + ggrepel::geom_text_repel(size=1,max.overlaps = 15)
+
+pdf('Fig6_volcano_DMR_DGE_pre_v_post.pdf',height = 5,width = 2.5)
+layout <- '
+a
+b'
+a + b + plot_layout(design = layout)
+dev.off()
+```
+
+# Heatmap ANNOTATION BUILD
+
+```{r get_anno}
+
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useMethylation==TRUE); dim(meta00)
+# meta00 <- dplyr::arrange(meta00,Pregnancy,`Age at time of surgery`)
+meta00 <- dplyr::arrange(meta00,`Age at time of surgery`)
+# meta00 <- dplyr::arrange(meta00,MIR200cAvgBeta)
+meta00$MenoStatus <- ifelse(meta00$Postpartum,'Postpartum',meta00$ReproductiveStatus)
+meta00$MIR200cAvgBeta <- as.numeric(meta00$MIR200cAvgBeta)
+meta00$MenoStatus <- factor(meta00$MenoStatus, levels=c('Pre','Post','Postpartum'))
+meta00$menstrPh_by_Endom <- factor(meta00$menstrPh_by_Endom, levels=c('Weakly Proliferative','Proliferative','Late Proliferative/Early Secretory','Secretory','Inactive'))
+
+library(ComplexHeatmap)
+
+heatmapColorPal <- viridis::viridis(n=100)
+pal = c(
+  viridis::viridis(n=4),
+  viridis::rocket(n=5)[2:4],
+  viridis::turbo(n=5)[c(2,4)]
+)
+# pal2 = viridis::mako(n=5)
+pal2 = viridis::turbo(n=5)
+haCol_DMR <- HeatmapAnnotation(
+  `Path Report Menstrual Phase` = meta00$menstrPh_by_Endom,
+  # `contraception use` = meta00$`contraception use`,
+  `Age` = meta00$`Age at time of surgery`,
+  `Stromal Content` = meta00$MIR200cAvgBeta,
+  `Menopause Status` = meta00$MenoStatus,
+  `BRCAm` = meta00$groupBRCA,
+  `Race` = meta00$Race,
+  # `Days since LMP` = meta00$`Days since LMP`,
+  # DaysSinceLMP_categ = meta00$DaysSinceLMP_categ,
+  `Surgical Indication` = meta00$`Reason for surgery 3`,
+  # `Number of Pregnancies` = as.numeric(meta00$`# of Pregnancies`),
+
+  # `Immune Score` = meta00$ImmuneScore,
+  col = list(
+    `Stromal Content` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 1, length = 20),
+                              colors = viridis::cividis(20)
+    ),
+    `Age` = circlize::colorRamp2(
+                              breaks = seq(from = 20, to = 72, length = 20),
+                              colors = colorRampPalette(c("gray75", "black"))(20)
+    ),
+    `Menopause Status` = c(
+      'Pre' = "#28BBECFF",
+      'Post' = "#FB8022FF",
+      'Postpartum' = 'grey33'
+    ),
+    `BRCAm` = c(
+      # 'BRCA1' = '#40498e',
+      'BRCA1' = '#7df5f5',
+      'BRCA2' = '#38aaac',
+      'NON-BRCA' = 'black'
+    ),
+    Race = c(
+      'Asian' = '#30123BFF',
+      'Black' = "#28BBECFF",
+      'East Indian' = "#A2FC3CFF",
+      'Hispanic Latino/White' = "#FB8022FF",
+      'White' = "#7A0403FF",
+      'Other' = 'gray48'
+    ),
+    DaysSinceLMP_categ=c(
+      '[0,12]' = '#67001F',
+      '(12,16]' = '#92C5DE',
+      '(16,30]' = '#053061',
+      '(30,60]' = 'black'
+    ),
+    `Path Report Menstrual Phase` = c(
+      'Weakly Proliferative'='#92C5DE',
+      'Proliferative' = '#0096FF',
+      'Late Proliferative/Early Secretory'='dodgerblue4',
+      'Secretory'= "#CA0020",
+      'Inactive'='black'
+    ),
+    `Surgical Indication` = c(
+      'Benign Uterine'='#8DD3C7',
+      'Cesarean Section'='#FCCDE5',
+      'Cervical Dysplasia'='#BEBADA',
+      'Menorrhagia'='#FB8072',
+      'Endometriosis'='#80B1D3',
+      'Ovarian Serous Cystadenoma'='#FDB462',
+      # 'Ovarian Cyst (Sex chord stromal tumor)'='#B3DE69',
+      'Ovarian Cyst'='pink3',
+      'Pelvic mass'='#D9D9D9',
+      'Adnexal Mass' = '#BC80BD',
+      # 'Tubal Sterilization' = '#CCEBC5',
+      'Tubal Sterilization' = '#0BDA51',
+      'Gender Affirmation'='#FFED6F',
+      # 'Risk Reduction' = '#B3DE69'
+      'Risk Reduction' = 'green'
+    ),
+    `contraception use` = c(
+      'NA'='grey66',
+      'Former'='purple',
+      'Current'='blue',
+      'Y'='blue3',
+      'Y - BTL'='darkblue',
+      'N' = 'red'
+    )
+  ),na_col='white'
+)
+
+
+```
+
+```{r get_mat_and_make_heatmap}
+
+
+
+mat <- readRDS('BCRA1_DMR_N14cpgs.Rds')[,meta00$SVC]
+
+stopifnot(all(colnames(mat)==meta00$SVC))
+colnames(mat) <- meta00$patientID
+
+hm00_BCRA1_DMR <- ComplexHeatmap::Heatmap(mat,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  cluster_column_slices = FALSE,
+  cluster_row_slices = FALSE,
+  col=viridis::cividis(n=100),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  heatmap_legend_param = list(title='Beta'),
+  row_title_gp = gpar(fontsize = 7),
+  row_names_gp = gpar(fontsize = 7),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 8#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 12),
+  column_split = meta00$MenoStatus,
+  top_annotation = haCol_DMR,
+  heatmap_width = unit(8, "in"),  
+  heatmap_height = unit(9, "in"),  
+  row_title_rot = 0
+)
+# hm00_BCRA1_DMR
+pdf('hm00_BCRA1_DMR.pdf',height = 12,width = 15); hm00_BCRA1_DMR; dev.off()
+
+```
+
+# ERalpha binding sites HEATMAP
+no promoters
+
+do this chunk on the HPC
+```{r eralpha}
+library(LOLA)
+list.files('../')
+regionDB <- loadRegionDB('../nm/t1/resources/regions/LOLACore/hg38/', useCache = TRUE, limit = NULL,collections=c('ucsc_features','encode_tfbs')) # this is slow...
+
+# get the right indexes from regionDB$regionAnno, a data.table
+antibody <- c('ERalpha_a','ERRA')
+idx <- which(regionDB$regionAnno$antibody%in%antibody); length(idx)
+gr <- regionDB$regionGRL[idx]
+length(gr)
+# > class(gr)
+# [1] "CompressedGRangesList"
+# attr(,"package")
+# [1] "GenomicRanges"
+gr0 <- do.call(c, gr) # need a granges for setdiff
+genome(gr0) <- 'hg38'
+# now remove promoters from gr, so that we are only dealing with enhancers
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+promoters.gr <- promoters(TxDb.Hsapiens.UCSC.hg38.knownGene)
+gr.no.promoter <- setdiff(gr0,promoters.gr, ignore.strand=TRUE) 
+gr.promoter <- subsetByOverlaps(x=gr0, ranges=promoters.gr, ignore.strand=TRUE) 
+
+# want to get all probes that overlap the binding sites, this might be too large??
+genome(myBS) <- 'hg38'
+genome(gr.no.promoter) <- 'hg38'
+gr2 <- subsetByOverlaps(x=myBS,ranges=gr.no.promoter)
+# > gr2
+# An object of type 'BSseq' with
+#   152265 methylation loci
+#   103 samples
+# has not been smoothed
+# All assays are in-memory
+
+# > gr2 - THIS IS WITHOUT PROMOTER PROBES
+# An object of type 'BSseq' with
+#   90744 methylation loci
+#   103 samples
+# has not been smoothed
+# All assays are in-memory
+
+tmp <- as.data.frame(bsseq::getMeth(gr2,type='raw'))
+saveRDS(tmp,file='ERalpha_binding_data.frame.Rds')
+
+
+
+
+# now get only the most variable
+vars <- matrixStats::rowVars(as.matrix(tmp))
+mostVar <- order(vars,decreasing=TRUE)
+n = 2000
+
+tmp2 <- tmp[mostVar[1:n],]
+saveRDS(tmp2,file='ERalpha_binding_data.frame_topVariable.Rds')
+
+```
+
+do this local
+```{r get_mat_and_make_heatmap}
+
+
+mat <- readRDS('ERalpha_binding_data.frame_topVariable.Rds')[,meta00$SVC]
+dim(mat)
+stopifnot(all(colnames(mat)==meta00$SVC))
+colnames(mat) <- meta00$patientID
+
+hm00_ERalpha_binding_sites <- ComplexHeatmap::Heatmap(mat,
+  show_column_names = TRUE,
+  show_row_names = FALSE,
+  cluster_column_slices = FALSE,
+  cluster_row_slices = FALSE,
+  col=viridis::cividis(n=100),
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  heatmap_legend_param = list(title='Beta'),
+  row_title_gp = gpar(fontsize = 7),
+  row_names_gp = gpar(fontsize = 7),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 8#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 12),
+  # column_split = meta00$MenoStatus,
+  top_annotation = haCol_DMR,
+  heatmap_width = unit(8, "in"),  
+  heatmap_height = unit(9, "in"),  
+  row_title_rot = 0,
+  show_row_dend = FALSE
+)
+# hm00_BCRA1_DMR
+pdf('ERalpha_binding_sites_top2k_mostVar.pdf',height = 12,width = 15); hm00_ERalpha_binding_sites; dev.off()
+
+```
+
+# ESR1 promoter binding site
+
+```{r esr1}
+
+esr1 <- makeGRangesFromDataFrame(df=data.frame(
+  seqnames = c('chr6'),
+  # start = c(151690495),
+  # end = c(152129603)
+  start = c(151654672),
+  end = c(152129619)
+))
+genome(esr1) <- 'hg38'
+gr2 <- subsetByOverlaps(x=myBS,ranges=esr1)
+tmp <- as.data.frame(bsseq::getMeth(gr2,type='raw'))
+saveRDS(tmp,file='ESR1_promoter_methylation_data.frame.Rds')
+
+# and save the rowranges of the CpGs for use w/ Gviz
+saveRDS(rowRanges(gr2),file='esr1_rowRanges.Rds')
+```
+
+```{r get_mat_and_make_heatmap}
+
+
+mat <- readRDS('ESR1_promoter_methylation_data.frame.Rds')[,meta00$SVC]
+dim(mat)
+stopifnot(all(colnames(mat)==meta00$SVC))
+colnames(mat) <- meta00$patientID
+mat[is.na(mat)] <- 0
+
+
+# add the rowranges
+tmp <- readRDS('esr1_rowRanges.Rds')
+tmp <- data.frame(tmp)
+
+rownames(mat) <- tmp$start
+
+# hm00_ESR1tmpContrast2# hm00_ESR1 <- ComplexHeatmap::Heatmap(mat[1:2000,],
+# hm00_ESR1 <- ComplexHeatmap::Heatmap(mat[1:2000,],
+
+# chr6:151807688-151808636 --- does this overlap with an unmethylated block
+i <- which(rownames(mat)==151807688); i
+j <- which(rownames(mat)==151808635); j
+# j <- grep('1518086',rownames(mat)); j
+
+hm00_ESR1 <- ComplexHeatmap::Heatmap(mat[1400:1700,98:103],
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  cluster_column_slices = FALSE,
+  cluster_row_slices = FALSE,
+  col=viridis::cividis(n=100),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  heatmap_legend_param = list(title='Beta'),
+  row_title_gp = gpar(fontsize = 7),
+  row_names_gp = gpar(fontsize = 0.5),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 8#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 12),
+  # column_split = meta00$MenoStatus,
+  # top_annotation = haCol_DMR,
+  heatmap_width = unit(2, "in"),  
+  heatmap_height = unit(9, "in"),  
+  row_title_rot = 0,
+  show_row_dend = FALSE,
+)
+# hm00_BCRA1_DMR
+pdf('ESR1_promoter_methylation.pdf',height = 15,width = 15); hm00_ESR1; dev.off()
+
+```
+
+```{r esr1_gviz,fig.height=5,fig.width=5}
+
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(Gviz)
+
+# yep, June 2024 and here we are...
+getOption("Gviz.scheme")
+## [1] "default"
+scheme <- getScheme()
+scheme$GeneRegionTrack$fill <- "grey69"
+addScheme(scheme, "myScheme")
+options(Gviz.scheme = "myScheme")
+
+
+tmp <- readRDS('esr1_rowRanges.Rds')
+options(ucscChromosomeNames=FALSE) 
+atrack <- AnnotationTrack(tmp, name = "CpGs",chromosome = 'chr6')
+atrack_esr1 <- AnnotationTrack(esr1, name = "ESR1",chromosome = 'chr6')
+
+
+esr1.2 <- makeGRangesFromDataFrame(df=data.frame(
+  seqnames = c('chr6'),
+  start = c(151654672),
+  end = c(151879903) # this is the 1st 2k probes only
+))
+atrack_esr1.2 <- AnnotationTrack(esr1.2, name = "ESR1",chromosome = 'chr6')
+
+
+# now annotate the CGIs here manually 
+cgi <- makeGRangesFromDataFrame(df=data.frame(
+  seqnames = c('chr6','chr6','chr6','chr6','chr6','chr6'),
+  start = c(151663974,151681364,151689706,151698238,151763325,151804922),
+  end = c(151665659,151682318,151691481,151701129,151764992,151818111) # this is the 1st 2k probes only
+))
+
+# now read in ESR1 annotation from paper
+tmp <- read.delim('hglft_genome_3d034_f12d40.tsv',sep="\t",header=FALSE)
+colnames(tmp) <- c('chr','start','end','name')
+tmp2 <- makeGRangesFromDataFrame(df=tmp)
+atrack_esr1_anno <- AnnotationTrack(tmp2,name='',chromosome='chr6',id=tmp$name,showFeatureId=TRUE)
+
+
+atrack_cgi <- AnnotationTrack(cgi,name='',chromosome='chr6')
+gtrack <- GenomeAxisTrack()
+# plotTracks(atrack)
+
+itrack <- IdeogramTrack(genome = 'hg38', chromosome = 'chr6')
+
+grtrack <- GeneRegionTrack(range=TxDb.Hsapiens.UCSC.hg38.knownGene,chr='chr6',stacking='squish',
+                           geneSymbol = TRUE,transcriptAnnotation = "symbol", name = "Gene")
+
+pdf('ESR1_gviz2.pdf',height = 5,width = 5)
+plotTracks(list(itrack, gtrack, #atrack, 
+                atrack_esr1_anno,atrack_esr1.2,atrack_cgi, grtrack),from = 151654672, to=152129619,extend.left = 0.1, extend.right = 0.1)
+dev.off()
+
+
+# now get 
+i <- which(rownames(mat)==151804922); i
+j <- which(rownames(mat)==151818111); j
+x <- colMeans(mat[i:j,])
+y <- data.frame(x) %>% tibble::rownames_to_column('patientID') %>% dplyr::left_join(meta00)
+
+p <- ggplot(y,aes(x=x,y=`Age at time of surgery`,color=MIR200cAvgBeta)) + geom_point(size=3) + theme_bw() +
+  scale_size_continuous(breaks = seq(0.1,1,by=0.1)) + xlab('ESR1 promoter methylation') 
+
+p2 <- ggplot(y,aes(x=x,y=MIR200cAvgBeta,color=MIR200cAvgBeta)) + geom_point() + theme_bw() +
+  scale_size_continuous(breaks = seq(0.1,1,by=0.1)) + xlab('ESR1 promoter methylation') 
+
+  
+pdf('ESR1_promoter_methylation_vs_stroma.pdf',height = 3.5,width = 5); p; dev.off()
+
+cor.test(y$x,y$`Age at time of surgery`,method='spearman')
+cor.test(y$x,y$MIR200cAvgBeta,method='spearman')
+
+```
+
+# ERalpha binding sites from unibind
+no promoters
+
+do this chunk on the HPC
+```{r eralpha2}
+
+# bed <- read.delim('EXP053240.primary_endometrium_cancer.ESR1.MA0112.3.damo.bed',sep="\t",header=FALSE); colnames(bed) <- c('seqnames','start','end','id','score','strand') # option 1
+bed <- read.delim('EXP048233.Ishikawa_endometrial_adenocarcinoma.ESR1.MA0112.3.damo.bed',sep="\t",header=FALSE); colnames(bed) <- c('seqnames','start','end','id','score','strand')
+
+gr <- makeGRangesFromDataFrame(bed)
+genome(gr) <- 'hg38'
+
+# now remove promoters from gr, so that we are only dealing with enhancers
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+promoters.gr <- promoters(TxDb.Hsapiens.UCSC.hg38.knownGene)
+gr.no.promoter <- setdiff(gr,promoters.gr, ignore.strand=TRUE) 
+gr.promoter <- subsetByOverlaps(x=gr, ranges=promoters.gr, ignore.strand=TRUE) 
+
+# want to get all probes that overlap the binding sites, this might be too large??
+genome(myBS) <- 'hg38'
+genome(gr.no.promoter) <- 'hg38'
+gr2 <- subsetByOverlaps(x=myBS,ranges=gr.no.promoter)
+# > gr2
+# An object of type 'BSseq' with
+#   152265 methylation loci
+#   103 samples
+# has not been smoothed
+# All assays are in-memory
+
+# > gr2 - THIS IS WITHOUT PROMOTER PROBES
+# An object of type 'BSseq' with
+#   90744 methylation loci
+#   103 samples
+# has not been smoothed
+# All assays are in-memory
+
+tmp <- as.data.frame(bsseq::getMeth(gr2,type='raw'))
+saveRDS(tmp,file='ERalpha_binding_unibind_Ishikawa.Rds')
+
+```
+
+do this local
+```{r get_mat_and_make_heatmap2}
+
+
+# mat <- readRDS('ERalpha_binding_unibind.Rds')[,meta00$SVC]
+mat <- readRDS('ERalpha_binding_unibind_Ishikawa.Rds')[,meta00$SVC]
+dim(mat)
+stopifnot(all(colnames(mat)==meta00$SVC))
+colnames(mat) <- meta00$patientID
+
+# remove NAs, because those cause issue with hclust
+r <- which(is.na(rowSums(mat)))
+mat <- mat[-r,]; dim(mat)
+# matScaled <- t(scale(t(mat),center = TRUE))
+# matScaled[matScaled > 2] <- 2
+# matScaled[matScaled < (-2)] <- (-2)
+hm00_ERalpha_binding_sites <- ComplexHeatmap::Heatmap(
+  mat[1:2000,],
+  # matScaled,
+  show_column_names = TRUE,
+  show_row_names = FALSE,
+  cluster_column_slices = FALSE,
+  cluster_row_slices = FALSE,
+  col=viridis::cividis(n=100),
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  heatmap_legend_param = list(title='Beta'),
+  row_title_gp = gpar(fontsize = 7),
+  row_names_gp = gpar(fontsize = 7),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 8#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 12),
+  # column_split = meta00$MenoStatus,
+  top_annotation = haCol_DMR,
+  heatmap_width = unit(8, "in"),  
+  heatmap_height = unit(9, "in"),  
+  row_title_rot = 0,
+  show_row_dend = FALSE
+)
+
+# hm00_BCRA1_DMR
+pdf('ERalpha_binding_sites_unibind.pdf',height = 12,width = 15); hm00_ERalpha_binding_sites; dev.off()
+
+
+```
+
+# ERalpha binding sites from Jaspar
+no promoters
+
+downloaded from https://frigg.uio.no/JASPAR/JASPAR_TFBSs/2024/hg38/
+
+do this chunk on the HPC
+```{r eralpha2.jaspar}
+
+# bed <- read.delim('EXP053240.primary_endometrium_cancer.ESR1.MA0112.3.damo.bed',sep="\t",header=FALSE); colnames(bed) <- c('seqnames','start','end','id','score','strand') # option 1
+bed <- read.delim('MA0112.4_Jaspar_ESR1_hg38.bed',sep="\t",header=FALSE); colnames(bed) <- c('seqnames','start','end','id','score','score2','strand')
+
+gr <- makeGRangesFromDataFrame(bed)
+genome(gr) <- 'hg38'
+
+# now remove promoters from gr, so that we are only dealing with enhancers
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+promoters.gr <- promoters(TxDb.Hsapiens.UCSC.hg38.knownGene)
+gr.no.promoter <- setdiff(gr,promoters.gr, ignore.strand=TRUE) 
+gr.promoter <- subsetByOverlaps(x=gr, ranges=promoters.gr, ignore.strand=TRUE) 
+
+# want to get all probes that overlap the binding sites, this might be too large??
+genome(myBS) <- 'hg38'
+genome(gr.no.promoter) <- 'hg38'
+gr2 <- subsetByOverlaps(x=myBS,ranges=gr.no.promoter)
+# > gr2
+# An object of type 'BSseq' with
+#   152265 methylation loci
+#   103 samples
+# has not been smoothed
+# All assays are in-memory
+
+# > gr2 - THIS IS WITHOUT PROMOTER PROBES
+# An object of type 'BSseq' with
+#   90744 methylation loci
+#   103 samples
+# has not been smoothed
+# All assays are in-memory
+
+
+
+tmp <- as.data.frame(bsseq::getMeth(gr2,type='raw'))
+tmpCov <- as.data.frame(bsseq::getCoverage(gr2,type='raw'))
+
+# get sites with >10 coverage in all
+ymat <- apply(tmpCov,1,FUN=function(x){
+  length(which(x>5))==length(x)
+})
+# > table(ymat)
+# ymat
+# FALSE  TRUE 
+# 46966 14515 
+
+tmp1 <- tmp[ymat,]
+
+# now get only the most variable
+vars <- matrixStats::rowVars(as.matrix(tmp1))
+mostVar <- order(vars,decreasing=TRUE)
+n = 2000
+
+tmp2 <- tmp1[mostVar[1:n],]
+
+saveRDS(tmp2,file='ERalpha_binding_Jaspar_MA0112.4.Rds')
+
+```
+
+do this local
+```{r get_mat_and_make_heatmap2}
+
+
+# mat <- readRDS('ERalpha_binding_unibind.Rds')[,meta00$SVC]
+mat <- readRDS('ERalpha_binding_Jaspar_MA0112.4.Rds')[,meta00$SVC]
+dim(mat)
+stopifnot(all(colnames(mat)==meta00$SVC))
+colnames(mat) <- meta00$patientID
+
+# matScaled <- t(scale(t(mat),center = TRUE))
+# matScaled[matScaled > 2] <- 2
+# matScaled[matScaled < (-2)] <- (-2)
+hm00_ERalpha_binding_sites <- ComplexHeatmap::Heatmap(
+  mat,
+  # matScaled,
+  show_column_names = TRUE,
+  show_row_names = FALSE,
+  cluster_column_slices = FALSE,
+  cluster_row_slices = FALSE,
+  col=viridis::cividis(n=100),
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  heatmap_legend_param = list(title='Beta'),
+  row_title_gp = gpar(fontsize = 7),
+  row_names_gp = gpar(fontsize = 7),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 8#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 12),
+  # column_split = meta00$MenoStatus,
+  top_annotation = haCol_DMR,
+  heatmap_width = unit(8, "in"),  
+  heatmap_height = unit(9, "in"),  
+  row_title_rot = 0,
+  show_row_dend = FALSE
+)
+
+# hm00_BCRA1_DMR
+pdf('ERalpha_binding_Jaspar_MA0112.4.pdf',height = 12,width = 15); hm00_ERalpha_binding_sites; dev.off()
+
+
+# now make a plot of these positions, their beta vs. age and stroma %
+meta00$ESR1_tfbs_CpGs <- colMeans(mat)
+
+stopifnot(all(meta00$patientID==colnames(mat)))
+
+fff <- cor.test(meta00$`Age at time of surgery`,meta00$ESR1_tfbs_CpGs,method='spearman')
+
+# do glm with age + stroma
+result <- glm(meta00$ESR1_tfbs_CpGs ~ meta00$`Age at time of surgery`+meta00$MIR200cAvgBeta)
+summary(result)
+
+a <- ggplot(meta00,aes(x=`Age at time of surgery`,y=ESR1_tfbs_CpGs,color=MenoStatus)) + 
+  geom_point() + theme_classic() + labs(caption='Top 2k most variable CpGs with >5 coverage in all samples\noverlapping Jaspar ESR1 TFBS excluding promoter CpGs',subtitle = paste0('Spearman rho=',signif(fff$estimate,2),'; Pval=',signif(fff$p.value,2))) + scale_color_manual(values=c("#28BBECFF","#FB8022FF","grey33")) + geom_smooth(se=FALSE)
+
+
+ggg <- cor.test(meta00$MIR200cAvgBeta,meta00$ESR1_tfbs_CpGs,method='spearman')
+b <- ggplot(meta00,aes(x=MIR200cAvgBeta,y=ESR1_tfbs_CpGs,color=MenoStatus,size=`Age at time of surgery`)) + 
+  geom_point() + theme_classic() + labs(caption='Top 2k most variable CpGs with >5 coverage in all samples\noverlapping Jaspar ESR1 TFBS excluding promoter CpGs',subtitle = paste0('Spearman rho=',signif(ggg$estimate,2),'; Pval=',signif(ggg$p.value,2)),xlab='Stroma Fraction') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF","grey33")) +
+  geom_smooth(se=FALSE,show.legend = FALSE)
+
+pdf('ERalpha_binding_Jaspar_MA0112.4_correlations.pdf',height = 3,width = 5);
+a + b + plot_layout(nrow=2)
+a
+b
+dev.off()
+
+cor.test(meta00$ESR1_tfbs_CpGs,meta00$`Age at time of surgery`,method='spearman') 
+rstatix::anova_test(meta00,ESR1_tfbs_CpGs ~ MenoStatus)
+rstatix::pairwise_wilcox_test(meta00,ESR1_tfbs_CpGs ~ MenoStatus)
+rstatix::pairwise_wilcox_test(meta00,ESR1_tfbs_CpGs ~ cluster2)
+```
+
+
+# GSTP1 
+
+<!-- chr11:67,583,742-67,586,656 -->
+
+```{r GSTP1}
+
+GSTP1 <- makeGRangesFromDataFrame(df=data.frame(
+  seqnames = c('chr11'),
+  start = c(67581742), # 2kb upsteam of TSS from genecards
+  end = c(67586656)
+))
+
+gr2 <- subsetByOverlaps(x=myBS,ranges=GSTP1)
+tmp <- as.data.frame(bsseq::getMeth(gr2,type='raw'))
+saveRDS(tmp,file='GSTP1_promoter_methylation_data.frame.Rds')
+
+genome(GSTP1) <- 'hg38' # this needs to be done after subsetByOverlaps
+# and save the rowranges of the CpGs for use w/ Gviz
+saveRDS(rowRanges(gr2),file='GSTP1_rowRanges.Rds')
+```
+
+```{r get_mat_and_make_heatmap_GSTP1}
+
+
+mat <- readRDS('GSTP1_promoter_methylation_data.frame.Rds')[,meta00$SVC]
+dim(mat)
+stopifnot(all(colnames(mat)==meta00$SVC))
+colnames(mat) <- meta00$patientID
+mat[is.na(mat)] <- 0
+
+
+# add the rowranges
+tmp <- readRDS('GSTP1_rowRanges.Rds')
+tmp <- data.frame(tmp)
+
+rownames(mat) <- tmp$start
+
+hm00_GSTP1 <- ComplexHeatmap::Heatmap(mat,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  cluster_column_slices = FALSE,
+  cluster_row_slices = FALSE,
+  col=viridis::cividis(n=100),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  heatmap_legend_param = list(title='Beta'),
+  row_title_gp = gpar(fontsize = 7),
+  row_names_gp = gpar(fontsize = 1),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 8#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 12),
+  # column_split = meta00$MenoStatus,
+  top_annotation = haCol_DMR,
+  heatmap_width = unit(8, "in"),  
+  heatmap_height = unit(9, "in"),  
+  row_title_rot = 0,
+  show_row_dend = FALSE,
+)
+# hm00_BCRA1_DMR
+pdf('GSTP1_promoter_methylation.pdf',height = 15,width = 15); hm00_GSTP1; dev.off()
+
+```
+
+```{r GSTP1_gviz,fig.height=5,fig.width=5}
+
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(Gviz)
+
+# yep, June 2024 and here we are...
+getOption("Gviz.scheme")
+## [1] "default"
+scheme <- getScheme()
+scheme$GeneRegionTrack$fill <- "grey69"
+addScheme(scheme, "myScheme")
+options(Gviz.scheme = "myScheme")
+
+
+tmp <- readRDS('esr1_rowRanges.Rds')
+options(ucscChromosomeNames=FALSE) 
+atrack <- AnnotationTrack(tmp, name = "CpGs",chromosome = 'chr6')
+atrack_esr1 <- AnnotationTrack(esr1, name = "ESR1",chromosome = 'chr6')
+
+
+esr1.2 <- makeGRangesFromDataFrame(df=data.frame(
+  seqnames = c('chr6'),
+  start = c(151654672),
+  end = c(151879903) # this is the 1st 2k probes only
+))
+atrack_esr1.2 <- AnnotationTrack(esr1.2, name = "ESR1",chromosome = 'chr6')
+
+
+# now annotate the CGIs here manually 
+cgi <- makeGRangesFromDataFrame(df=data.frame(
+  seqnames = c('chr6','chr6','chr6','chr6','chr6','chr6'),
+  start = c(151663974,151681364,151689706,151698238,151763325,151804922),
+  end = c(151665659,151682318,151691481,151701129,151764992,151818111) # this is the 1st 2k probes only
+))
+atrack_cgi <- AnnotationTrack(cgi,name='',chromosome='chr6')
+gtrack <- GenomeAxisTrack()
+plotTracks(atrack)
+
+itrack <- IdeogramTrack(genome = 'hg38', chromosome = 'chr6')
+
+grtrack <- GeneRegionTrack(range=TxDb.Hsapiens.UCSC.hg38.knownGene,chr='chr6',stacking='squish',
+                           geneSymbol = TRUE,transcriptAnnotation = "symbol", name = "Gene")
+
+pdf('ESR1_gviz.pdf',height = 5,width = 5)
+plotTracks(list(itrack, gtrack, #atrack, 
+                atrack_esr1,atrack_esr1.2,atrack_cgi, grtrack),from = 151654672, to=152129619,extend.left = 0.1, extend.right = 0.1)
+dev.off()
+
+
+# now get 
+i <- which(rownames(mat)==151804922); i
+j <- which(rownames(mat)==151818111); j
+x <- colMeans(mat[i:j,])
+y <- data.frame(x) %>% tibble::rownames_to_column('patientID') %>% dplyr::left_join(meta00)
+
+p <- ggplot(y,aes(x=x,y=`Age at time of surgery`,size=MIR200cAvgBeta)) + geom_point() + theme_bw() +
+  scale_size_continuous(breaks = seq(0.1,1,by=0.1)) + xlab('ESR1 promoter methylation') 
+
+p2 <- ggplot(y,aes(x=x,y=MIR200cAvgBeta)) + geom_point() + theme_bw() +
+  scale_size_continuous(breaks = seq(0.1,1,by=0.1)) + xlab('ESR1 promoter methylation') 
+
+  
+  # pdf('ESR1_promoter_methylation_vs_stroma.pdf',height = 4,width = 5); p; dev.off()
+
+cor.test(y$x,y$`Age at time of surgery`,method='spearman')
+cor.test(y$x,y$MIR200cAvgBeta,method='spearman')
+
+```
+
+# UQCRH1 
+
+<!-- chr11:67,583,742-67,586,656 -->
+
+```{r UQCRH1}
+
+UQCRH1 <- makeGRangesFromDataFrame(df=data.frame(
+  seqnames = c('chr1'),
+  start = c(46303558), # 2kb upsteam of TSS from genecards
+  end = c(46303892)
+))
+
+gr2 <- subsetByOverlaps(x=myBS,ranges=UQCRH1)
+tmp <- as.data.frame(bsseq::getMeth(gr2,type='raw'))
+saveRDS(tmp,file='UQCRH1_DMR_microdissected_methylation_data.frame.Rds')
+
+# genome(UQCRH1) <- 'hg38' # this needs to be done after subsetByOverlaps
+# and save the rowranges of the CpGs for use w/ Gviz
+# saveRDS(rowRanges(gr2),file='UQCRH1_rowRanges.Rds')
+```
+
+```{r get_mat_and_make_heatmap_UQCRH1}
+
+
+mat <- readRDS('UQCRH1_DMR_microdissected_methylation_data.frame.Rds')[,meta00$SVC]
+dim(mat)
+stopifnot(all(colnames(mat)==meta00$SVC))
+colnames(mat) <- meta00$patientID
+mat[is.na(mat)] <- 0
+
+
+# add the rowranges
+tmp <- readRDS('GSTP1_rowRanges.Rds')
+tmp <- data.frame(tmp)
+
+rownames(mat) <- tmp$start
+
+hm00_GSTP1 <- ComplexHeatmap::Heatmap(mat,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  cluster_column_slices = FALSE,
+  cluster_row_slices = FALSE,
+  col=viridis::cividis(n=100),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  heatmap_legend_param = list(title='Beta'),
+  row_title_gp = gpar(fontsize = 7),
+  row_names_gp = gpar(fontsize = 1),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 8#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 12),
+  # column_split = meta00$MenoStatus,
+  top_annotation = haCol_DMR,
+  heatmap_width = unit(8, "in"),  
+  heatmap_height = unit(9, "in"),  
+  row_title_rot = 0,
+  show_row_dend = FALSE,
+)
+# hm00_BCRA1_DMR
+pdf('GSTP1_promoter_methylation.pdf',height = 15,width = 15); hm00_GSTP1; dev.off()
+
+```
+
+
+# DMRs from race unadjusted analysis N=7
+
+```{r degs3535}
+
+degTable <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Table2_Tables/DMR_result_tableBRCA_v_NON-BRCA_noPreg_mir200c_adjusted_N7.tsv',sep="\t"); dim(degTable)
+
+degTable <- dplyr::arrange(degTable,min_smoothed_fdr)
+
+esr1 <- makeGRangesFromDataFrame(df=data.frame(
+  seqnames = degTable$seqnames,
+  start = degTable$start,
+  end = degTable$end
+))
+
+saveRDS(esr1,'DMR_result_tableBRCA_v_NON-BRCA_noPreg_mir200c_adjusted_N7_ROWRANGES_topDMR.Rds') # save at local
+
+esr1 <- readRDS('DMR_result_tableBRCA_v_NON-BRCA_noPreg_mir200c_adjusted_N7_ROWRANGES_topDMR.Rds') # read in on HPC
+genome(myBS) <- 'hg38'
+genome(esr1) <- 'hg38'
+gr2 <- subsetByOverlaps(x=myBS,ranges=esr1)
+hits <- findOverlaps(gr2, myBS)
+idx <- unique(subjectHits(hits))
+positions = data.frame(ranges(myBS)[idx])
+tmp <- cbind( 
+  seqnames = as.character(seqnames(myBS)[idx]),
+  positions,
+  as.data.frame(bsseq::getMeth(gr2,type='raw'))
+)
+# saveRDS(tmp,file='DMR_result_tableBRCA_v_NON-BRCA_noPreg_mir200c_adjusted_N7_methylation_data.frame_topDMR.Rds')
+saveRDS(tmp,file='DMR_result_tableBRCA_v_NON-BRCA_noPreg_mir200c_adjusted_N7_methylation_data.frame.Rds')
+
+# and save the rowranges of the CpGs for use w/ Gviz
+# saveRDS(rowRanges(gr2),file='DMR_result_tableBRCA_v_NON-BRCA_noPreg_mir200c_adjusted_N7_rowRanges_topDMR.Rds')
+```
+
+get true mean diff for these 7
+```{r meandiff}
+
+# get the matrix for the 7 DMRs
+mat0 <- readRDS('DMR_result_tableBRCA_v_NON-BRCA_noPreg_mir200c_adjusted_N7_methylation_data.frame.Rds')
+mat <- mat0[,meta00$SVC]
+rownames(mat0) <- paste0(mat0$seqnames,':',mat0$start)
+mat0 <- dplyr::arrange(mat0,seqnames,desc(start))
+dim(mat)
+stopifnot(all(colnames(mat)==meta00$SVC))
+colnames(mat) <- meta00$patientID
+mat[is.na(mat)] <- 0
+
+# get the regions
+regions <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Table2_Tables/DMR_result_tableBRCA_v_NON-BRCA_noPreg_mir200c_adjusted_N7.tsv',sep="\t")
+regions$brca.true.mean.beta <- NULL
+regions$non.brca.true.mean.beta <- NULL
+regions$pre.true.mean.beta <- NULL
+regions$post.true.mean.beta <- NULL
+mat0$DMR <- rep(0,nrow(mat0))
+
+brca.samples <- which(colnames(mat0) %in% dplyr::filter(meta,groupBRCA!='NON-BRCA')$SVC); length(brca.samples)
+non.brca.samples <- which(colnames(mat0) %in% dplyr::filter(meta,groupBRCA=='NON-BRCA' & Pregnancy!='Pregnant')$SVC); length(non.brca.samples)
+
+
+for(i in 1:nrow(regions)){
+  tmp2 <- filter(mat0,seqnames==regions$seqnames[i] & start>=regions$start[i] & start<=regions$end[i]); 
+  print(dim(tmp2))
+
+  # also want to mark in mat0 which rows belong to which DMR for heatmap build
+  J <- which(paste(mat0$seqnames,mat0$start) %in% paste(tmp2$seqnames,tmp2$start))
+  mat0$DMR[J] <- rep(i,length(J))
+  
+  
+  # check that the number of dmrs we are finding is the same as DMRcate reports
+  # stopifnot(nrow(tmp2)==regions$no.cpgs[i])
+  
+  # now get the groupBRCA-specific values
+  regions$brca.true.mean.beta[i] <- mean(rowMeans(tmp2[,brca.samples],na.rm=TRUE))
+  regions$non.brca.true.mean.beta[i] <- mean(rowMeans(tmp2[,non.brca.samples],na.rm=TRUE))
+
+  if(i %% 100 == 0){
+    print(cat("On DMR",i,"\n"))
+  }
+}
+
+# saveRDS(regions,'regions_DMRs_pre_v_post_N39155_with_means.Rds')
+# saveRDS(regions,'regions_DMRs_BRCAmut_v_NonBRCA_no_covariates_N63_with_means.Rds')
+# saveRDS(regions,'regions_DMRs_BRCA_v_NON-BRCA_noPreg_mir200c_race_adjusted_N1_with_means.Rds')
+# saveRDS(regions,'regions_DMRs_DMR_result_table_BRCAmut_v_NonBRCA_no_covariates_N63_with_means.Rds')
+# saveRDS(regions,'regions_DMRs_DMR_result_table_BRCAmut_v_NonBRCA_N7_with_means.Rds')
+
+# save as a table for supp
+write.table(regions,'DMR_result_table_BRCAmut_v_NonBRCA_N7_with_means.tsv',sep="\t",quote=F,row.names=F)
+```
+
+```{r get_mat_and_make_heatmap_degs3535}
+
+
+mat <- mat0[,meta00$SVC]
+rownames(mat) <- rownames(mat0)
+
+# get row annotation - done on mat0
+x1 <- rowMeans(mat0[,brca.samples],na.rm=TRUE)
+x2 <- rowMeans(mat0[,non.brca.samples],na.rm=TRUE)
+meta00$groupBRCA_postpartum <- ifelse(meta00$Postpartum,'Postpartum',as.character(meta00$groupBRCA));
+table(meta00$groupBRCA_postpartum)
+meta00$groupBRCA_postpartum <- factor(meta00$groupBRCA_postpartum,levels=c('NON-BRCA','BRCA1','BRCA2','Postpartum'))
+
+haRow <- rowAnnotation(
+  `Beta Diff` = anno_barplot((x2 - x1),gp = gpar(fill='gray45'), width = unit(0.5, "in"),border=FALSE,ylim=c(-0.2,0.2)))
+
+meta00$groupBRCA <- factor(meta00$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+
+# try with z-score
+matScaled <- t(scale(t(mat),center = TRUE))
+matScaled[matScaled > 2] <- 2
+matScaled[matScaled < (-2)] <- (-2)
+
+
+hm00_dmr7 <- ComplexHeatmap::Heatmap(matScaled,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  cluster_column_slices = FALSE,
+  cluster_row_slices = FALSE,
+  col=viridis::cividis(n=100),
+  cluster_rows = FALSE,
+  cluster_columns = TRUE,
+  heatmap_legend_param = list(title='Beta'),
+  row_title_gp = gpar(fontsize = 7),
+  row_names_gp = gpar(fontsize = 0.5),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 8#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 12),
+  column_split = meta00$groupBRCA_postpartum,
+  top_annotation = haCol_DMR,
+  heatmap_width = unit(8, "in"),  
+  heatmap_height = unit(8, "in"),  
+  row_title_rot = 0,
+  right_annotation = haRow,
+  show_row_dend = FALSE,
+  row_split = paste0('DMR ',mat0$DMR)
+)
+# hm00_BCRA1_DMR
+pdf('DMRs_N7_methylation_HEATMAP.pdf',height = 15,width = 15); hm00_dmr7; dev.off()
+
+# do a boxplots
+dmr_list <- list()
+dmr_list.cpg <- list()
+for(d in unique(mat0$DMR)){
+  x <- dplyr::filter(mat0,DMR==d)
+  x1 <- data.frame(t(x[,meta00$SVC])) %>% tibble::rownames_to_column('SVC')
+  
+  x1.5 <- tidyr::pivot_longer(x1,names_to = 'CpG',values_to = 'Beta',cols=matches('^chr'))
+  x1.5$DMR <- rep(d,nrow(x1.5))
+  x1.5 <- dplyr::left_join(x1.5,meta00)
+  x2 <- data.frame(Beta = colMeans(x[,meta00$SVC])) %>% tibble::rownames_to_column('SVC') %>% dplyr::left_join(meta00)
+  
+  dmr_list[[d]] <- ggplot(x2,aes(x=groupBRCA_postpartum,y=Beta)) + geom_boxplot(outlier.shape = NA) + theme_bw() + geom_jitter(width = 0.1,color='grey32',size=0.5) + xlab('')  + ggtitle(paste0('DMR ',d)) + ylab('')
+  
+  
+  dmr_list.cpg[[d]] <- ggplot(x1.5,aes(x=groupBRCA_postpartum,y=Beta)) + geom_boxplot(outlier.shape = NA) + theme_bw() + geom_jitter(width = 0.1,color='grey32',size=0.5) + xlab('')  + ggtitle(paste0('DMR ',d)) + ylab('') + facet_wrap(~CpG)
+} 
+
+
+ggsave(
+   filename = "dmr7_beta_boxplots.pdf", 
+   plot = marrangeGrob(dmr_list, nrow=1, ncol=7), 
+   width = 15, height = 2.5
+)
+
+ggsave(
+   filename = "dmr7_beta_boxplots_IndvCpGs.pdf", 
+   plot = marrangeGrob(dmr_list.cpg, nrow=1, ncol=7), 
+   width = 15, height = 20
+)
+        
+
+```
+
+# DMRs from brcam - nonbrcam with postpartum N=48, take 5 that pass Stouffer
+
+```{r degs3535}
+# on local
+degTable <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Table2_Tables/DMR_result_table_BRCAmut_v_NonBRCA_mir200c_adjusted_N48.tsv',sep="\t"); dim(degTable)
+
+degTable <- dplyr::arrange(degTable,Stouffer)
+# filter these for Stouffer < 0.05
+degTable <- dplyr::filter(degTable,Stouffer<0.05)
+
+esr1 <- makeGRangesFromDataFrame(df=data.frame(
+  seqnames = degTable$seqnames,
+  start = degTable$start,
+  end = degTable$end
+))
+
+saveRDS(esr1,'DMR_result_table_BRCAmut_v_NonBRCA_mir200c_adjusted_N48_ROWRANGES_topDMR.Rds') # save at local
+
+# on HPC
+esr1 <- readRDS('DMR_result_table_BRCAmut_v_NonBRCA_mir200c_adjusted_N48_ROWRANGES_topDMR.Rds') # read in on HPC
+genome(myBS) <- 'hg38'
+genome(esr1) <- 'hg38'
+gr2 <- subsetByOverlaps(x=myBS,ranges=esr1)
+hits <- findOverlaps(gr2, myBS)
+idx <- unique(subjectHits(hits))
+positions = data.frame(ranges(myBS)[idx])
+tmp <- cbind( 
+  seqnames = as.character(seqnames(myBS)[idx]),
+  positions,
+  as.data.frame(bsseq::getMeth(gr2,type='raw'))
+)
+# saveRDS(tmp,file='DMR_result_tableBRCA_v_NON-BRCA_noPreg_mir200c_adjusted_N7_methylation_data.frame_topDMR.Rds')
+saveRDS(tmp,file='DMR_result_table_BRCAmut_v_NonBRCA_mir200c_adjusted_N48_methylation_data.frame.Rds')
+
+# and save the rowranges of the CpGs for use w/ Gviz
+# saveRDS(rowRanges(gr2),file='DMR_result_tableBRCA_v_NON-BRCA_noPreg_mir200c_adjusted_N7_rowRanges_topDMR.Rds')
+```
+
+get true mean diff for these 7
+```{r meandiff}
+
+# get the matrix for the 7 DMRs
+mat0 <- readRDS('DMR_result_table_BRCAmut_v_NonBRCA_mir200c_adjusted_N48_methylation_data.frame.Rds')
+mat <- mat0[,meta00$SVC]
+rownames(mat0) <- paste0(mat0$seqnames,':',mat0$start)
+mat0 <- dplyr::arrange(mat0,seqnames,desc(start))
+dim(mat)
+stopifnot(all(colnames(mat)==meta00$SVC))
+colnames(mat) <- meta00$patientID
+mat[is.na(mat)] <- 0
+
+# get the regions
+regions <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Table2_Tables/DMR_result_table_BRCAmut_v_NonBRCA_mir200c_adjusted_N48.tsv',sep="\t")
+regions$brca.true.mean.beta <- NULL
+regions$non.brca.true.mean.beta <- NULL
+regions$pre.true.mean.beta <- NULL
+regions$post.true.mean.beta <- NULL
+mat0$DMR <- rep(0,nrow(mat0))
+
+brca.samples <- which(colnames(mat0) %in% dplyr::filter(meta,groupBRCA!='NON-BRCA')$SVC); length(brca.samples)
+non.brca.samples <- which(colnames(mat0) %in% dplyr::filter(meta,groupBRCA=='NON-BRCA' & Pregnancy!='Pregnant')$SVC); length(non.brca.samples)
+
+
+for(i in 1:nrow(regions)){
+  tmp2 <- filter(mat0,seqnames==regions$seqnames[i] & start>=regions$start[i] & start<=regions$end[i]); 
+  print(dim(tmp2))
+
+  # also want to mark in mat0 which rows belong to which DMR for heatmap build
+  J <- which(paste(mat0$seqnames,mat0$start) %in% paste(tmp2$seqnames,tmp2$start))
+  mat0$DMR[J] <- rep(i,length(J))
+  
+  
+  # check that the number of dmrs we are finding is the same as DMRcate reports
+  # stopifnot(nrow(tmp2)==regions$no.cpgs[i])
+  
+  # now get the groupBRCA-specific values
+  regions$brca.true.mean.beta[i] <- mean(rowMeans(tmp2[,brca.samples],na.rm=TRUE))
+  regions$non.brca.true.mean.beta[i] <- mean(rowMeans(tmp2[,non.brca.samples],na.rm=TRUE))
+
+  if(i %% 100 == 0){
+    print(cat("On DMR",i,"\n"))
+  }
+}
+
+# saveRDS(regions,'regions_DMRs_pre_v_post_N39155_with_means.Rds')
+# saveRDS(regions,'regions_DMRs_BRCAmut_v_NonBRCA_no_covariates_N63_with_means.Rds')
+# saveRDS(regions,'regions_DMRs_BRCA_v_NON-BRCA_noPreg_mir200c_race_adjusted_N1_with_means.Rds')
+# saveRDS(regions,'regions_DMRs_DMR_result_table_BRCAmut_v_NonBRCA_no_covariates_N63_with_means.Rds')
+# saveRDS(regions,'regions_DMRs_DMR_result_table_BRCAmut_v_NonBRCA_N7_with_means.Rds')
+
+# save as a table for supp
+write.table(regions,'DMR_result_table_BRCAmut_v_NonBRCA_mir200c_adjusted_N48_with_means.tsv',sep="\t",quote=F,row.names=F)
+```
+
+```{r get_mat_and_make_heatmap_degs3535}
+
+
+mat <- mat0[,meta00$SVC]
+rownames(mat) <- rownames(mat0)
+
+# get row annotation - done on mat0
+x1 <- rowMeans(mat0[,brca.samples],na.rm=TRUE)
+x2 <- rowMeans(mat0[,non.brca.samples],na.rm=TRUE)
+meta00$groupBRCA_postpartum <- ifelse(meta00$Postpartum,'Postpartum',as.character(meta00$groupBRCA));
+table(meta00$groupBRCA_postpartum)
+meta00$groupBRCA_postpartum <- factor(meta00$groupBRCA_postpartum,levels=c('NON-BRCA','BRCA1','BRCA2','Postpartum'))
+
+haRow <- rowAnnotation(
+  `Beta Diff` = anno_barplot((x2 - x1),gp = gpar(fill='gray45'), width = unit(0.5, "in"),border=FALSE,ylim=c(-0.4,0.4)))
+
+# meta00$groupBRCA <- factor(meta00$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+
+# try with z-score
+# matScaled <- t(scale(t(mat),center = TRUE))
+# matScaled[matScaled > 2] <- 2
+# matScaled[matScaled < (-2)] <- (-2)
+
+
+hm00_dmr48 <- ComplexHeatmap::Heatmap(mat,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  cluster_column_slices = FALSE,
+  cluster_row_slices = FALSE,
+  col=viridis::cividis(n=100),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  heatmap_legend_param = list(title='Beta'),
+  row_title_gp = gpar(fontsize = 7),
+  row_names_gp = gpar(fontsize = 8),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 8#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 12),
+  column_split = meta00$groupBRCA_postpartum,
+  top_annotation = haCol_DMR,
+  heatmap_width = unit(8, "in"),  
+  heatmap_height = unit(8, "in"),  
+  row_title_rot = 0,
+  right_annotation = haRow,
+  show_row_dend = FALSE,
+  row_split = paste0('DMR ',mat0$DMR)
+)
+# hm00_BCRA1_DMR
+pdf('DMRs_N48_methylation_HEATMAP.pdf',height = 15,width = 15); hm00_dmr48; dev.off()
+
+# do a boxplots
+dmr_list <- list()
+# dmr_list.cpg <- list()
+for(i in 1:length(unique(mat0$DMR))){
+  d <- unique(mat0$DMR)[i]
+  x <- dplyr::filter(mat0,DMR==d)
+  x1 <- data.frame(t(x[,meta00$SVC])) %>% tibble::rownames_to_column('SVC')
+  
+  x1.5 <- tidyr::pivot_longer(x1,names_to = 'CpG',values_to = 'Beta',cols=matches('^chr'))
+  x1.5$DMR <- rep(d,nrow(x1.5))
+  x1.5 <- dplyr::left_join(x1.5,meta00)
+  x2 <- data.frame(Beta = colMeans(x[,meta00$SVC])) %>% tibble::rownames_to_column('SVC') %>% dplyr::left_join(meta00)
+  
+  dmr_list[[i]] <- ggplot(x2,aes(x=groupBRCA_postpartum,y=Beta)) + geom_boxplot(outlier.shape = NA) + theme_bw() + geom_jitter(width = 0.1,color='grey32',size=0.5) + xlab('')  + ggtitle(paste0('DMR ',d)) + ylab('')
+  
+  
+  # dmr_list.cpg[[d]] <- ggplot(x1.5,aes(x=groupBRCA_postpartum,y=Beta)) + geom_boxplot(outlier.shape = NA) + theme_bw() + geom_jitter(width = 0.1,color='grey32',size=0.5) + xlab('')  + ggtitle(paste0('DMR ',d)) + ylab('') + facet_wrap(~CpG)
+} 
+
+library(gridExtra)
+ggsave(
+   filename = "dmr48_beta_boxplots.pdf", 
+   plot = marrangeGrob(dmr_list, nrow=1, ncol=7), 
+   width = 15, height = 2.5
+)
+        
+
+```
+
+

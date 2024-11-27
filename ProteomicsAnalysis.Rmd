@@ -1,0 +1,2025 @@
+---
+title: "Canary Proteomics adjusting for covariates"
+author: "Ian Beddows"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+params:
+  rmd: ""
+output:
+  html_document:
+    dev: png
+    code_folding: hide
+    self_contained: yes
+    toc: true
+    toc_depth: 2
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    df_print: paged
+    css: styles.css
+---
+
+```{r setup,echo=FALSE}
+# 
+# knitr::opts_chunk$set(
+# 	echo = TRUE,
+# 	message = FALSE,
+# 	warning = FALSE,
+# 	cache = TRUE,
+# 	cache.lazy = FALSE
+# )
+
+```
+
+```{r loadlibs}
+# > library(clusterProfiler)
+# Error: package or namespace load failed for ‘clusterProfiler’:
+#  object ‘get_fun_from_pkg’ is not exported by 'namespace:rvcheck'
+# require(devtools)
+# install_version("rvcheck", version = "0.1.8", repos = "http://cran.us.r-project.org")
+# library(rvcheck)
+# 
+suppressPackageStartupMessages({
+    library(yaml)
+    library(xtable)
+    library(kableExtra)
+    library(tidyverse)
+    library(reshape2)
+    library(matrixStats)
+    library(SummarizedExperiment)
+    library(DESeq2)
+    library(ggrepel)
+    library(gridExtra)
+    require(grid)
+    library(pheatmap)
+    library(cowplot)
+    library(RColorBrewer)
+    library(edgeR)
+    library(clusterProfiler)
+    library(enrichplot)
+    library(msigdbr)
+    library(biomaRt)
+    library(org.Hs.eg.db)
+    # library(vegan)
+    library(ComplexHeatmap)
+    library(patchwork)
+    library(viridis)
+})
+
+
+# library(org.Rn.eg.db)
+
+```
+
+assayed # [1] "C-21-74" "C-21-77" "C-21-81" "C-21-91"
+but no meta data for these samples (maybe dropped from spreadsheet because no rna/meth?)
+
+load the header and the master.meta, do some checking
+```{r load_proteomics_samples}
+
+xx <- data.frame(t(read.delim('20231030_canary_ms_data.txt',sep="\t",check.names = FALSE,header=FALSE)[1:5,6:160]))
+# Thanks for your time earlier today! As discussed, here is the table summarizing the quantitative data for the 155 FFPE samples we analyzed.
+stopifnot(nrow(xx)==155)
+
+
+colnames(xx)[1:3] <- c('Batch','theirBatch','sample_raw')
+# table(xx$Batch,xx$theirBatch) # looks good 
+xx$firstChunk <- substr(x=xx$sample_raw,start=4,stop=23)
+table(xx$firstChunk,xx$Batch) # corresponds perfectly to batch
+
+
+xx$sample_id_Chunk <- substr(x=xx$sample_raw,start=25,stop=31)
+xx$sample_id_Chunk <- gsub(pattern='_',replacement = "",x=xx$sample_id_Chunk)
+xx$sample_id_Chunk <- gsub(pattern='\\-$',replacement = "",x=xx$sample_id_Chunk,perl = TRUE)
+xx$sample_id_Chunk <- gsub(pattern='^\\-',replacement = "",x=xx$sample_id_Chunk,perl = TRUE)
+length(xx$sample_id_Chunk) # 155
+length(unique(xx$sample_id_Chunk)) # 105
+
+xx$ffpe_identifierChunk <- substr(x=xx$sample_raw,start=32,stop=42)
+xx$ffpe_identifierChunk <- gsub(pattern='\\-$',replacement = "",x=xx$ffpe_identifierChunk,perl = TRUE)
+xx$ffpe_identifierChunk <- gsub(pattern='^\\-',replacement = "",x=xx$ffpe_identifierChunk,perl = TRUE)
+length(unique(xx$ffpe_identifierChunk)) # 155
+
+# ok, so now read in the RAW spreadsheet & attach this info and resave as an updated version! change column order manually when doing manual QC!
+
+master.meta.file="../MasterCanaryClinData_20230913.xlsx"
+sheet = 'data_clean'
+cat('Loading Master Meta Data:',master.meta.file,"\n")
+cat('\tSheet:',sheet,"\n")
+master.meta <- readxl::read_excel(path=master.meta.file,sheet=sheet)
+dim(master.meta)
+
+
+# table(master.meta$patientID %in% unique(xx$sample_id_Chunk))
+table(unique(xx$sample_id_Chunk) %in% master.meta$patientID)
+# FALSE  TRUE 
+    # 7    98 
+
+uniq <- unique(xx$sample_id_Chunk)
+uniq[which(! uniq %in% master.meta$patientID)]
+
+# [1] "C-21-74" "C-21-77" "C-21-81" "C-21-91"
+
+# these are not in the spreadsheet online! So need to be 
+
+# xx$sample_id_Chunk[q]
+# saveRDS(datValues,file='datValuesN155.Rds')
+
+```
+
+```{r load_intensity_data}
+
+dat <- data.frame(read.delim('20231030_canary_ms_data.txt',sep="\t",check.names = FALSE,header=FALSE,skip = 2))
+# check if this will work..
+stopifnot(all(xx$sample_raw==dat[1,6:ncol(dat)]))
+datValues <- dat[3:nrow(dat),6:ncol(dat)]
+dim(datValues) # assayed 5959 proteins fragments
+colnames(datValues) <- xx$ffpe_identifierChunk # do this for now because their are multiple sample IDs
+rownames(datValues) <- make.names(dat[3:nrow(dat),4],unique=TRUE)
+datValues <- dplyr::mutate_all(datValues, function(x) as.numeric(as.character(x)))
+# View(head(dat,100))
+
+
+```
+
+```{r,eval=FALSE}
+
+library(rlist)
+duplicatedCases <- xx$sample_id_Chunk[which(duplicated(xx$sample_id_Chunk))]
+NotduplicatedCasesFFPEid <- xx$ffpe_identifierChunk[which(!duplicated(xx$sample_id_Chunk))]
+
+myDups <- which(duplicated(xx$sample_id_Chunk))
+take_these_ffpe_ids<- xx$ffpe_identifierChunk[-myDups]
+length(take_these_ffpe_ids)
+
+R <- cor(X,use='complete.obs')
+
+corlist4dups <- list()
+for(c in duplicatedCases){
+  # print(c)
+  # get identifiers
+  ids <- xx$ffpe_identifierChunk[which(xx$sample_id_Chunk==c)]
+  
+  corlist4dups <- list.append(corlist4dups,
+                            as.numeric(cor.test(datValues[,ids[1]],datValues[,ids[2]],method='spearman')$estimate)
+  )
+}
+length(corlist4dups)
+
+summary(unlist(corlist4dups))
+# Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# tmp  0.9129  0.9495  0.9350  0.9657  0.9841 
+
+vec <- c(R[NotduplicatedCasesFFPEid,NotduplicatedCasesFFPEid])
+summary(vec[-which(vec==1)])# summary of non 1 values (because those are cor to itself)
+  # Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+ # 0.2759  0.8053  0.8700  0.8482  0.9120  0.9859 
+```
+
+```{r get_mean_cor_to_other_samples}
+R <- cor(X,use='complete.obs')
+meanCorDF <- data.frame(colMeans(R,na.rm = TRUE))
+meanCorDF$ffpe_identifierChunk <- rownames(test)
+colnames(meanCorDF)[1] <- 'MeanCorrelationToOtherSamples'
+
+# metaXX <- dplyr::left_join(metaXX,test)
+
+# ggplot(test,aes(x=MeanCorrelationToOtherSamples)) + geom_histogram()
+# 
+# test[which(test$MeanCorrelationToOtherSamples==min(test$MeanCorrelationToOtherSamples)),]
+# # 1B_S1-D1_1	 has such low correlation that I think this sample failed!
+# # '1B_S1-D1_1' %in% duplicatedCases # FALSE, so must remove
+# 
+# meta$
+
+# datValuesN104 <- datValues[,take_these_ffpe_ids]
+# datValuesN104 <- datValuesN104[,-which(colnames(datValuesN105)=='1B_S1-D1_1')]
+# dim(datValuesN104)
+# R <- cor(X,use='complete.obs')
+# [1] 5959  104
+```
+
+add 2 columns to metadata
+useProteinData
+quantifiedProtein
+there are 10 proteomics samples that do not have rna or meth data. So 6 in addition to the 4 without any clin data
+these 6 are:
+
+```{r join_metaMeth}
+
+meta.rna <- readRDS('../canary_meth_Rproj/meta.rna_N94.Rds')
+meta.meth <- readRDS('../canary_meth_Rproj/meta_N103.Rds')
+
+tmp <- master.meta[,c('Patient ID','patientID')]
+tmp <- dplyr::filter(tmp,patientID %in% unique(xx$sample_id_Chunk)); dim(tmp) # this says 103 which is two more than the 101 expected ???
+# length(unique(tmp$patientID))
+# length(unique(tmp$`Patient ID`))
+# ok it is because some CaseIDs are in the master.meta twice for some reason, so remove these dups -- need to sort this out 
+
+## FIXED now says 101 after manual removal of dups in data_clean -- 11/8/23
+
+# tmp <- tmp[-which(duplicated(tmp$`Patient ID`)),]
+# dim(tmp)
+table(tmp$patientID%in%xx$sample_id_Chunk)
+# TRUE 
+ # 101
+
+table(unique(xx$sample_id_Chunk)%in%tmp$patientID)
+# FALSE  TRUE 
+    # 4   101 # shows expected 4 samples missing clin data
+
+metaXX <- dplyr::left_join(xx,tmp,by=c('sample_id_Chunk'='patientID'))
+metaXX <- dplyr::left_join(metaXX,meanCorDF)
+dim(metaXX)
+
+table(unique(metaXX$`Patient ID`) %in% c(meta.rna$`Patient ID`,meta.meth$`Patient ID`))
+# FALSE  TRUE 
+    # 4    98 
+
+# nice, this means all except the 4 without clin data have their clin data in the rna or meth!
+table(unique(metaXX$`Patient ID`) %in% meta.meth$`Patient ID`)
+# FALSE  TRUE 
+    # 6    96 
+# 96 have metadata in the meth, so use this for a start (dropping two samples info, get these from the rna later)
+
+metaXX <- dplyr::left_join(metaXX,meta.meth,by='Patient ID')
+dim(metaXX)
+# [1] 155  61
+table(metaXX$ReproductiveStatus)
+
+saveRDS(metaXX,file='temporary_protein_metadata_N155.Rds')
+
+```
+
+```{r correlationHeatmap}
+library(ComplexHeatmap)
+pal = c(
+  viridis::viridis(n=4),
+  viridis::rocket(n=5)[2:4],
+  viridis::turbo(n=5)[c(2,4)]
+)
+pal2 = viridis::turbo(n=5)
+palBatch <- viridis::viridis(n=6)
+
+haRowProtBatch <- rowAnnotation(
+  Batch = metaXX$Batch,
+  `Reproductive Status` = metaXX$ReproductiveStatus,
+  `Race` = metaXX$Race,
+  `Age` = metaXX$`Age at time of surgery`,
+  `Pregnancy` = metaXX$Pregnancy,
+  `Days since LMP` = metaXX$DaysSinceLMP_use,
+  `BRCA status` = metaXX$groupBRCA,
+  col = list(
+    `Days since LMP` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 50, length = 20),
+                              colors = colorRampPalette(c("gray100", "gray10"))(20)
+    ),
+    `Age` = circlize::colorRamp2(
+                              breaks = seq(from = 20, to = 72, length = 20),
+                              colors = colorRampPalette(c("gray75", "gray10"))(20)
+    ),
+    `Pregnancy` = c(
+      'Pregnant' = 'pink',
+      'Normal' = 'gray22'
+    ),
+    Batch = c(
+      'batch1' = palBatch[1],
+      'batch2' = palBatch[2],
+      'batch3' = palBatch[3],
+      'batch4' = palBatch[4],
+      'batch5' = palBatch[5],
+      'batch6' = palBatch[6]
+    ),
+    `Reproductive Status` = c(
+      'Pre' = pal[8],
+      'Post' = pal[9]
+    ),
+    `BRCA status` = c(
+      'BRCA1' = '#40498e',
+      'BRCA2' = '#38aaac',
+      'NON-BRCA' = 'black'
+    ),
+    Race = c(
+      'Asian' = pal2[1],
+      'Black' = pal2[2],
+      'East Indian' = pal2[3],
+      'Hispanic Latino/White' = pal2[4],
+      'White' = pal2[5],
+      'Other' = 'gray48'
+    )
+  )
+)
+
+
+all(colnames(R)==metaXX$ffpe_identifierChunk)
+
+hmCor <- Heatmap(R,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  col=viridis::magma(20),
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  heatmap_legend_param = list(title='Rho'),
+  row_title_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 3),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 3#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 10),
+  # right_annotation = haRowMaster,
+  # right_annotation = haRow_MIR141,
+  right_annotation = haRowProtBatch,
+  heatmap_width = unit(6, "in"),  
+  heatmap_height = unit(5, "in"),  
+  # row_split = paste0(meta$ReproductiveStatus,'\n',meta$groupBRCA),
+  # row_split = xx$Batch,
+  # column_split = xx$Batch,
+  row_title_rot = 0
+)
+
+pdf('cor_heatmap.pdf',width=10,height=7); print(hmCor); dev.off()
+```
+
+establish metaXX$useProteinData variable
+```{r missing_data_boxplot}
+
+test <- data.frame(apply(datValues,2,FUN=function(x){
+  return(round(length(which(is.na(x)))/length(x)*100,2))
+}))
+dim(test)
+test$ffpe_identifierChunk <- rownames(test)
+colnames(test)[1] <- 'NA_frac'
+metaXX <- dplyr::left_join(metaXX,test)
+
+# here it is!!
+metaXX$useProteinData <- ifelse(metaXX$NA_frac>50,FALSE,TRUE)
+metaXX$useProteinData <- ifelse(metaXX$ffpe_identifierChunk=='1B_S1-D1_1',FALSE,metaXX$useProteinData)
+
+table(metaXX$useProteinData)
+
+ggplot(metaXX,aes(x=NA_frac,fill=useProteinData)) + geom_histogram()
+ggplot(metaXX,aes(x=MeanCorrelationToOtherSamples,fill=useProteinData)) + geom_histogram()
+
+```
+
+
+# Filter samples & fix up meta
+1) remove samples due to low quality!
+2) merge samples from same FFPE block/Patient
+
+```{r filter_then_merge}
+
+stopifnot(nrow(metaXX)==155)
+
+stopifnot(length(unique(metaXX$`Patient ID`))==102)
+
+tmpMETA <- dplyr::filter(metaXX,useProteinData==TRUE)
+dim(tmpMETA)
+
+length(unique(tmpMETA$ffpe_identifierChunk))
+all(unique(tmpMETA$ffpe_identifierChunk)%in%colnames(datValues))
+
+tmpLIST <- list()
+pids <- unique(tmpMETA$`Patient ID`)
+pids <- pids[!is.na(pids)]
+for(i in 1:length(pids)){
+  c <- pids[i]
+  ids <- tmpMETA$ffpe_identifierChunk[which(tmpMETA$`Patient ID`==c)]
+  if(length(ids)==3){
+    cat(print(paste('Merging FFPE ids',paste(ids,collapse=" & "),"for Patient ID",c,"\n")))
+    tmpLIST[[i]] <- rowMeans(datValues[,ids],na.rm=TRUE)
+    taken[[counter]] <- ids[1]
+    taken[[counter+1]] <- ids[2]
+    taken[[counter+2]] <- ids[3]
+    counter <- counter + 3
+  }else if(length(ids)==2){
+    cat(print(paste('Merging FFPE ids',paste(ids,collapse=" & "),"for Patient ID",c,"\n")))
+    tmpLIST[[i]] <- rowMeans(datValues[,ids],na.rm=TRUE)
+  }else if(length(ids)==1){
+    cat(print(paste('Single FFPE id',paste(ids),"for Patient ID",c,"\n")))
+    tmpLIST[[i]] <- datValues[,ids]
+  }else{
+    warning(paste("_____WARNING______",c,'does not have ids'))
+  }
+}
+length(tmpLIST) # 101
+protein_data = t(do.call(rbind, tmpLIST))
+colnames(protein_data) <- pids
+dim(protein_data)
+
+protein_meta <- dplyr::filter(metaXX,!is.na(metaXX$Pilot)) # because missing otherwise 
+protein_meta <- dplyr::filter(protein_meta,!duplicated(protein_meta$`Patient ID`))
+
+
+dim(protein_meta)
+protein_data <- protein_data[,protein_meta$`Patient ID`]
+ncol(protein_data)==nrow(protein_meta)
+
+all(colnames(protein_data)%in%protein_meta$`Patient ID`)
+all(colnames(protein_data)==protein_meta$`Patient ID`)
+any(!protein_meta$`Patient ID`%in%colnames(protein_data))
+
+# what is up with these samples??
+# Warning: _____WARNING______ C-21-41 does not have ids
+# Warning: _____WARNING______ C-21-47 does not have ids
+# tmpMETA$ffpe_identifierChunk[which(tmpMETA$`Patient ID`=='C-21-41')] # has 3
+# tmpMETA$ffpe_identifierChunk[which(tmpMETA$`Patient ID`=='C-21-47')] # has 3
+
+# saveRDS(protein_data,file='protein_data_N96.Rds')
+# saveRDS(protein_meta,file='protein_meta_N96.Rds')
+
+```
+
+# Check that the merging went as expected 
+
+1) check that the frac_na went down
+2) a joint matrix with unmerged
+
+```{r build_DOUBLEmerged_meta}
+test <- data.frame(apply(protein_data,2,FUN=function(x){
+  return(round(length(which(is.na(x)))/length(x)*100,2))
+}))
+dim(test)
+test$`Patient ID` <- rownames(test)
+colnames(test)[1] <- 'NA_frac'
+protein_meta <- dplyr::left_join(protein_meta,test)
+
+# joint meta
+metaXX$sampleSTATUS <- 'UNMERGED'
+protein_meta$sampleSTATUS <- 'MEAN_VALUES'
+meta251 <- dplyr::bind_rows(metaXX,protein_meta)
+
+```
+
+```{r boxplot_na_frac}
+
+g <- ggplot(meta251,aes(y=NA_frac,x=sampleSTATUS)) + 
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+      geom_jitter(size = 2, alpha = 1, width = 0.1) + theme_bw() + 
+  # scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + 
+  theme(legend.position='none') +
+  xlab('NA fraction') 
+g
+
+pdf('boxplot_NA_frac_after_merging_PatientID.pdf',height = 5,width = 5);g;dev.off()
+```
+
+# Filter protein_data for all missing
+```{r missing_data_by_protein_frag}
+test <- data.frame(apply(protein_data,1,FUN=function(x){
+  return(round(length(which(is.na(x)))/length(x)*100,2))
+}))
+ggplot(test,aes(`apply.protein_data..1..FUN...function.x...`)) + geom_histogram() + theme_bw() + xlab('Fraction missing samples')
+
+if(nrow(protein_data)==5959){
+  protein_data <- protein_data[-which(test[,1]==100),]
+}
+# dim(protein_data)
+# [1] 5957   96
+```
+
+```{r correlation_with_dblmerged_mat}
+
+
+
+ha201 <- rowAnnotation(
+  mergeSTATUS = meta251$sampleSTATUS
+)
+
+tmp <- datValues
+all(colnames(tmp)==metaXX$ffpe_identifierChunk)
+colnames(tmp) <- paste(metaXX$`Patient ID`,metaXX$ffpe_identifierChunk)
+X <- cbind(tmp,protein_data)
+Z <- cor(X,use='complete.obs')
+
+hmCor <- Heatmap(Z,
+  show_column_names = FALSE,
+  show_row_names = TRUE,
+  col=viridis::magma(20),
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  heatmap_legend_param = list(title='Rho'),
+  row_title_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 1),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 3#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 10),
+  # right_annotation = haRowMaster,
+  # right_annotation = haRow_MIR141,
+  right_annotation = ha201,
+  heatmap_width = unit(6, "in"),  
+  heatmap_height = unit(5, "in"),  
+  # row_split = paste0(meta$ReproductiveStatus,'\n',meta$groupBRCA),
+  # row_split = meta201$`Patient ID`,
+  # column_split = meta201$`Patient ID`,
+  row_title_rot = 0
+)
+
+pdf('cor_heatmap_merged_unmerged.pdf',width=10,height=7); print(hmCor); dev.off()
+```
+
+
+# Get new Frac_NA
+
+```{r}
+
+test <- data.frame(apply(protein_data,2,FUN=function(x){
+  return(round(length(which(is.na(x)))/length(x)*100,2))
+}))
+dim(test)
+colnames(test)[1] <- 'NA_frac'
+max(test$NA_frac)
+
+ggplot(test,aes(x=NA_frac)) + geom_histogram() + xlim(c(0,100))
+```
+
+# Boxplot of detected proteins
+
+```{r boxplot_na_frac}
+test <- data.frame(apply(protein_data,2,FUN=function(x){
+  return(length(which(!is.na(x))))
+}))
+# table(protein_meta$`Patient ID` %in% rownames(test))
+test$`Patient ID` = rownames(test)
+test <- dplyr::left_join(test,protein_meta)
+colnames(test)[1] <- 'Detected Proteins'
+g <- ggplot(test,aes(y=`Detected Proteins`,x=groupBRCA)) + 
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+      geom_jitter(size = 2, alpha = 1, width = 0.1,aes(color=ReproductiveStatus)) + theme_bw() + 
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) +
+  theme(legend.position='none') +
+  xlab('') 
+g
+
+pdf('boxplot_detected_fragments.pdf',height = 3,width = 3);g;dev.off()
+
+test %>% rstatix::anova_test(`Detected Proteins` ~ groupBRCA)
+test %>% rstatix::pairwise_wilcox_test(`Detected Proteins` ~ groupBRCA)
+cor.test(x = test$MIR200cAvgBeta, y = test$`Detected Proteins`,method='spearman')
+
+ggplot(test,aes(x=`Detected Proteins`, y = MIR200cAvgBeta)) + geom_point()
+
+```
+
+# PCA
+
+## with NAs<-0
+
+```{r pca}
+
+protein_data.pca <- protein_data
+protein_data.pca[is.na(protein_data.pca)] <- 0
+
+set.seed(5443546)
+pca <- prcomp(t(protein_data.pca))
+pr_comps <- data.frame(pca$x)
+dim(pr_comps)
+# pr_comps$SVC <- gsub('_pilot[BC]','',rownames(pr_comps))
+pr_comps$`Patient ID` <- rownames(pr_comps)
+# pr_comps$sample <- rownames(pr_comps)
+# column_meta <- as.data.frame(colData(bbc_obj), stringsAsFactor = FALSE)
+pr_comps <- dplyr::left_join(pr_comps, protein_meta)
+dim(pr_comps)
+prop_var <- data.frame(t(summary(pca)$importance))
+names(prop_var) = c("sd", "prop", "cum")
+prop_var$num = 1:nrow(prop_var)
+
+saveRDS(pr_comps,'pr_comps_proteomics_N96.Rds')
+
+```
+
+```{r pca_plot}
+
+
+
+ggplot(pr_comps, aes(x=PC1,y=PC2,label=`Patient ID`,color=Batch)) + geom_point(size = 7) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  scale_color_manual(values=RColorBrewer::brewer.pal(n = 5,'Set1')) +
+  # scale_color_viridis_d() +
+    ggtitle('') #+ geom_text_repel(aes(label=))
+
+
+
+# variance plot
+# varPlot <- ggplot(prop_var %>% dplyr::filter(.data$num <= 
+#     12), aes_string(x = "num", y = "prop")) + geom_point(size = 1.5) + 
+#     geom_line() + scale_x_continuous(breaks = seq(1, 100, 
+#     2)) + xlab("Principal Component") + ylab("Proportion of Variance") + 
+#     ggtitle("") + theme_minimal() + 
+#     theme(axis.title.y = element_text(vjust = 1), plot.margin = unit(c(0, 
+#       0, 0, 6), "mm"))
+# varPlot
+
+ggplot(pr_comps, aes(x=PC1,y=PC2,label=`Patient ID`,color=NA_frac)) + geom_point(size = 7) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  # scale_color_viridis_d() +
+  scale_color_viridis_c(option='turbo') +
+    ggtitle('') #+ geom_text_repel(aes(label=))
+cor.test(pr_comps$PC1,pr_comps$NA_frac)
+cor.test(pr_comps$PC2,pr_comps$NA_frac)
+
+
+xsre <- ggplot(pr_comps, aes(x=PC1,y=PC2,label=`Patient ID`,color=MIR200cAvgBeta)) + geom_point(size = 7) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  # scale_color_viridis_d() +
+  scale_color_viridis_c(option='cividis') +
+    ggtitle('') #+ geom_text_repel(aes(label=))
+
+pdf('PCA_proteomics_colored_MIR200C.pdf',height = 5,width = 7); xsre; dev.off()
+
+cor.test(pr_comps$PC1,pr_comps$MIR200cAvgBeta)
+cor.test(pr_comps$PC2,pr_comps$MIR200cAvgBeta)
+```
+
+## Features with all samples
+```{r pca2}
+
+protein_data.pca <- protein_data[which(!is.na(rowSums(protein_data))),]
+dim(protein_data.pca)
+
+set.seed(5443546)
+pca <- prcomp(t(protein_data.pca))
+pr_comps <- data.frame(pca$x)
+dim(pr_comps)
+# pr_comps$SVC <- gsub('_pilot[BC]','',rownames(pr_comps))
+pr_comps$`Patient ID` <- rownames(pr_comps)
+# pr_comps$sample <- rownames(pr_comps)
+# column_meta <- as.data.frame(colData(bbc_obj), stringsAsFactor = FALSE)
+pr_comps <- dplyr::left_join(pr_comps, protein_meta)
+dim(pr_comps)
+prop_var <- data.frame(t(summary(pca)$importance))
+names(prop_var) = c("sd", "prop", "cum")
+prop_var$num = 1:nrow(prop_var)
+
+```
+
+```{r pca_plot2}
+
+ggplot(pr_comps, aes(x=PC1,y=PC2,label=`Patient ID`,color=Batch)) + geom_point(size = 7) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  scale_color_manual(values=RColorBrewer::brewer.pal(n = 5,'Set1')) +
+  # scale_color_viridis_d() +
+    ggtitle('') #+ geom_text_repel(aes(label=))
+
+
+
+# variance plot
+# varPlot <- ggplot(prop_var %>% dplyr::filter(.data$num <= 
+#     12), aes_string(x = "num", y = "prop")) + geom_point(size = 1.5) + 
+#     geom_line() + scale_x_continuous(breaks = seq(1, 100, 
+#     2)) + xlab("Principal Component") + ylab("Proportion of Variance") + 
+#     ggtitle("") + theme_minimal() + 
+#     theme(axis.title.y = element_text(vjust = 1), plot.margin = unit(c(0, 
+#       0, 0, 6), "mm"))
+# varPlot
+
+ggplot(pr_comps, aes(x=PC1,y=PC2,label=`Patient ID`,color=NA_frac)) + geom_point(size = 7) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  # scale_color_viridis_d() +
+  scale_color_viridis_c(option='turbo') +
+    ggtitle('') #+ geom_text_repel(aes(label=))
+cor.test(pr_comps$PC1,pr_comps$NA_frac)
+cor.test(pr_comps$PC2,pr_comps$NA_frac)
+
+
+ggplot(pr_comps, aes(x=PC1,y=PC2,label=`Patient ID`,color=MIR200cAvgBeta)) + geom_point(size = 7) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  # scale_color_viridis_d() +
+  scale_color_viridis_c(option='cividis') +
+    ggtitle('') #+ geom_text_repel(aes(label=))
+cor.test(pr_comps$PC1,pr_comps$MIR200cAvgBeta)
+cor.test(pr_comps$PC2,pr_comps$MIR200cAvgBeta)
+```
+
+
+# Heatmap
+
+## Annotation
+
+## Most Variable
+
+```{r heatmap_top_variable}
+
+vars <- matrixStats::rowVars(as.matrix(protein_data))
+mostVar <- order(vars,decreasing=TRUE)
+n = 50
+
+scaled_mat = t(scale(t(protein_data[mostVar[1:n],]))); dim(scaled_mat)
+scaled_mat[scaled_mat>3] <- 3
+scaled_mat[scaled_mat<(-3)] <- -3
+
+hmMostVar <- Heatmap(scaled_mat,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  col=viridis::magma(20),
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  heatmap_legend_param = list(title='Z-score'),
+  row_title_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 2.5),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 3#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 10),
+  top_annotation = haCol_protein_meta,
+  heatmap_width = unit(6, "in"),  
+  heatmap_height = unit(5, "in"),  
+  # row_split = paste0(meta$ReproductiveStatus,'\n',meta$groupBRCA),
+  # row_split = xx$Batch,
+  # column_split = xx$Batch,
+  row_title_rot = 0
+)
+
+pdf('most_variable_heatmap.pdf',width=10,height=7); print(hmMostVar); dev.off()
+
+
+test <- unlist(strsplit(rownames(protein_data[mostVar[1:n],]),split = '.',fixed=TRUE))
+# (test)
+GO.BP = enrichGO(gene=test,
+                    OrgDb=org.Hs.eg.db,
+                    ont ="BP",
+                    keyType = "SYMBOL",
+                    pAdjustMethod = "BH")
+enrichplot::dotplot(GO.BP, showCategory=30) 
+```
+
+## Top Abundance
+
+```{r heatmap_top_abundance}
+
+vars <- matrixStats::rowMeans2(as.matrix(protein_data))
+mostVar <- order(vars,decreasing=TRUE)
+n = 100
+
+# scaled_mat = t(scale(t(protein_data[mostVar[1:n],]))); dim(scaled_mat)
+# scaled_mat[scaled_mat>3] <- 3
+# scaled_mat[scaled_mat<(-3)] <- -3
+
+hmMostAbund <- Heatmap(protein_data[mostVar[1:n],],
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  col=viridis::magma(20),
+  cluster_rows = FALSE,
+  cluster_columns = TRUE,
+  heatmap_legend_param = list(title='Z-score'),
+  row_title_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 2.5),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 3#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 10),
+  top_annotation = haCol_protein_meta,
+  heatmap_width = unit(6, "in"),  
+  heatmap_height = unit(5, "in"),  
+  # row_split = paste0(meta$ReproductiveStatus,'\n',meta$groupBRCA),
+  # row_split = xx$Batch,
+  # column_split = xx$Batch,
+  row_title_rot = 0
+)
+
+pdf('most_abundant_heatmap.pdf',width=10,height=7); print(hmMostAbund); dev.off()
+
+
+
+```
+
+
+## Marker "Genes" / Proteins
+
+```{r heatmap_anno_protein_meta}
+
+
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useProteomics==TRUE); dim(meta00)
+# meta00 <- dplyr::arrange(meta00,Pregnancy,`Age at time of surgery`)
+meta00 <- dplyr::arrange(meta00,`Age at time of surgery`)
+meta00$MenoStatus <- ifelse(meta00$Postpartum,'Postpartum',meta00$ReproductiveStatus)
+meta00$MIR200cAvgBeta <- as.numeric(meta00$MIR200cAvgBeta)
+meta00$MenoStatus <- factor(meta00$MenoStatus, levels=c('Pre','Post','Postpartum'))
+meta00$menstrPh_by_Endom <- factor(meta00$menstrPh_by_Endom, levels=c('Weakly Proliferative','Proliferative','Late Proliferative/Early Secretory','Secretory','Inactive'))
+
+mat <- as.data.frame(readRDS('protein_data_N96.Rds'))[,meta00$`Patient ID`] #%>% tibble::rownames_to_column('PROTEIN_ID')
+# dim(mat)
+library(ComplexHeatmap)
+# markerRowAnno <- rowAnnotation(
+  # Marker = markers$Marker
+# ) 
+
+
+heatmapColorPal <- viridis::viridis(n=100)
+pal = c(
+  viridis::viridis(n=4),
+  viridis::rocket(n=5)[2:4],
+  viridis::turbo(n=5)[c(2,4)]
+)
+# pal2 = viridis::mako(n=5)
+pal2 = viridis::turbo(n=5)
+
+haCol_rna_markers <- HeatmapAnnotation(
+  `Menstrual Phase` = meta00$menstrPh_by_Endom,
+  `Age` = meta00$`Age at time of surgery`,
+  `Stromal Content` = meta00$MIR200cAvgBeta,
+  `Menopause Status` = meta00$MenoStatus,
+  `BRCAm` = meta00$groupBRCA,
+  `Race` = meta00$Race,
+  # `Days since LMP` = meta00$`Days since LMP`,
+  # DaysSinceLMP_categ = meta00$DaysSinceLMP_categ,
+  `Surgical Indication` = meta00$`Reason for surgery 3`,
+  # `Number of Pregnancies` = as.numeric(meta00$`# of Pregnancies`),
+
+  # `Immune Score` = meta00$ImmuneScore,
+  col = list(
+    `Stromal Content` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 1, length = 20),
+                              colors = viridis::cividis(20)
+    ),
+    `Age` = circlize::colorRamp2(
+                              breaks = seq(from = 20, to = 72, length = 20),
+                              colors = colorRampPalette(c("gray75", "black"))(20)
+    ),
+    `Menopause Status` = c(
+      'Pre' = "#28BBECFF",
+      'Post' = "#FB8022FF",
+      'Postpartum' = 'grey33'
+    ),
+    `BRCAm` = c(
+      # 'BRCA1' = '#40498e',
+      'BRCA1' = '#7df5f5',
+      'BRCA2' = '#38aaac',
+      'NON-BRCA' = 'black'
+    ),
+    Race = c(
+      'Asian' = '#30123BFF',
+      'Black' = "#28BBECFF",
+      'East Indian' = "#A2FC3CFF",
+      'Hispanic Latino/White' = "#FB8022FF",
+      'White' = "#7A0403FF",
+      'Other' = 'gray48'
+    ),
+    DaysSinceLMP_categ=c(
+      '[0,12]' = '#67001F',
+      '(12,16]' = '#92C5DE',
+      '(16,30]' = '#053061',
+      '(30,60]' = 'black'
+    ),
+    `Menstrual Phase` = c(
+      'Weakly Proliferative'='#92C5DE',
+      'Proliferative' = '#0096FF',
+      'Late Proliferative/Early Secretory'='dodgerblue4',
+      'Secretory'= "#CA0020",
+      'Inactive'='black'
+    ),
+    `Surgical Indication` = c(
+      'Benign Uterine'='#8DD3C7',
+      'Cesarean Section'='#FCCDE5',
+      'Cervical Dysplasia'='#BEBADA',
+      'Menorrhagia'='#FB8072',
+      'Endometriosis'='#80B1D3',
+      'Ovarian Serous Cystadenoma'='#FDB462',
+      # 'Ovarian Cyst (Sex chord stromal tumor)'='#B3DE69',
+      'Ovarian Cyst'='pink3',
+      'Pelvic mass'='#D9D9D9',
+      'Adnexal Mass' = '#BC80BD',
+      # 'Tubal Sterilization' = '#CCEBC5',
+      'Tubal Sterilization' = '#0BDA51',
+      'Gender Affirmation'='#FFED6F',
+      # 'Risk Reduction' = '#B3DE69'
+      'Risk Reduction' = 'green'
+    ),
+    `contraception use` = c(
+      'NA'='grey66',
+      'Former'='purple',
+      'Current'='blue',
+      'Y'='blue3',
+      'Y - BTL'='darkblue',
+      'N' = 'red'
+    )
+  ),na_col='white'
+)
+
+
+```
+
+```{r marker_proteins}
+
+markers <- readRDS(file = '../canary_meth_Rproj/markers_from_nurDGE_Fig5a.Rds')
+
+# now try to find proteins that match rna markers
+for(i in 1:nrow(markers)){
+  r <- grep(markers$SYMBOL[i],rownames(mat))
+  print(
+    paste('Marker',markers$SYMBOL[i],":",paste(rownames(mat)[r],collapse = '; '),sep="")
+  )
+}
+
+
+# keratins
+rownames(mat)[grep('KRT',rownames(mat))]
+
+## load the mapper that has uniprot ID and symbols
+# mapper <- read.delim('20231030_canary_ms_data.tsv',sep="\t",header=TRUE,skip=2)[,c(1:4)]
+# mapper
+
+
+markerP <- readxl::read_excel('cell_type_markers_protein.xlsx') %>%
+  dplyr::left_join(markers,by="SYMBOL")
+
+## modify markerP
+# !!!!!!!! only able to find H4C1; others not expressed/detected
+# for(i in 1:nrow(markerP)){
+#   if(!is.na(markerP$Protein.Ids[i])){ # we have a matching name, get rowname aka PROTEIN_ID
+#     print(
+#       paste(
+#         markerP$SYMBOL[i],
+#         grep(markerP$Protein.Ids[i],mapper$Protein.Ids)  
+#       )
+#     )
+#   }
+# }
+
+markerP <- dplyr::filter(markerP,!is.na(PROTEIN_ID)); dim(markerP)
+# table(markerP$Marker)
+table(markerP$PROTEIN_ID %in% mat$PROTEIN_ID)
+
+
+matScaled <- t(scale(t(mat[markerP$PROTEIN_ID,]),center = TRUE))
+matScaled[matScaled>2] <- 2
+matScaled[matScaled<(-2)] <- -2
+dim(matScaled)
+
+
+myHM <- ComplexHeatmap::Heatmap(
+    # matLogCPM,
+    matScaled,
+    show_column_names = TRUE,
+    # col=heatmapColorPal,
+    col=viridis::magma(20),
+    cluster_rows = TRUE,
+    cluster_columns = TRUE,
+    # column_order =  unlist(column_order_uChicago),
+    # heatmap_legend_param = list(title='log2(CPM)'),
+    heatmap_legend_param = list(title='Z-Score'),
+    row_title_gp = gpar(fontsize = 9),
+    row_names_gp = gpar(fontsize = 4),
+    column_names_rot = 90,
+    column_names_gp = gpar(
+      fontsize = 5#,
+      # col = myPosColors
+    ),
+    # column_title = nameArg, 
+    column_title_gp = gpar(fontsize = 12),
+    column_title_rot = 0,
+    top_annotation = haCol_rna_markers,
+    heatmap_width = unit(8, "in"),  
+    heatmap_height = unit(6, "in"),  
+    row_title_rot = 0,
+    column_split = meta00$MenoStatus,
+    row_split = markerP$Marker,
+    show_row_dend = TRUE,
+    cluster_column_slices = FALSE,
+    cluster_row_slices = FALSE
+  )
+
+# pdf('CiliatedSecretoryMarkersByAge_Zscore.pdf',width = 15,height = 13); myHM; dev.off()
+pdf('CellType_markers_grouped_by_MenoStatus_clustered_PROTEIN.pdf',width = 15,height = 13); myHM; dev.off()
+
+```
+
+
+# Diff. Abundance
+
+```{r setup_for_DEP}
+library(DEP)
+
+protein_meta <- readRDS('protein_meta_N96.Rds') # start off with this one, but might be changed by this chunk!
+raw <- data.frame(read.delim('20231030_canary_ms_data.txt',sep="\t",check.names = FALSE,header=FALSE))
+
+colnames <- raw[4,1:5]
+# table(make.names(raw[,4],unique=TRUE) %in% rownames(protein_data))
+# FALSE  TRUE 
+    # 6  5957 
+
+raw <- raw[-c(1:4),]
+dim(raw)
+colnames(raw)[1:5] <- colnames
+raw$Genes <- make.names(raw$Genes,unique=TRUE)
+# table(raw$Genes %in% rownames(protein_data))
+# FALSE  TRUE 
+    # 2  5957 
+raw <- dplyr::filter(raw,Genes %in% rownames(protein_data))
+table(raw$Genes %in% rownames(protein_data))
+# TRUE 
+# 5957 
+
+stopifnot(all(raw$Genes==rownames(protein_data)))
+table(colnames(protein_data)==protein_meta$`Patient ID`)
+stopifnot(all(colnames(protein_data)==protein_meta$`Patient ID`))
+# since protein_meta and protein_data match, we can rename it for the contrast (needed by DEP package)
+protein_meta$sampleID <- paste0('sample',1:nrow(protein_meta))
+protein_data_renamed <- protein_data
+colnames(protein_data_renamed) <- protein_meta$sampleID
+
+# now we can do a subsetting for specific contrasts, e.g. excl. Postpartum
+# protein_meta_noPostpartum <- dplyr::filter(protein_meta,Pregnancy=='Normal')
+###########-------------------------#############
+# protein_meta <- protein_meta_noPostpartum # toggle this to turn off postpartum samples
+###########-------------------------#############
+# read it back in to change it back to all samples...
+# protein_meta <- readRDS('protein_meta_N96.Rds')
+protein_data_renamed <- protein_data_renamed[,protein_meta$sampleID]
+# protein_data_renamed <- protein_data
+protein_data_renamed[is.na(protein_data_renamed)] <- 0 # replace NA w/ 0
+
+
+dim(protein_data_renamed)
+data_for_se <- cbind(raw[,1:5],protein_data_renamed)
+data_for_se_uniq <- make_unique(data_for_se, "Genes", "Protein.Names", delim = ";")
+```
+
+## CONTRASTS!
+
+for sec vs. pro, accidently delted others
+```{r dep_get_SummarizedExperiment,eval=TRUE}
+
+protein_meta <- readRDS('protein_meta_N96.Rds') # start off with this one, but might be changed by this chunk!
+protein_meta <- dplyr::left_join(protein_meta,m0[,c('Patient ID','menstrPh_by_Endom')])
+protein_meta$menstr_phase <- ifelse(protein_meta$menstrPh_by_Endom=='Secretory','Secretory',ifelse(protein_meta$menstrPh_by_Endom=='Proliferative','Proliferative',''))
+protein_meta$menstr_phase <- factor(protein_meta$menstr_phase,levels=c("Secretory","Proliferative"))
+table(protein_meta$menstr_phase)
+
+protein_meta_M <- dplyr::filter(protein_meta,menstr_phase %in% c('Secretory','Proliferative')); dim(protein_meta_M)
+
+# protein_meta$replicate_menstr_phase
+# with replicate_menstr_phase need to set the replicates!
+protein_meta_M$replicate_menstr_phase <- NA
+protein_meta_M$replicate_menstr_phase[which(protein_meta_M$menstr_phase==levels(protein_meta_M$menstr_phase)[1])] <- 1:as.numeric(table(protein_meta_M$menstr_phase)[1])
+protein_meta_M$replicate_menstr_phase[which(protein_meta_M$menstr_phase==levels(protein_meta_M$menstr_phase)[2])] <- 1:as.numeric(table(protein_meta_M$menstr_phase)[2])
+table(protein_meta_M$menstr_phase,protein_meta_M$replicate_menstr_phase)
+
+
+# make exp design
+expdesign0 = data.frame(
+  label = protein_meta_M$sampleID,
+  condition = protein_meta_M$menstr_phase,
+  replicate = protein_meta_M$replicate_menstr_phase,
+  ReproductiveStatus = protein_meta_M$ReproductiveStatus,
+  MIR200cAvgBeta = protein_meta_M$MIR200cAvgBeta,
+  Race = protein_meta_M$Race
+)
+
+columns0 <- which(colnames(data_for_se) %in% protein_meta_M$sampleID)
+# columns0 <- which(colnames(data_for_se) %in% dplyr::filter(protein_meta,!is.na(menstr_phase))$sampleID); length(columns0)
+
+# Generate a SummarizedExperiment object using an experimental design
+data_se <- make_se(proteins_unique = data_for_se_uniq,
+                   columns = columns0,
+                   expdesign = expdesign0
+)
+
+class(data_se)
+
+# Filter for proteins that are identified in all replicates of at least one condition
+data_filt <- filter_missval(data_se, thr = 0)
+
+# normalized by vsn
+data_norm <- normalize_vsn(data_filt)
+# meanSdPlot(data_norm)
+# pdf('plot_normalization.pdf',height=11,width = 5); plot_normalization(data_filt, data_norm);dev.off()
+```
+
+for rna marker heatmap cluster from Fig. 5b: 
+cluster 1 (sec high) v 2 (pro high)
+```{r dep_get_SummarizedExperiment2,eval=TRUE}
+
+protein_meta <- readRDS('protein_meta_N96.Rds') # start off with this one, but might be changed by this chunk!
+protein_meta <- dplyr::left_join(protein_meta,m0[,c('Patient ID','menstrPh_by_Endom','patientID')])
+# these two clusters are for 5a....but we want 5b comparison :(
+# c1 <- c('C-21-84','C-23-9','C-21-95','C-21-41','C-23-13','C-21-53','C-23-18','C-21-71','C-21-39','C-23-1','C-21-73','C-21-90','C-21-17','C-23-16','C-23-15','C-21-58','C-21-59','C-21-10','C-21-75','C-21-93','C-21-65')
+# c2 <- c('C-23-10','C-21-69','C-21-83','C-21-82','C-21-31','C-21-86','C-21-68','C-21-70','C-23-8','C-23-5','C-21-5','C-21-22','C-23-7','C-21-30','C-21-79','C-21-13','C-21-80','C-21-78','C-21-87','C-21-9','C-23-5','C-21-85','C-21-20','C-21-28','C-21-62')
+
+
+c1 <- readRDS(file = '../canary_meth_Rproj/Fig5b_cluster_2_preFTs_highSec_cluster2.Pre.Rds') # 2,Pre is high sec
+c2 <- readRDS(file = '../canary_meth_Rproj/Fig5b_preFTs_highPro_cluster3.Pre.Rds') # 3,Pre is high pro)
+
+protein_meta$cluster <- ifelse(protein_meta$patientID %in% c1,'Cluster 1 high sec',ifelse(protein_meta$patientID %in% c2,'Cluster 2 high pro',''))
+table(protein_meta$cluster)
+
+protein_meta_M <- dplyr::filter(protein_meta,cluster %in% c('Cluster 1 high sec','Cluster 2 high pro')); dim(protein_meta_M)
+protein_meta_M$cluster <- factor(protein_meta_M$cluster,levels=c('Cluster 1 high sec','Cluster 2 high pro'))
+# protein_meta$replicate_menstr_phase
+# with replicate_menstr_phase need to set the replicates!
+protein_meta_M$replicate_cluster <- NA
+protein_meta_M$replicate_cluster[which(protein_meta_M$cluster==levels(protein_meta_M$cluster)[1])] <- 1:as.numeric(table(protein_meta_M$cluster)[1])
+
+protein_meta_M$replicate_cluster[which(protein_meta_M$cluster==levels(protein_meta_M$cluster)[2])] <- 1:as.numeric(table(protein_meta_M$cluster)[2])
+table(protein_meta_M$cluster,protein_meta_M$replicate_cluster)
+
+
+# make exp design
+expdesign0 = data.frame(
+  label = protein_meta_M$sampleID,
+  condition = protein_meta_M$cluster,
+  replicate = protein_meta_M$replicate_cluster,
+  MIR200cAvgBeta = protein_meta_M$MIR200cAvgBeta
+)
+
+columns0 <- which(colnames(data_for_se) %in% protein_meta_M$sampleID)
+# columns0 <- which(colnames(data_for_se) %in% dplyr::filter(protein_meta,!is.na(menstr_phase))$sampleID); length(columns0)
+
+# Generate a SummarizedExperiment object using an experimental design
+data_se <- make_se(proteins_unique = data_for_se_uniq,
+                   columns = columns0,
+                   expdesign = expdesign0
+)
+
+class(data_se)
+
+# Filter for proteins that are identified in all replicates of at least one condition
+data_filt <- filter_missval(data_se, thr = 0)
+
+# normalized by vsn
+data_norm <- normalize_vsn(data_filt)
+# meanSdPlot(data_norm)
+# pdf('plot_normalization.pdf',height=11,width = 5); plot_normalization(data_filt, data_norm);dev.off()
+```
+
+```{r differential_abundance}
+
+# Test every sample versus control
+data_diff <- test_diff(data_filt, type = "all", 
+                       # control = "NON.BRCA",
+                       # control = "Post",
+                       # control = 'Proliferative',
+                       # control = 'Cluster.2.high.pro',
+                       # design_formula = formula(~0 + condition))
+                       design_formula = formula(~0 + condition + MIR200cAvgBeta))
+                       # design_formula = formula(~0 + condition + MIR200cAvgBeta + Race))
+
+dep <- add_rejections(data_diff, alpha = 0.05, lfc = log2(1))
+
+outputTable <- data.frame(rowData(dep, use.names = FALSE))
+dim(outputTable)
+
+# table(outputTable$BRCAmut_vs_NON.BRCA_significant)
+# table(outputTable$Pre_vs_Post_significant)
+# outputTable$adjusted_Pval_BH_method <- p.adjust(p=outputTable$Pre_vs_Post_p.val,method='BH') # Pre v Post
+outputTable$adjusted_Pval_BH_method <- p.adjust(p=outputTable$Cluster.1.high.sec_vs_Cluster.2.high.pro_p.val,method='BH') # Pre v Post
+
+# outputTable$adjusted_Pval_BH_method <- p.adjust(p=outputTable$BRCAmut_vs_NON.BRCA_p.val,method='BH') # BRCAmut NonBRCA
+# table(outputTable$Cluster.1.high.sec_vs_Cluster.2.high.pro_p.adj)
+table(outputTable$adjusted_Pval_BH_method<0.05)
+
+
+# ggplot(outputTable,aes(x=Secretory_vs_Proliferative_p.val)) + 
+ggplot(outputTable,aes(x=Cluster.1.high.sec_vs_Cluster.2.high.pro_p.val)) + 
+# ggplot(outputTable,aes(x=Pre_vs_Post_p.val)) + 
+  geom_histogram(bins = 100) + theme_minimal()
+
+# outputTable$FDR <- p.adjust(outputTable$BRCAmut_vs_NON.BRCA_p.val)
+# outputTable$signif <- outputTable$FDR<0.05
+# table(outputTable$signif)
+# ggplot(outputTable,aes(y=-log10(BRCAmut_vs_NON.BRCA_p.val),x=BRCAmut_vs_NON.BRCA_diff,color=signif)) + 
+#   geom_point() + theme_bw() + scale_color_manual(values=viridis::turbo(n=2))
+
+write.table(outputTable,file='DPE_analysis_Cluster1.high.sec_v_Cluster2.high.pro_ResultsTable.tsv',sep="\t",quote = FALSE,row.names = FALSE) # BRCA1 and BRCA2 separately
+# write.table(outputTable,file='DPE_analysis_ResultsTable_group.tsv',sep="\t",quote = FALSE,row.names = FALSE)
+
+# table(outputTable$BRCA1_vs_NON.BRCA_significant,outputTable$BRCA2_vs_NON.BRCA_significant)
+
+
+```
+
+```{r heatmap_with__DEGs,eval=FALSE,fig.width=12,fig.height=10}
+
+# outputTable <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables/DPE_analysis_ResultsTable_BRCAmut_v_NonBRCA_mir200_race_adjusted_excl_postpartum_N0.tsv')
+# outputTable <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables/DPE_analysis_ResultsTable_Pre_vs_Post_no_covariates_N966.tsv')
+
+
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useProteomics==TRUE); dim(meta00)
+# meta00 <- dplyr::arrange(meta00,Pregnancy,`Age at time of surgery`)
+meta00 <- dplyr::arrange(meta00,`Age at time of surgery`)
+meta00$MenoStatus <- ifelse(meta00$Postpartum,'Postpartum',meta00$ReproductiveStatus)
+meta00$MIR200cAvgBeta <- as.numeric(meta00$MIR200cAvgBeta)
+meta00$MenoStatus <- factor(meta00$MenoStatus, levels=c('Pre','Post','Postpartum'))
+meta00$menstrPh_by_Endom <- factor(meta00$menstrPh_by_Endom, levels=c('Weakly Proliferative','Proliferative','Late Proliferative/Early Secretory','Secretory','Inactive'))
+
+
+outputTable <- read.delim('DPE_analysis_Cluster1.high.sec_v_Cluster2.high.pro_ResultsTable.tsv')
+DEprot <- outputTable$Genes[which(outputTable$adjusted_Pval_BH_method<0.1)]; length(DEprot)
+
+
+scaled_mat = t(scale(t(protein_data[which(rownames(protein_data)%in%DEprot),meta00$`Patient ID`]))); dim(scaled_mat)
+
+scaled_mat[scaled_mat>2] <- 2
+scaled_mat[scaled_mat<(-2)] <- -2
+
+# saveRDS(scaled_mat,'DEP_scaled_mat_N9.Rds')
+# scaled_mat <- scaled_mat[,dplyr::arrange(protein_meta,`Age at time of surgery`)$`Patient ID`]
+# dim(scaled_mat)
+
+#++++++++++++++++++++++++
+#+
+## get anno
+haCol_rna_markers <- HeatmapAnnotation(
+  `Menstrual Phase` = meta00$menstrPh_by_Endom,
+  `Age` = meta00$`Age at time of surgery`,
+  `Stromal Content` = meta00$MIR200cAvgBeta,
+  `Menopause Status` = meta00$MenoStatus,
+  `BRCAm` = meta00$groupBRCA,
+  `Race` = meta00$Race,
+  # `Days since LMP` = meta00$`Days since LMP`,
+  # DaysSinceLMP_categ = meta00$DaysSinceLMP_categ,
+  `Surgical Indication` = meta00$`Reason for surgery 3`,
+  # `Number of Pregnancies` = as.numeric(meta00$`# of Pregnancies`),
+
+  # `Immune Score` = meta00$ImmuneScore,
+  col = list(
+    `Stromal Content` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 1, length = 20),
+                              colors = viridis::cividis(20)
+    ),
+    `Age` = circlize::colorRamp2(
+                              breaks = seq(from = 20, to = 72, length = 20),
+                              colors = colorRampPalette(c("gray75", "black"))(20)
+    ),
+    `Menopause Status` = c(
+      'Pre' = "#28BBECFF",
+      'Post' = "#FB8022FF",
+      'Postpartum' = 'grey33'
+    ),
+    `BRCAm` = c(
+      # 'BRCA1' = '#40498e',
+      'BRCA1' = '#7df5f5',
+      'BRCA2' = '#38aaac',
+      'NON-BRCA' = 'black'
+    ),
+    Race = c(
+      'Asian' = '#30123BFF',
+      'Black' = "#28BBECFF",
+      'East Indian' = "#A2FC3CFF",
+      'Hispanic Latino/White' = "#FB8022FF",
+      'White' = "#7A0403FF",
+      'Other' = 'gray48'
+    ),
+    DaysSinceLMP_categ=c(
+      '[0,12]' = '#67001F',
+      '(12,16]' = '#92C5DE',
+      '(16,30]' = '#053061',
+      '(30,60]' = 'black'
+    ),
+    `Menstrual Phase` = c(
+      'Weakly Proliferative'='#92C5DE',
+      'Proliferative' = '#0096FF',
+      'Late Proliferative/Early Secretory'='dodgerblue4',
+      'Secretory'= "#CA0020",
+      'Inactive'='black'
+    ),
+    `Surgical Indication` = c(
+      'Benign Uterine'='#8DD3C7',
+      'Cesarean Section'='#FCCDE5',
+      'Cervical Dysplasia'='#BEBADA',
+      'Menorrhagia'='#FB8072',
+      'Endometriosis'='#80B1D3',
+      'Ovarian Serous Cystadenoma'='#FDB462',
+      # 'Ovarian Cyst (Sex chord stromal tumor)'='#B3DE69',
+      'Ovarian Cyst'='pink3',
+      'Pelvic mass'='#D9D9D9',
+      'Adnexal Mass' = '#BC80BD',
+      # 'Tubal Sterilization' = '#CCEBC5',
+      'Tubal Sterilization' = '#0BDA51',
+      'Gender Affirmation'='#FFED6F',
+      # 'Risk Reduction' = '#B3DE69'
+      'Risk Reduction' = 'green'
+    ),
+    `contraception use` = c(
+      'NA'='grey66',
+      'Former'='purple',
+      'Current'='blue',
+      'Y'='blue3',
+      'Y - BTL'='darkblue',
+      'N' = 'red'
+    )
+  ),na_col='white'
+)
+#======================================
+#======================================
+scaled_mat[is.na(scaled_mat)] <- 0
+hmDEP <- Heatmap(scaled_mat,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  col=viridis::magma(20),
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  heatmap_legend_param = list(title='Z-score'),
+  row_title_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 10),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 7#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 10),
+  top_annotation = haCol_rna_markers,
+  heatmap_width = unit(6, "in"),  
+  heatmap_height = unit(5, "in"),  
+  # column_split = protein_meta$ReproductiveStatus,
+  row_title_rot = 0,
+  column_km = 5
+)
+hmDEP
+pdf('DEP_heatmap.pdf',width=12,height=7); print(hmDEP); dev.off()
+
+
+```
+
+# Post Diff. Abundance analyses
+
+```{r enrichment}
+
+x <- read.delim('DPE_analysis_ResultsTable.tsv',sep="\t")
+dim(x)
+table(x$BRCA1_vs_NON.BRCA_p.adj<0.05)
+
+brca1.tags <- unlist(strsplit(dplyr::filter(x,BRCA1_vs_NON.BRCA_p.adj<0.05)$name,split = '.',fixed=TRUE))
+
+GO.BP = enrichGO(gene=brca1.tags,
+                    OrgDb=org.Hs.eg.db,
+                    ont ="BP",
+                    keyType = "SYMBOL",
+                    pAdjustMethod = "BH")
+enrichplot::dotplot(GO.BP, showCategory=30) 
+
+brca2.tags <- unlist(strsplit(dplyr::filter(x,BRCA2_vs_NON.BRCA_p.adj<0.05)$name,split = '.',fixed=TRUE))
+
+GO.BP = enrichGO(gene=brca2.tags,
+                    OrgDb=org.Hs.eg.db,
+                    ont ="BP",
+                    keyType = "SYMBOL",
+                    pAdjustMethod = "BH")
+enrichplot::dotplot(GO.BP, showCategory=30) 
+
+table(x$BRCA2_vs_NON.BRCA_p.adj<0.05)
+
+
+
+```
+
+# Boxplots with groupBRCA
+
+```{r protein_expr_boxplots}
+
+grep('LAMB2',rownames(protein_data)) # no
+grep('SRGAP1',rownames(protein_data)) # no
+rownames(protein_data)[grep('GAP1',rownames(protein_data))] # yes but not SRGAP1
+grep('PTPRQ',rownames(protein_data)) # no
+
+
+rownames(protein_data)[grep('HCK',rownames(protein_data))]
+
+# HCK
+x <- data.frame(
+  `Patient ID` = colnames(protein_data),
+  `Expression` = protein_data[which(rownames(protein_data)=='EZR.RDX'),], check.names=FALSE
+)
+
+x <- x %>%
+ # tidyr::pivot_longer(names_to = 'Patient ID',values_to = 'Expression',cols = everything()) %>%
+  dplyr::left_join(y=protein_meta)
+
+dim(x)
+x %>%
+  ggplot(aes(x=cluster2,y=Expression)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(color=groupBRCA)) +
+  theme_minimal() +
+  scale_color_manual(values=rev(c('#7df5f5','#38aaac','black'))) + theme(legend.position = 'none') 
+
+
+
+
+
+# TUBB4B
+# rownames(protein_data)[grep('TUBB4B',rownames(protein_data))]
+# TUBB4B
+x <- data.frame(protein_data[grep('TUBB4B',rownames(protein_data)),],check.names = FALSE)
+x$gene <- rownames(x)
+x <- x %>% tidyr::pivot_longer(names_to = 'Patient ID',values_to = 'Expression',cols = -matches('gene')) 
+x <- x %>%
+  dplyr::left_join(y=protein_meta) 
+
+dplyr::filter(x,!is.na(group)) %>%
+  ggplot(aes(x=group,y=Expression)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=ReproductiveStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme(legend.position = 'none') + facet_wrap(~gene)
+```
+
+# 5 clusters: luteal, inactive, follicular, postmeno, postpartum
+
+```{r find_protein_markers_5_groups}
+
+
+# first load the meta00
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE & useProteomics==TRUE); dim(meta00)
+# meta00 <- dplyr::arrange(meta00,Pregnancy,`Age at time of surgery`)
+meta00 <- dplyr::arrange(meta00,`Age at time of surgery`)
+meta00$MenoStatus <- ifelse(meta00$Postpartum,'Postpartum',meta00$ReproductiveStatus)
+meta00$MIR200cAvgBeta <- as.numeric(meta00$MIR200cAvgBeta)
+meta00$MenoStatus <- factor(meta00$MenoStatus, levels=c('Pre','Post','Postpartum'))
+meta00$menstrPh_by_Endom <- factor(meta00$menstrPh_by_Endom, levels=c('Weakly Proliferative','Proliferative','Late Proliferative/Early Secretory','Secretory','Inactive'))
+
+# assign protein_meta
+protein_meta <- meta00
+stopifnot(all(protein_meta$`Patient ID` %in% colnames(protein_data)))
+protein_data4marker <- protein_data[,protein_meta$`Patient ID`];dim(protein_data4marker)
+
+c1 <- readRDS(file = '../canary_meth_Rproj/Fig5b_cluster_2_preFTs_highSec_cluster2.Pre.Rds') # 2,Pre is high sec - aka Luteal
+c2 <- readRDS(file = '../canary_meth_Rproj/Fig5b_preFTs_highPro_cluster3.Pre.Rds') # 3,Pre is high pro) - aka Follicular
+
+
+# needs to create a sc exper. object
+# then use findMarkers function
+stopifnot(all(colnames(protein_data4marker)==protein_meta$`Patient ID`))
+
+# get the clusters, they are sort of somewhat configured
+protein_meta$cluster2 <- ifelse(
+  protein_meta$patientID%in%c1,'Luteal',
+  ifelse(protein_meta$patientID%in%c2,'Follicular',
+  ifelse(protein_meta$ReproductiveStatus=='Post','Postmeno',
+  ifelse(protein_meta$MenoStatus=='Postpartum','Postpartum','Inactive')))
+)
+
+table(protein_meta$cluster2,protein_meta$clusterMembership)
+library(SingleCellExperiment)
+library(scran)
+protein_data_noNA <- log2(protein_data4marker) # log2 here
+protein_data_noNA[is.na(protein_data_noNA)] <- 0 
+
+sce <- SingleCellExperiment(assays = list(logcounts=protein_data_noNA), colData=protein_meta)
+
+protein.markers <- scran::findMarkers(sce, pval.type="some",direction="up",groups = colData(sce)$cluster2,assay.type='logcounts',test.type="t",min.prop=0.5)
+
+#================
+#================
+### LAMB2 testing because this is showing up a a marker for all 5 groups somehow
+lapply(protein.markers,function(x){
+  return(x[which(rownames(x)=='LAMB2'),])
+})
+
+
+#---_____------__________________
+
+length(protein.markers)
+names(protein.markers)
+lapply(protein.markers,nrow)
+# protein.markers[[3]]
+
+# get all p.value<0.05 markers for export for Supplemental Table
+all_markers_p <- data.frame()
+for(i in 1:length(protein.markers)){
+  tmp <- data.frame(protein.markers[[i]],check.names=FALSE) %>% dplyr::arrange(p.value) %>% dplyr::filter(FDR<0.05)
+  tmp$protein <- rownames(tmp)
+  tmp$marker <- rep(names(protein.markers)[i],nrow(tmp))
+  all_markers_p <- dplyr::bind_rows(
+    all_markers_p,
+    # data.frame(
+    #   marker = rep(names(rna.5.markers)[i],nrow(tmp)),
+    #   ensemblId = rownames(tmp)
+    # )
+    tmp
+  )
+}
+dim(all_markers_p)
+head(all_markers_p)
+table(all_markers_p$marker)
+# all_markers_p <- tibble::rownames_to_column(all_markers_p,'protein')
+# rownames(all_markers_p) <- all_markers_p$protein
+# all_markers <- dplyr::left_join(all_markers,mapper)
+
+write.table(all_markers_p,file="5_expression_groups_Supplemental_Table_pval_some.tsv",sep="\t",quote=FALSE,row.names = FALSE)
+
+# upset plot with protein data
+# get this into a data.frame, so we can add the protein overlap 
+markerDF_p <- data.frame(
+  geneSymbol = unique(all_markers_p$protein)
+)
+markerDF_p$Follicular <- ifelse(markerDF_p$geneSymbol %in% dplyr::filter(all_markers_p,marker=='Follicular')$protein,1,0)
+markerDF_p$Luteal <- ifelse(markerDF_p$geneSymbol %in% dplyr::filter(all_markers_p,marker=='Luteal')$protein,1,0)
+markerDF_p$Inactive <- ifelse(markerDF_p$geneSymbol %in% dplyr::filter(all_markers_p,marker=='Inactive')$protein,1,0)
+markerDF_p$Postpartum <- ifelse(markerDF_p$geneSymbol %in% dplyr::filter(all_markers_p,marker=='Postpartum')$protein,1,0)
+markerDF_p$Postmeno <- ifelse(markerDF_p$geneSymbol %in% dplyr::filter(all_markers_p,marker=='Postmeno')$protein,1,0)
+library(UpSetR)
+
+upset(markerDF_p,nsets = 10)
+
+markersList.Protein <- list(
+  'Follicular' = dplyr::filter(all_markers_p,marker=='Follicular')$protein,
+  'Luteal' = dplyr::filter(all_markers_p,marker=='Luteal')$protein,
+  'Inactive' = dplyr::filter(all_markers_p,marker=='Inactive')$protein,
+  'Postpartum' = dplyr::filter(all_markers_p,marker=='Postpartum')$protein,
+  'Postmeno' = dplyr::filter(all_markers_p,marker=='Postmeno')$protein
+)
+
+
+all_markers_FDR <- readRDS('../canary_meth_Rproj/all_markers_rna_FILTERED_for_protein_overlap.Rds'); dim(all_markers_FDR)
+markerDF_p$rna_status <- ifelse(markerDF_p$geneSymbol %in% (readRDS('../canary_meth_Rproj/cpm.4.sce.4protein.Rds')$geneSymbol),'OneToOneMatchFound','noOneToOneMatch')
+markerDF_p$rna_status <- ifelse(markerDF_p$geneSymbol %in% all_markers_FDR$geneSymbol,'one2oneMatchAndMarker',markerDF_p$rna_status)
+table(markerDF_p$rna_status)
+
+# pdf('protein_markers_FDRfilt_N1338_UpsetR_max_degree2.pdf'); 
+library(ComplexUpset)
+colValues <- RColorBrewer::brewer.pal(5,'Blues')
+upstrPlot <- ComplexUpset::upset(markerDF_p,
+                    intersect = c('Postmeno','Postpartum','Inactive','Luteal','Follicular'),
+                    sort_sets = FALSE,
+                    sort_intersections_by = c('cardinality'),
+                    group_by = 'degree',
+                    max_degree = 2,
+        base_annotations=list(
+          'Intersection size'=intersection_size(
+            counts=TRUE,
+            mapping=aes(fill=rna_status)
+          ) +
+            scale_fill_manual(values=c('OneToOneMatchFound'=colValues[3],'noOneToOneMatch'=colValues[5],'one2oneMatchAndMarker'=colValues[2])) + theme_classic()
+        ),
+        intersections = 'observed'
+) # dev.off()
+upstrPlot
+pdf(file='Protein_RNA_markers_upsetR.pdf',height = 5,width = 8); upstrPlot; dev.off()
+
+
+
+markerDF_filtered <- dplyr::filter(markerDF_p,rna_status=='one2oneMatchAndMarker'); dim(markerDF_filtered)
+upstrPlot <- ComplexUpset::upset(markerDF_filtered,
+                    intersect = c('Postmeno','Postpartum','Inactive','Luteal','Follicular'),
+                    sort_sets = FALSE,
+                    sort_intersections_by = c('cardinality'),
+                    group_by = 'degree',
+                    max_degree = 2,
+        base_annotations=list(
+          'Intersection size'=intersection_size(
+            counts=TRUE
+          ) + theme_classic()
+        ),
+        intersections = 'observed'
+) 
+upstrPlot
+pdf(file='Protein_RNA_markers_OneToOneMarkerAndMatch_upsetR.pdf',height = 5,width = 8); upstrPlot; dev.off()
+saveRDS(markerDF_p,'markerDF_p.Rds')
+
+# load the top RNA markers that have protein data to identify which proteins to plot
+all_markers_rna_FILTERED <- readRDS('../canary_meth_Rproj/all_markers_rna_FILTERED_for_protein_overlap.Rds')
+
+all_markers_p_FDR <- dplyr::filter(all_markers_p,protein %in% all_markers_rna_FILTERED$geneSymbol)
+# dim(all_markers_p_FDR)
+table(all_markers_p_FDR$marker) # this includes those that are not correct marker grp, so add on the marker.x (which is == to marker.y)
+tmp <- all_markers_rna_FILTERED[,c('geneSymbol','marker.x')]
+all_markers_p_FDR <- dplyr::left_join(all_markers_p_FDR,tmp,by=c('protein'='geneSymbol'))
+table(all_markers_p_FDR$marker)
+all_markers_p_FDR <- dplyr::filter(all_markers_p_FDR,marker==marker.x)
+table(all_markers_p_FDR$marker)
+dim(all_markers_p_FDR) # same 424 as with RNA!
+
+```
+
+```{r heatmap_protein_5_groups,fig.width=12,fig.height=10}
+
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useProteomics==TRUE & useRNA_2==TRUE); dim(meta00)
+# meta00 <- dplyr::arrange(meta00,Pregnancy,`Age at time of surgery`)
+meta00 <- dplyr::arrange(meta00,`Age at time of surgery`)
+meta00$MenoStatus <- ifelse(meta00$Postpartum,'Postpartum',meta00$ReproductiveStatus)
+meta00$MIR200cAvgBeta <- as.numeric(meta00$MIR200cAvgBeta)
+meta00$MenoStatus <- factor(meta00$MenoStatus, levels=c('Pre','Post','Postpartum'))
+meta00$menstrPh_by_Endom <- factor(meta00$menstrPh_by_Endom, levels=c('Weakly Proliferative','Proliferative','Late Proliferative/Early Secretory','Secretory','Inactive'))
+
+
+# want only the same genes as we are showing for the RNA
+all_markers_FDR <- readRDS('../canary_meth_Rproj/all_markers_FDR_with_intersect_group.Rds')
+
+# without row grouping only want the unique markers!
+# all_markers_p_FDR <- all_markers_p_FDR[-which(duplicated(all_markers_p_FDR$protein)),]; dim(all_markers_p_FDR)
+scaled_mat = t(scale(t(protein_data[all_markers_FDR$geneSymbol,meta00$`Patient ID`]))); dim(scaled_mat)
+# change to patientID
+stopifnot(all(colnames(scaled_mat) == meta00$`Patient ID`))
+colnames(scaled_mat) <- meta00$patientID
+scaled_mat[scaled_mat>2] <- 2
+scaled_mat[scaled_mat<(-2)] <- -2
+
+# add in the cluster2 info!!
+meta00 <- dplyr::left_join(meta00,protein_meta[,c('Patient ID','cluster2')])
+table(meta00$cluster2)
+meta00$cluster2 <- factor(meta00$cluster2,levels=c('Follicular','Luteal','Inactive','Postpartum','Postmeno'))
+all_markers_p_FDR$marker = factor(all_markers_p_FDR$marker,levels=levels(meta00$cluster2))
+#++++++++++++++++++++++++
+#+
+## get anno
+haCol_rna_markers <- HeatmapAnnotation(
+  # `Menstrual Phase` = meta00$menstrPh_by_Endom,
+  `Age` = meta00$`Age at time of surgery`,
+  `Stromal Fraction` = meta00$MIR200cAvgBeta,
+  `Menopause Status` = meta00$MenoStatus,
+  `BRCAm` = meta00$groupBRCA,
+  # `Race` = meta00$Race,
+  # `Surgical Indication` = meta00$`Reason for surgery 3`,
+  col = list(
+    `Stromal Fraction` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 1, length = 20),
+                              colors = viridis::cividis(20)
+    ),
+    `Age` = circlize::colorRamp2(
+                              breaks = seq(from = 20, to = 72, length = 20),
+                              colors = colorRampPalette(c("gray75", "black"))(20)
+    ),
+    `Menopause Status` = c(
+      'Pre' = "#28BBECFF",
+      'Post' = "#FB8022FF",
+      'Postpartum' = 'grey33'
+    ),
+    `BRCAm` = c(
+      # 'BRCA1' = '#40498e',
+      'BRCA1' = '#7df5f5',
+      'BRCA2' = '#38aaac',
+      'NON-BRCA' = 'black'
+    ),
+    Race = c(
+      'Asian' = '#30123BFF',
+      'Black' = "#28BBECFF",
+      'East Indian' = "#A2FC3CFF",
+      'Hispanic Latino/White' = "#FB8022FF",
+      'White' = "#7A0403FF",
+      'Other' = 'gray48'
+    ),
+    DaysSinceLMP_categ=c(
+      '[0,12]' = '#67001F',
+      '(12,16]' = '#92C5DE',
+      '(16,30]' = '#053061',
+      '(30,60]' = 'black'
+    ),
+    `Menstrual Phase` = c(
+      'Weakly Proliferative'='#92C5DE',
+      'Proliferative' = '#0096FF',
+      'Late Proliferative/Early Secretory'='dodgerblue4',
+      'Secretory'= "#CA0020",
+      'Inactive'='black'
+    ),
+    `Surgical Indication` = c(
+      'Benign Uterine'='#8DD3C7',
+      'Cesarean Section'='#FCCDE5',
+      'Cervical Dysplasia'='#BEBADA',
+      'Menorrhagia'='#FB8072',
+      'Endometriosis'='#80B1D3',
+      'Ovarian Serous Cystadenoma'='#FDB462',
+      # 'Ovarian Cyst (Sex chord stromal tumor)'='#B3DE69',
+      'Ovarian Cyst'='pink3',
+      'Pelvic mass'='#D9D9D9',
+      'Adnexal Mass' = '#BC80BD',
+      # 'Tubal Sterilization' = '#CCEBC5',
+      'Tubal Sterilization' = '#0BDA51',
+      'Gender Affirmation'='#FFED6F',
+      # 'Risk Reduction' = '#B3DE69'
+      'Risk Reduction' = 'green'
+    ),
+    `contraception use` = c(
+      'NA'='grey66',
+      'Former'='purple',
+      'Current'='blue',
+      'Y'='blue3',
+      'Y - BTL'='darkblue',
+      'N' = 'red'
+    )
+  ),na_col='white',
+  show_legend = c(FALSE,FALSE,FALSE,FALSE),
+  show_annotation_name = FALSE
+)
+#======================================
+
+
+# now import the scaled_mat so that we can match the protein rownames to this
+rownames <- readRDS('../canary_meth_Rproj/rownames_rna_markers_scaled_mat.Rds')
+# and roworder of that heatmap
+column_order <- readRDS('../canary_meth_Rproj/column_order_rna_markers_scaled_mat.Rds')
+
+roworder <- readRDS('../canary_meth_Rproj/roworder_rna_markers_scaled_mat.Rds')
+# checks
+all(rownames %in% rownames(scaled_mat))
+all(rownames(scaled_mat) %in% rownames)
+
+# now rearrange the scaled_mat
+# scaled_mat <- scaled_mat[rownames[roworder],]; dim(scaled_mat)
+#======================================
+scaled_mat[is.na(scaled_mat)] <- 0
+hmDEP <- Heatmap(scaled_mat,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  col=viridis::magma(20),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  column_order = unlist(column_order),
+  row_order = unlist(roworder),
+  show_heatmap_legend = FALSE,
+  heatmap_legend_param = list(title='Z-score'),
+  row_title_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 5),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 5#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 10),
+  top_annotation = haCol_rna_markers,
+  heatmap_width = unit(6, "in"),  
+  heatmap_height = unit(7, "in"),  
+  column_split = meta00$cluster2,
+  row_title_rot = 0,
+  cluster_column_slices = TRUE,
+  row_split = all_markers_FDR$name,
+  cluster_row_slices=FALSE
+)
+
+
+hmDEP
+pdf('protein_5_RNA_groups_findMarkers_heatmap.pdf',width=12,height=11); print(hmDEP); dev.off()
+
+
+
+```
+
+```{r heatmap_OneToOneMatchesThatAreNotMarkers}
+
+# filter for the RNA exclusive markers and plot proteins
+table(dplyr::filter(markerDF_p,rna_status=='OneToOneMatchFound')$geneSymbol %in% rownames(protein_data))
+
+scaled_mat = t(scale(t(protein_data[dplyr::filter(markerDF_p,rna_status=='OneToOneMatchFound')$geneSymbol,meta00$`Patient ID`]))); dim(scaled_mat)
+# change to patientID
+stopifnot(all(colnames(scaled_mat) == meta00$`Patient ID`))
+colnames(scaled_mat) <- meta00$patientID
+scaled_mat[scaled_mat>2] <- 2
+scaled_mat[scaled_mat<(-2)] <- -2
+
+scaled_mat[is.na(scaled_mat)] <- 0
+
+hm.protein43 <- Heatmap(scaled_mat,
+  show_column_names = FALSE,
+  show_row_names = FALSE,
+  col=viridis::magma(20),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  # column_order = unlist(column_order),
+  # row_order = unlist(roworder),
+  heatmap_legend_param = list(title='Z-score'),
+  row_title_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 1),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 5#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 10),
+  # top_annotation = haCol_rna_markers,
+  heatmap_width = unit(6, "in"),  
+  heatmap_height = unit(7, "in"),  
+  column_split = factor(meta00$clusterMembership,levels=c(
+    'Follicular','Luteal','Inactive','Postpartum','Postmeno'
+  )),
+  row_title_rot = 0,
+  cluster_column_slices = FALSE,
+  # row_title = paste0('Protein\nExclusive\nMarkers\nN=',nrow(scaled_mat)),
+  cluster_row_slices=FALSE,
+  show_heatmap_legend = FALSE
+)
+
+hm.protein43
+
+pdf('protein_proteinExclusiveWithMatch.pdf',width=12,height=11); print(hm.protein43); dev.off()
+png('protein_proteinExclusiveWithMatch.png',width=500,height=600,unit='px'); print(hm.protein43); dev.off()
+
+
+## same thing with RNA markers
+markerDF_rna <- readRDS('../canary_meth_Rproj/markerDF_rna_with_protein_status.Rds')
+scaled_mat = t(scale(t(protein_data[dplyr::filter(markerDF_rna,protein_status=='OneToOneMatchFound')$geneSymbol,meta00$`Patient ID`]))); dim(scaled_mat)
+
+scaled_mat[scaled_mat>2] <- 2
+scaled_mat[scaled_mat<(-2)] <- -2
+scaled_mat[is.na(scaled_mat)] <- 0
+hm.protein44 <- Heatmap(scaled_mat,
+  show_column_names = FALSE,
+  show_row_names = FALSE,
+  col=viridis::magma(20),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  # column_order = unlist(column_order),
+  # row_order = unlist(roworder),
+  heatmap_legend_param = list(title='Z-score'),
+  row_title_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 1),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 5#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 10),
+  top_annotation = haCol_rna_markers,
+  heatmap_width = unit(6, "in"),  
+  heatmap_height = unit(7, "in"),  
+  column_split = factor(meta00$clusterMembership,levels=c(
+    'Follicular','Luteal','Inactive','Postpartum','Postmeno'
+  )),,
+  row_title_rot = 0,
+  cluster_column_slices = FALSE,
+  # row_title = paste0('RNA\nExclusive\nMarkers\nN=',nrow(scaled_mat)),
+  cluster_row_slices=FALSE,
+  show_heatmap_legend = FALSE
+)
+
+# hm.protein44
+
+pdf('protein_rnaExclusiveWithMatch.pdf',width=12,height=11); print(hm.protein44); dev.off()
+png('protein_rnaExclusiveWithMatch.png',width=500,height=600,unit='px'); print(hm.protein44); dev.off()
+
+
+```
+
+# all protein markers N
+
+```{r heatmap_OneToOneMatchesThatAreNotMarkers}
+
+scaled_mat = t(scale(t(protein_data[markerDF_p$geneSymbol,meta00$`Patient ID`]))); dim(scaled_mat)
+# change to patientID
+stopifnot(all(colnames(scaled_mat) == meta00$`Patient ID`))
+colnames(scaled_mat) <- meta00$patientID
+scaled_mat[scaled_mat>2] <- 2
+scaled_mat[scaled_mat<(-2)] <- -2
+
+scaled_mat[is.na(scaled_mat)] <- 0
+col.order.43twd <- readRDS('../canary_meth_Rproj/column_order_rna_all_markers_N7493.Rds')
+
+
+top25 <- all_markers_p %>% group_by(marker) %>% slice_min(FDR,n=10); dim(top25)
+length(unique(top25$protein))
+index <- which(rownames(scaled_mat) %in% top25$protein); length(index)
+topGenesLabel <- anno_mark(at = index, 
+        labels = rownames(scaled_mat)[index],
+        # labels_gp = gpar(fontsize = 5), padding = unit(1, "mm"),
+        which = "row"
+)
+
+
+
+hm.protein45 <- Heatmap(scaled_mat,
+  show_column_names = FALSE,
+  show_row_names = FALSE,
+  col=viridis::magma(20),
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  column_order = unlist(col.order.43twd),
+  # row_order = unlist(roworder),
+  heatmap_legend_param = list(title='Z-score'),
+  row_title_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 1),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 5#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 10),
+  right_annotation = rowAnnotation(mark = topGenesLabel),
+  heatmap_width = unit(6, "in"),  
+  heatmap_height = unit(7, "in"),  
+  column_split = factor(meta00$clusterMembership,levels=c(
+    'Follicular','Luteal','Inactive','Postpartum','Postmeno'
+  )),
+  row_title_rot = 0,
+  cluster_column_slices = FALSE,
+  # row_title = paste0('Protein\nExclusive\nMarkers\nN=',nrow(scaled_mat)),
+  cluster_row_slices=FALSE,
+  show_heatmap_legend = FALSE
+)
+
+png('proteinMarkers_all_N936.png',width=1200,height=1500,unit='px',res=140); print(hm.protein45); dev.off()
+
+# save the column order for hte protein one
+
+
+```
+
+# Marker GENE heatmap
+
+```{r heatmap_protein_markers}
+
+markers <- readRDS(file = '../canary_meth_Rproj/markers_from_nurDGE_Fig5a.Rds',)
+table(markers$SYMBOL %in% rownames(protein_data))
+# FALSE  TRUE 
+   # 38    39 
+markersF <- dplyr::filter(markers,markers$SYMBOL%in%rownames(protein_data))
+
+scaled_mat = t(scale(t(protein_data[markersF$SYMBOL,meta00$`Patient ID`]))); dim(scaled_mat)
+# change to patientID
+stopifnot(all(colnames(scaled_mat) == meta00$`Patient ID`))
+colnames(scaled_mat) <- meta00$patientID
+scaled_mat[scaled_mat>2] <- 2
+scaled_mat[scaled_mat<(-2)] <- -2
+
+scaled_mat[is.na(scaled_mat)] <- 0
+hm.P.markers <- Heatmap(scaled_mat,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  col=viridis::magma(20),
+  cluster_rows = FALSE,
+  cluster_columns = TRUE,
+  # column_order = unlist(column_order),
+  # row_order = unlist(roworder),
+  heatmap_legend_param = list(title='Z-score'),
+  row_title_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 10),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 10#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 10),
+  top_annotation = haCol_rna_markers,
+  heatmap_width = unit(6, "in"),  
+  heatmap_height = unit(7, "in"),  
+  column_split = factor(protein_meta$clusterMembership,levels=c(
+    'Follicular','Luteal','Inactive','Postpartum','Postmeno'
+  )),
+  row_title_rot = 0,
+  cluster_column_slices = FALSE,
+  row_split = markersF$Marker,
+  cluster_row_slices=FALSE
+  # column_km = 5
+)
+
+
+# hm.P.markers
+pdf('protein_5_RNA_groups_GeneMarkers_heatmap.pdf',width=12,height=11); print(hm.P.markers); dev.off()
+
+```
+
+# Gray synapse upload - 2/19/24
+
+```{r synapse}
+
+tmp <- readRDS('protein_meta_N96.Rds')
+
+tmp2 <- as.data.frame(readRDS('protein_data_N96.Rds'))
+
+if(all(tmp$`Patient ID` == colnames(tmp2))){
+  colnames(tmp2) <- tmp$SVC
+}
+colnames(tmp2)
+
+tmp2 <- tibble::rownames_to_column(tmp2,var="Genes")
+write.table(tmp2,'protein_data_level3_N96.tsv',sep="\t",quote=FALSE,row.names=FALSE)
+```
+
+
+```{r HCK_prot_expr}
+
+
+i <- grep('HCK',rownames(protein_data))
+protein_data[i,]
+
+
+```

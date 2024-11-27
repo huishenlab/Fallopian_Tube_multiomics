@@ -1,0 +1,5444 @@
+---
+title: "Canary BRCA1/2 Methylation"
+author: "Ian Beddows"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+params:
+  rmd: ""
+output:
+  html_document:
+    dev: png
+    code_folding: hide
+    self_contained: yes
+    toc: true
+    toc_depth: 2
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    df_print: paged
+    css: styles.css
+---
+
+Tested in R version `r getRversion()`.
+
+```{r setup,echo=FALSE}
+
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE,
+	cache = TRUE,
+	cache.lazy = FALSE
+)
+
+```
+
+```{r loadlibs}
+
+# BiocManager::install(site_repository = 'biobenkj/biscuiteer',update=TRUE) - not working
+# remotes::install_github(repo = 'biobenkj/biscuiteer') # dev version  - is working
+
+suppressPackageStartupMessages({
+  library(yaml)
+  library(xtable)
+  library(kableExtra)
+  library(tidyverse)
+  library(reshape2)
+  library(matrixStats)
+  library(ggplot2)
+  library(ggrepel)
+  library(biscuiteer)
+  library(patchwork)
+  library(ggrepel)
+  library(bsseq)
+  library(ComplexHeatmap)
+  library(DMRcate)
+  library(Gviz)
+  library(rstatix)
+  library(bbplot)
+})
+
+```
+
+```{r source_methFunctions.R,cache=FALSE}
+
+
+source("~/Desktop/biscuiteer_adjacent_R_functions/methFunctions.R")
+
+# source bisplotti
+source("~/Desktop/bisplotti/R/epistate.R")
+
+
+HeatmapFromBed <- function(myChr,myRanges,nameArg,clip=0,cluster_rows=TRUE){
+
+  bs_list <- generate_or_load_bsseq_list(
+     path='../Biscuit_Snakemake_Workflow/analysis/pileup/',
+     vcf_header_path = '../Biscuit_Snakemake_Workflow/analysis/pileup/',
+     name=nameArg,
+     sampNames=meta$SVC,
+     readBiscuitMergedFlag=TRUE,
+     whichFlag = GRanges(
+        seqnames=myChr,
+        ranges=myRanges,
+        strand='*'
+     )
+  )
+
+  names(bs_list) <-  meta$SVC
+# unique(unlist(lapply(bs_list,FUN=function(x){return(rownames(x))})))
+  tictoc::tic("Unionize")
+  myBS <- bs_list[[1]]
+  
+  # combineList <- edit(bsseq::combineList)
+  # add 
+  # `checkDimnames = FALSE` to the se call at the very end!
+  # (see https://github.com/hansenlab/bsseq/pull/113/commits/d4a2305f1fe5d9e65312f9a4575ff942fd0c21eb)
+  
+  for (i in seq(2,length(bs_list))){
+        cat(i,names(bs_list)[i],nrow(bs_list[[i]]),"\n")
+        myBS <- combineList(list(bs_list[[i]],myBS))
+  }
+  tictoc::toc()
+
+  betaMatrix.tidy <- do.call('rbind',
+    lapply(
+      seq_along(bs_list), FUN = function(
+          x,n,i
+        ){
+          # print(paste(x[i],n[i],i))
+          cbind(
+            data.frame(rowRanges(x[[i]])),
+            beta = as.numeric(round(x[[i]]@assays@data$M / x[[i]]@assays@data$Cov, 2)),
+            depth = as.numeric(x[[i]]@assays@data$Cov),
+            sample = rep(n[[i]],nrow(x[[i]]))
+          )
+        },
+      x=bs_list,
+      n=names(bs_list)
+    )
+  )
+
+  betaMatrix.tidy$pos <- paste0(betaMatrix.tidy$seqnames,':',betaMatrix.tidy$start)
+
+
+  ## GET THE BETA MATRIX
+  betaMatrix <- betaMatrix.tidy %>% 
+    dplyr::select(one_of(c('sample','beta','pos'))) %>%
+    tidyr::pivot_wider(values_from = beta,names_from = sample)
+  dim(betaMatrix)
+  betaMatrix <- dplyr::arrange(betaMatrix,pos)
+  .rownames <- betaMatrix$pos
+  betaMatrix <- dplyr::select(betaMatrix,-pos)
+  dim(betaMatrix)
+  # rownames(betaMatrix) <- .rownames
+  
+  # if(clip>0){betaMatrix <- head(betaMatrix,clip)}
+  ### arrange the order
+  meta.tmp <- dplyr::arrange(meta,`ReproductiveStatus`,DaysSinceLMP)
+  meta.tmp$groupBRCA = factor(meta.tmp$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+  
+  betaMatrix <- betaMatrix[,meta.tmp$sample]
+  rownames(betaMatrix) <- .rownames
+  stopifnot(all(colnames(betaMatrix)==meta.tmp$sample))
+  
+  betaMatrix <- t(betaMatrix)
+  stopifnot(all(rownames(betaMatrix)==meta.tmp$sample))
+
+  
+  ### REMAKE THE ANNOTATION SINCE THE ORDER IS CHANGED
+  haRowMasterFUNCTION <- rowAnnotation(
+    `Stroma` = meta.tmp$MIR200cAvgBeta,
+    `Reproductive Status` = meta.tmp$ReproductiveStatus,
+    `Age` = meta.tmp$`Age at time of surgery`,
+    `BRCA Germline` = meta.tmp$groupBRCA,
+    # `LMP explanation` = meta.tmp$LMP_explanation,
+    `Race` = meta.tmp$Race,
+    col = list(
+      `Stroma` = circlize::colorRamp2(
+                                breaks = seq(from = 0, to = 1, length = 20),
+                                colors = colorRampPalette(c("white", "black"))(20)
+      ),
+      Pilot = c(
+        'A' = pal[1],
+        'B' = pal[2]
+      ),
+      `Reproductive Status` = c(
+        'Pre' = '#28BBECFF',
+        'Post' = '#FB8022FF'
+      ),
+  
+      `BRCA Germline` = c(
+        'BRCA1' = '#40498e',
+        'BRCA2' = '#38aaac',
+        'NON-BRCA' = 'black'
+      ),
+      Race = c(
+        'Asian' = pal2[1],
+        'Black' = pal2[2],
+        'East Indian' = pal2[3],
+        'Hispanic Latino/White' = pal2[4],
+        'White' = pal2[5],
+        'Other' = 'grey44'
+      ),
+      `Age` = circlize::colorRamp2(
+                                breaks = seq(from = 20, to = 72, length = 20),
+                                colors = colorRampPalette(c("gray75", "gray10"))(20)
+      ),
+      DaysSinceLMP = circlize::colorRamp2(
+                                breaks = seq(from = 6, to = 368, length = 50),
+                                colors = colorRampPalette(c("white", "blue"))(50)
+      ),
+      `LMP explanation` = c(
+        'F2M on Testosterone' = 'orange',
+        'Perimennopausal' = 'lightblue2',
+        'Post' = 'red',
+        'Pregnancy' = 'pink'
+      )
+    )
+  )
+  
+  
+  
+  # new_order <- match(ordered,rownames(betaMatrix))
+  # betaMatrix2 <- betaMatrix[new_order,]
+  myHM <- ComplexHeatmap::Heatmap(
+    betaMatrix,
+    show_column_names = FALSE,
+    col=viridis::cividis(20),
+    cluster_rows = cluster_rows,
+    cluster_columns = FALSE,
+    heatmap_legend_param = list(title='Beta'),
+    row_title_gp = gpar(fontsize = 9),
+    row_names_gp = gpar(fontsize = 7),
+    column_names_rot = 90,
+    column_names_gp = gpar(
+      fontsize = 8#,
+      # col = myPosColors
+    ),
+    column_title = nameArg, 
+    column_title_gp = gpar(fontsize = 22),
+    # right_annotation = haRowMIR200,
+    right_annotation = haRowMasterFUNCTION,
+    # top_annotation = haCol_MIR141,
+    heatmap_width = unit(9, "in"),  
+    heatmap_height = unit(7, "in"),  
+    # row_split = paste0(meta$groupBRCA),
+    # row_split = paste0(meta.tmp$Race),
+    # row_split = paste0(meta$ReproductiveStatus,'\n',meta$groupBRCA),
+    row_title_rot = 0
+  )
+
+  print(
+    myHM
+  )
+  
+  return(
+    betaMatrix
+  )
+}
+
+
+```
+
+```{r config}
+
+config <- yaml::yaml.load_file("../Biscuit_Snakemake_Workflow/config/config.yaml")
+
+config.multiscale = "../Biscuit_Snakemake_Workflow/multiscale_methylation_plot_pipeline//bin/config.yaml"
+# config$ref$fasta
+```
+
+# METADATA
+
+From Pilot C data
+    
+    removed 3345 (BRCA2) due to low coverage
+    removed 3354 (WT) due to being an outlier in retention rates
+
+Note that these are removed in the useMethData column of the metadata. They were also resequenced but no avail.
+
+```{r load_meta}
+brca.lvls <- c('NON-BRCA','BRCA1','BRCA2')
+snk.meta.file="../Biscuit_Snakemake_Workflow/config/samples_Aug2023.tsv" # samples_Aug2023 has 111 samples with Pilots A (N=7, only for showing in multiqc that they were not converted), B, C, & D
+# master.meta.file="../MasterCanaryClinData_20230823.xlsx"
+master.meta.file="../MasterCanaryClinData_20230913.xlsx"
+sheet = 'data'
+snk.meta <- read.delim(snk.meta.file)
+cat('Found',nrow(snk.meta),'samples in SNAKEMAKE meta file',snk.meta.file,'\n')
+
+cat('Loading Master Meta Data:',master.meta.file,"\n")
+cat('\tSheet:',sheet,"\n")
+master.meta <- dplyr::filter(readxl::read_excel(path=master.meta.file,sheet=sheet),sequencedRNA==TRUE | useMethData==TRUE)
+dim(master.meta)
+table(master.meta$groupBRCA)
+table(master.meta$Pilot)
+table(master.meta$useMethData,master.meta$Pilot)
+
+
+
+# do some math for # samples
+# meta2 <- dplyr::filter(meta,useMethData==TRUE | sequencedRNA==TRUE)
+# dim(meta2)
+# table(master.meta$sequencedRNA,master.meta$useMethData)
+# These are from 53 individual samples. 26 cases have both Methylation and RNA, 7 have only methylation, and 20 have only RNA.
+
+
+# drop levels that were not sequenced
+meta <- readxl::read_excel(path=master.meta.file,sheet=sheet)
+meta$PredictedAges <- round(as.numeric(meta$PredictedAges),1)
+meta <- dplyr::filter(meta,useMethData==TRUE | is.na(useMethData))
+cat('Found',nrow(meta),"samples with useMethData==TRUE or blank\n")
+
+cat('all samples are in SNAKEMAKE meta file:',all(meta$SVC %in% snk.meta$sample),'\n')
+
+
+# Make some factors
+raceLvls = c('Asian','Black','Hispanic Latino/White','East Indian','White','Other')
+# Fix race issue
+meta$Race <- ifelse(meta$Race=='white','White',meta$Race)
+meta$Race <- ifelse(meta$Race=='black','Black',meta$Race)
+setequal(raceLvls,unique(meta$Race)) # check that values are ok
+meta$Race <- factor(meta$Race,levels=raceLvls)
+
+unique(meta$ReproductiveStatus)
+meta$ReproductiveStatus = factor(meta$ReproductiveStatus,levels=c('Pre','Post'))
+
+# Get the age of the patients in years
+# meta$age_in_years <- ifelse(
+#   meta$Pilot%in%c('B'),
+#   as.numeric( round(( as.Date(meta$`Date of Surgery`) - as.Date(meta$DoB) ) / 365 , 0) ),
+#   as.numeric(meta$`Age at time of surgery`)
+# )
+# summary(meta$age_in_years)
+
+# Not working with pilot C
+# meta$FlowcellNumber <- unlist(lapply(meta$fq1,function(x){
+# stringr::str_count(x,",") + 1
+# }))
+# cat('Flowcells count distribution by sample\n')
+# table(meta$FlowcellNumber)
+
+# saveRDS(meta,'meta.Rds') # do this later after adding MIR200c
+
+meta$sample <- meta$SVC
+
+meta$groupBRCA = factor(meta$groupBRCA,
+                        levels=c('NON-BRCA','BRCA1','BRCA2'))
+
+
+## Note Aug 2023, this code is no longer needed because the meta was formalized with these values in it. Retaking the meta from box now.
+
+# also change the Date of Surgery and LMP to dates
+# meta$`Date of Surgery` <- as.Date(meta$`Date of Surgery`)
+# change NAs
+# meta$LMP <- as.Date(dplyr::na_if(meta$LMP,"NA"))
+# meta$`LMP (days)` = ifelse(meta$ReproductiveStatus=='Post',NA,(meta$`Date of Surgery` - meta$LMP))
+
+
+# check that all TRUE in table(meta$useMethData) exist as mergecg.bed.gz
+table(
+  file.exists(
+    paste0('../Biscuit_Snakemake_Workflow/analysis/pileup/',dplyr::filter(meta,useMethData==TRUE)$SVC,'_mergecg.bed.gz')
+  )
+)
+
+
+# Make pregnancy annotation variable
+meta$Pregnancy <- ifelse(is.na(meta$LMP_explanation),'Normal',meta$LMP_explanation)
+meta$Pregnancy <- ifelse(meta$Pregnancy=='Pregnancy','Pregnant','Normal')
+# table(meta$Pregnancy)
+
+meta$DaysSinceLMP_use <- abs(meta$DaysSinceLMP)
+meta$DaysSinceLMP_use <- ifelse(meta$DaysSinceLMP_use>50,NA,meta$DaysSinceLMP_use)
+
+meta.rna <- dplyr::filter(master.meta,is.na(useRNAData) & sequencedRNA==TRUE)
+dim(meta.rna)
+
+```
+
+# Sample Demographics
+
+old one
+```{r sample.demographics.plots,fig.height=5,fig.width=5}
+
+meta$groupBRCA=factor(meta$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+master.meta$groupBRCA=factor(master.meta$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+
+meta.wgbs <- dplyr::filter(meta,useMethData==TRUE)
+
+pal <- viridis::viridis(n=7)
+meta.rna$ReproductiveStatus <- factor(meta.rna$ReproductiveStatus,levels=levels(meta.wgbs$ReproductiveStatus))
+a <- ggplot(meta.rna,aes(x=groupBRCA)) + 
+  geom_bar(aes(y=..count.., fill=`ReproductiveStatus`)) +
+  # geom_bar(aes(y=..count..),fill='grey32') + 
+  # coord_flip() + 
+  scale_fill_manual(values = c('#28BBECFF','#FB8022FF')) +
+  # facet_wrap(~groupBRCA) + 
+  xlab('') +
+  bbc_style() + 
+  labs(title="",
+       subtitle = paste0('KAPA RNA Hyperprep Kit (N=',nrow(meta.rna),')'),) +
+  theme(axis.text.x = element_text(angle=45,hjust=1))
+
+b <- ggplot(meta.wgbs,aes(x=groupBRCA)) +
+  geom_bar(aes(y=..count.., fill=`ReproductiveStatus`)) +
+  # geom_bar(aes(y=..count..),fill='grey32') +
+  # coord_flip() + 
+  scale_fill_manual(values = c('#28BBECFF','#FB8022FF')) +
+  # facet_wrap(~groupBRCA) + 
+  xlab('') +
+  bbc_style() + 
+  labs(title="",
+       subtitle = paste0('Swift Accel-NGS Methyl-Seq (N=',nrow(meta.wgbs),')'),) +
+  theme(axis.text.x = element_text(angle=45,hjust=1))
+
+library(patchwork)
+layout <- '
+A
+B
+'
+
+pdf(file='sample_demographics_RNA.pdf',height = 6,width = 6); a + ylim(c(0,60)); dev.off()
+pdf(file='sample_demographics_Meth.pdf',height = 6,width = 6); b + ylim(c(0,60));dev.off()
+
+
+# boxplot of groupBRCA ~ age
+
+library(rstatix)
+meta %>%
+  pairwise_wilcox_test(`Age at time of surgery` ~ groupBRCA)
+
+.meta <- meta
+.meta$PilotColor <- ifelse(.meta$Pilot=='B','grey12','grey72')
+pdf(file='sample_demographics_groupBRCA_age.pdf',height = 6,width = 6)
+ggplot(.meta,aes(x=groupBRCA,y=`Age at time of surgery`)) +
+  # geom_boxplot() +
+ 
+  geom_jitter(size = 5, alpha = 1, width = 0.1,aes(color=Pilot)) +
+  # geom_jitter(size = 5, alpha = 1, width = 0.1,color=.meta$RaceColor) +
+   geom_violin(aes(x=groupBRCA,y=`Age at time of surgery`),fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  bbc_style() +
+  ylab('Age') +
+  ylim(c(30,80)) +
+  ylab('Age at the time of FT collection') + 
+  ggtitle('') +
+  theme(axis.text.x = element_text(angle=45,hjust=1),
+        legend.position='bottom')
+dev.off()
+
+  pdf(file='sample_demographics_groupBRCA_race2.pdf',height = 5,width = 5)
+  ggplot(meta,aes(x=groupBRCA,fill=Race)) +
+    geom_bar(stat='count') +
+    # scale_fill_manual(values = c('grey32','grey52','grey82')) +
+    scale_fill_brewer(palette = 'Accent') +
+    bbc_style() +
+    xlab('') +
+    ylim(c(0,60)) + 
+    ggtitle('') +
+    theme(axis.text.x = element_text(angle=45,hjust=1),legend.position = 'top')
+  dev.off()
+# table(meta.wgbs$Pilot,meta.wgbs$groupBRCA)
+# table(meta.rna$Pilot,meta.rna$groupBRCA)
+
+  .meta$LMP_explanation2 <- ifelse(is.na(.meta$LMP_explanation),as.character(.meta$ReproductiveStatus),.meta$LMP_explanation)
+   
+    pdf(file='sample_demographics_groupBRCA_pregnancy.pdf',height = 5,width = 5)
+  ggplot(.meta,aes(x=groupBRCA,fill=LMP_explanation2)) +
+    geom_bar(stat='count') +
+    # scale_fill_manual(values = c('grey32','grey52','grey82')) +
+    scale_fill_brewer(palette = 'Set1') +
+    bbc_style() +
+    xlab('') +
+    ylim(c(0,60)) + 
+    ggtitle('') +
+    theme(axis.text.x = element_text(angle=45,hjust=1),legend.position = 'top')
+dev.off()
+```
+
+new one using Table S1
+```{r sample.demographics.plots,fig.height=5,fig.width=5}
+require(bbplot)
+require(tidyverse)
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+dim(m0)
+
+m0$groupBRCA=factor(m0$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+m0$ReproductiveStatus <- factor(m0$ReproductiveStatus,levels=c('Pre','Post'))
+
+# Filter that an assay was done:
+m1 <- dplyr::filter(m0,useMethylation==TRUE | useProteomics==TRUE | useRNA_2==TRUE)
+dim(m1)
+table(m1$useMethylation,m1$useProteomics,m1$useRNA_2)
+table(m1$groupBRCA)
+ggplot(m1,aes(x=groupBRCA)) + 
+  geom_bar(aes(y=..count.., fill=`ReproductiveStatus`)) +
+  # geom_bar(aes(y=..count..),fill='grey32') + 
+  # coord_flip() + 
+  scale_fill_manual(values = c('#28BBECFF','#FB8022FF')) +
+  # facet_wrap(~groupBRCA) + 
+  xlab('') +
+  bbc_style() + 
+  labs(title="",
+       subtitle = paste0('N=',nrow(m1))) +
+  theme(axis.text.x = element_text(angle=45,hjust=1))
+
+# same thing with race
+m1$Race <- factor(m1$Race,levels=c('Asian','Black','East Indian','Hispanic Latino/White','White','Other'))
+
+library(ggpattern)
+ggplot(data = df, aes(x = Class, fill = StudyTime, pattern = Nerd)) +
+  geom_bar_pattern(position = position_dodge(preserve = "single"),
+                   color = "black", 
+                   pattern_fill = "black",
+                   pattern_angle = 45,
+                   pattern_density = 0.1,
+                   pattern_spacing = 0.025,
+                   pattern_key_scale_factor = 0.6) + 
+  scale_fill_manual(values = colorRampPalette(c("#0066CC","#FFFFFF","#FF8C00"))(4)) +
+  scale_pattern_manual(values = c(Nerd = "stripe", NotNerd = "none")) +
+  labs(x = "Class", y = "Number of Students", pattern = "Nerd?") + 
+  guides(pattern = guide_legend(override.aes = list(fill = "white")),
+         fill = guide_legend(override.aes = list(pattern = "none")))
+
+
+pX <- ggplot(m1,aes(x=groupBRCA,fill=Race,pattern=Postpartum)) + 
+  ggpattern::geom_bar_pattern(
+                   color = "black", 
+                   pattern_fill = "black",
+                   pattern_angle = 45,
+                   pattern_density = 0.1,
+                   pattern_spacing = 0.025,
+                   pattern_key_scale_factor = 0.6) +
+  # geom_bar(aes(y=..count..),fill='grey32') + 
+  # coord_flip() + 
+  scale_fill_manual(values = c("#30123BFF","#28BBECFF","#A2FC3CFF","#FB8022FF","#7A0403FF","grey44")) +
+   scale_pattern_manual(values = c('TRUE' = "stripe", 'FALSE' = "none")) +
+
+  # Race = c(
+  #     'Asian' = "#30123BFF",
+  #     'Black' = "#28BBECFF",
+  #     'East Indian' = "#A2FC3CFF",
+  #     'Hispanic Latino/White' = "#FB8022FF",
+  #     'White' = "#7A0403FF"
+  #   )
+  
+  xlab('') +
+  bbc_style() + 
+  labs(title="",
+       subtitle = paste0('N=',nrow(m1))) +
+  theme(axis.text.x = element_text(angle=45,hjust=1)) +
+  guides(pattern = guide_legend(override.aes = list(fill = "white")),
+         fill = guide_legend(override.aes = list(pattern = "none")))
+pX
+
+pdf(file='sample_demographics_Race.pdf',height = 6,width = 6);pX; dev.off()
+
+
+
+```
+
+
+# Heatmap anno row master
+
+```{r ComplexHeatmapAnnotations}
+heatmapColorPal <- colorRampPalette(c('blue','yellow'))(20)
+pal = c(
+  viridis::viridis(n=4),
+  viridis::rocket(n=5)[2:4],
+  viridis::turbo(n=5)[c(2,4)]
+)
+# pal2 = viridis::mako(n=5)
+pal2 = viridis::turbo(n=5)
+
+
+metaOO <- dplyr::arrange(meta,`Age at time of surgery`)
+
+haRowMaster <- rowAnnotation(
+  Batch = metaOO$Pilot,
+  `Reproductive Status` = metaOO$ReproductiveStatus,
+  `Race` = metaOO$Race,
+  `Age` = metaOO$`Age at time of surgery`,
+  `Pregnancy` = metaOO$Pregnancy,
+  `Days since LMP` = metaOO$DaysSinceLMP_use,
+  `BRCA status` = metaOO$groupBRCA,
+  col = list(
+    `Block Age (Years)` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 11, length = 20),
+                              colors = colorRampPalette(c("yellow", "blue"))(20)
+    ),
+    `Days since LMP` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 50, length = 20),
+                              colors = colorRampPalette(c("gray100", "gray10"))(20)
+    ),
+    `Age` = circlize::colorRamp2(
+                              breaks = seq(from = 20, to = 72, length = 20),
+                              colors = colorRampPalette(c("gray75", "gray10"))(20)
+    ),
+    `Pregnancy` = c(
+      'Pregnant' = 'pink',
+      'Normal' = 'gray22'
+    ),
+    Batch = c(
+      'A' = pal[1],
+      'B' = pal[2],
+      'C' = pal[3],
+      'D' = pal[4]
+    ),
+    `Reproductive Status` = c(
+      'Pre' = pal[8],
+      'Post' = pal[9]
+    ),
+    `BRCA status` = c(
+      'BRCA1' = '#40498e',
+      'BRCA2' = '#38aaac',
+      'NON-BRCA' = 'black'
+    ),
+    Race = c(
+      'Asian' = pal2[1],
+      'Black' = pal2[2],
+      'East Indian' = pal2[3],
+      'Hispanic Latino/White' = pal2[4],
+      'White' = pal2[5],
+      'Other' = 'gray48'
+    )
+  )
+)
+
+```
+
+# MultiQC plots remade
+
+```{r boxplot.biscuit-mapping-overview-plot,fig.height=5,fig.width=7}
+
+# get the raw reads
+# rawReads <- NULL
+# namesReads <- NULL
+# for(s in meta$SVC){
+#   fi <- paste0('../Biscuit_Snakemake_Workflow/analysis/rawReads/',s,'.txt')
+#   if(file.exists(fi)){
+#     x <- read.delim(fi,header=FALSE,check.names = FALSE)
+#     rawReads <- c(rawReads,x$V1)
+#     namesReads <- c(namesReads,s)
+#   }
+# }
+# rawReads <- rawReads / 2
+# 
+# tmp <- data.frame(
+#   SVC=namesReads,
+#   rawReadsMethylation=rawReads
+# ) %>% dplyr::left_join(meta)
+
+data <- read.delim('samtools-flagstat-dp.tsv',sep="\t")
+# if(! 'Optimally.Aligned.Reads' %in% colnames(meta)){
+tmp <- dplyr::left_join(meta,data,by=c('SVC'='Sample'))
+
+dim(tmp)
+tmp$groupBRCA = factor(tmp$groupBRCA,levels=levels(meta$groupBRCA))
+
+a <- ggplot(tmp,aes(x=groupBRCA,y=Mapped,group=groupBRCA,color=ReproductiveStatus)) + 
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+      geom_jitter(size = 2, alpha = 1, width = 0.1) + theme_bw() + 
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) +
+  theme(legend.position='none') +
+  # theme(axis.text = element_text(size=34),
+        # axis.title = element_text(size=36)) + 
+  ylab('Million Reads Mapped') + xlab('') + ylim(c(0,1000))
+a
+
+pdf(file='MillionsReadMapped_dotplot.pdf',height = 3,width = 3); a; dev.off()
+
+# shows no correlation
+ggplot(tmp,aes(x=`Age at time of surgery`,y=Mapped,group=groupBRCA)) + geom_point() + theme_bw() + scale_color_viridis_c() #+ theme(legend.position='none')
+
+
+
+# make a matched figure for total counts of RNA data
+
+# add in the raw counts
+raw_counts <- readRDS('raw_counts_N104.Rds')
+x <- data.frame(colSums(raw_counts[,3:ncol(raw_counts)],na.rm=TRUE))
+x$SVC <- rownames(x)
+colnames(x)[1] <- 'total_reads_RNA'
+tmp <- dplyr::left_join(meta,x)
+b <- ggplot(tmp,aes(x=groupBRCA,y=total_reads_RNA,group=groupBRCA,color=Race)) + 
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+      geom_jitter(size = 2, alpha = 1, width = 0.1) + theme_bw() + 
+  # scale_color_manual(values=c("#28BBECFF","#FB8022FF")) +
+  theme(legend.position='none') +
+  # theme(axis.text = element_text(size=34),
+        # axis.title = element_text(size=36)) + 
+  ylab('Gene Counts') + xlab('') + ylim(c(0,3e7))
+b
+
+pdf(file='GeneCounts_dotplot.pdf',height = 3,width = 3); b; dev.off()
+
+
+```
+
+## Biscuit Retention Barplot
+
+Looked at the isize distribution in multiQC with no differences amongst samples
+
+```{r boxplot.biscuit_retention,fig.height=5,fig.width=9}
+
+data <- read.delim('biscuit_retention.tsv',sep="\t")
+
+data <- dplyr::left_join(meta,data,by=c('SVC'='Category'))
+
+d <- dplyr::select(data,matches('Retention'),one_of(c('groupBRCA','SVC')))
+
+d2 <- pivot_longer(d,cols=matches('Retention'),names_to = 'Base',values_to = 'Retention')
+
+ggplot(d2,aes(x=SVC,y=Retention,fill=Base)) + geom_bar(stat='identity',position = 'dodge') + bbplot::bbc_style() + scale_fill_viridis_d(option='turbo') + theme(axis.text.x = element_blank()) + ylim(c(0,100))
+
+
+d3 <- dplyr::left_join(d2,meta,by='SVC')
+
+pdf('Retention_boxplot.pdf',height = 3,width = 6)
+ggplot(d3,aes(x=groupBRCA.x,y=Retention,color=Base)) +
+  geom_boxplot() + theme_bw() + scale_color_viridis_d(option='mako') +
+  theme(axis.text.x = element_text(angle=45,hjust=1)) +
+  xlab('')
+dev.off()
+
+d3$Base <- gsub('.Retention','',d3$Base)
+pdf('Retention_boxplot2.pdf',height = 5,width = 2)
+ggplot(d3,aes(x=Base,y=Retention)) +
+  geom_boxplot() + theme_bw() + scale_color_viridis_d(option='mako') +
+  theme(axis.text.x = element_text(angle=45,hjust=1)) +
+  xlab('')
+dev.off()
+
+
+# get average of different retentions
+dplyr::filter(d3,Base!='CpG.Retention') %>% summarise(mean=mean(Retention))
+dplyr::filter(d3,Base=='CpG.Retention') %>% summarise(mean=mean(Retention))
+
+
+```
+
+```{r boxplot.biscuit_strands,fig.height=7,fig.width=7}
+
+data <- read.delim('biscuit_strands.tsv',sep="\t",check.names = FALSE)
+data <- dplyr::filter(data,Category%in%dplyr::filter(meta2,Pilot!='A')$SVC)
+# meta <- dplyr::left_join(meta,data,by=c('SVC'='Category'))
+
+# d <- dplyr::select(meta,matches('Retention'),one_of(c('groupBRCA','SVC')))
+
+d2 <- pivot_longer(data,cols=matches('Conversion'),names_to = 'Mapping',values_to = 'Reads')
+
+# pdf('mappingStrand.pdf',width = 7,height = 7)
+ggplot(d2,aes(x=Category,y=Reads,fill=Mapping)) + geom_bar(stat='identity',position = 'stack') + bbplot::bbc_style() + scale_fill_viridis_d(option='viridis') + theme(axis.text.y = element_blank()) + coord_flip()#+ ylim(c(0,100))
+# dev.off()
+
+
+```
+
+```{r boxplot.biscuit_seq_depth,fig.height=7,fig.width=12,eval=FALSE}
+
+# data <- read.delim('biscuit_seq_depth.tsv',sep="\t",check.names = FALSE)
+# data <- dplyr::filter(data,Sample%in%dplyr::filter(meta2,Pilot!='A')$SVC)
+
+
+
+```
+
+
+# Age by patient BRCA status dotplot
+
+```{r }
+
+p002 <-  ggplot(dplyr::filter(master.meta,Pilot!='A'),aes(x=groupBRCA,y=`Age at time of surgery`)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 1, alpha = 1, width = 0.1) +
+  theme_minimal() +
+  xlab('Patient germline status') + ggtitle('') + ylim(c(19,80))
+
+p002
+
+pdf(file='Age_by_BRCAgroup.pdf',height = 3,width = 3);p002;dev.off()
+
+rstatix::anova_test(dplyr::filter(master.meta,Pilot!='A'),formula = `Age at time of surgery` ~ groupBRCA)
+rstatix::pairwise_wilcox_test(dplyr::filter(master.meta,Pilot!='A'),formula = `Age at time of surgery` ~ groupBRCA)
+```
+
+# MIR200chg
+
+```{r load_epic_manifest_get_mir_probes,eval=TRUE}
+manifest.df <- read.table('EPIC.hg38.manifest.gencode.v36.tsv',sep="\t",header=TRUE)
+
+# manifest <- sesameData::sesameDataGet("EPIC.hg38.manifest")
+# class(manifest)
+# manifest.df <- data.frame(manifest)
+rownames(manifest.df) <- manifest.df$probeID
+
+mir200c.probes <- c(
+  'cg24702147',
+  'cg00366413',
+  'cg27534624',
+  'cg22413603', # this does not exist !!
+  'cg18959988',
+  'cg23067082',
+  'cg19794481',
+  'cg18185189',
+  'cg12161331',
+  'cg02624246'
+)
+
+mir200c.probes.pos <- manifest.df[mir200c.probes,1:3]
+
+# mir200.start <- min(c(mir200c.probes.pos$end,mir200c.probes.pos$start),na.rm=TRUE)
+# mir200.end <- max(c(mir200c.probes.pos$end,mir200c.probes.pos$start),na.rm=TRUE)
+
+mir200.start <- min(c(mir200c.probes.pos$CpG_beg,mir200c.probes.pos$CpG_end),na.rm=TRUE);mir200.start
+mir200.end <- max(c(mir200c.probes.pos$CpG_beg,mir200c.probes.pos$CpG_end),na.rm=TRUE);mir200.end
+
+```
+
+```{r readBiscuit}
+
+bs_list <- generate_or_load_bsseq_list(
+   path='../Biscuit_Snakemake_Workflow/analysis/pileup/',
+   vcf_header_path = '../Biscuit_Snakemake_Workflow/analysis/pileup/',
+   name='MIR200',
+   sampNames=meta$SVC,
+   readBiscuitMergedFlag=TRUE,
+   whichFlag = GRanges(
+      seqnames='chr12',
+      ranges=IRanges(mir200.start, width=(mir200.end-mir200.start)),
+      strand='*'
+   )
+)
+
+names(bs_list) <- meta$SVC
+
+# names(bs_list) <- gsub('_mergecg.bed.gz','',list.files('Biscuit_Snakemake_Workflow/analysis/pileup/',pattern = '_mergecg.bed.gz$')) # these are the same but one is easier...
+
+# tictoc::tic("Unionize")
+# myBS <- bs_list[[1]]
+# table(unlist(lapply(bs_list,FUN=length)))
+# for (i in (2:length(bs_list))){
+#       myBS <- biscuiteer::unionize(myBS,bs_list[[i]])
+# }
+# tictoc::toc()
+
+# saveRDS(myBS,'MIR200_myBS.Rds')
+# myBS <- readRDS('MIR200_myBS.Rds')
+# myBS <- bs_list[[1]]
+# for (i in (2:length(bs_list))){
+#       myBS <- bsseq::combine(myBS,bs_list[[i]])
+# }
+
+```
+
+```{r getBetaMatrixFrom_BS_LIST}
+
+
+
+betaMatrix.tidy <- do.call('rbind',
+  lapply(
+    seq_along(bs_list), FUN = function(
+        x,n,i
+      ){
+        # print(paste(x[i],n[i],i))
+        cbind(
+          data.frame(rowRanges(x[[i]])),
+          beta = as.numeric(round(x[[i]]@assays@data$M / x[[i]]@assays@data$Cov, 2)),
+          depth = as.numeric(x[[i]]@assays@data$Cov),
+          sample = rep(n[[i]],nrow(x[[i]]))
+        )
+      },
+    x=bs_list,
+    n=names(bs_list)
+  )
+)
+
+betaMatrix.tidy$pos <- paste0(betaMatrix.tidy$seqnames,':',betaMatrix.tidy$start)
+
+## Factor samples
+betaMatrix.tidy$sample = factor(betaMatrix.tidy$sample,levels=meta$SVC)
+
+
+### FILTER TO SET OF PROBES 
+# dim(betaMatrix.tidy)
+# betaMatrix.tidy <- dplyr::filter(betaMatrix.tidy,pos %in% paste(mir200c.probes.pos$seqnames,mir200c.probes.pos$start,sep=":"))
+dim(betaMatrix.tidy)
+
+## GET THE BETA MATRIX
+betaMatrix <- betaMatrix.tidy %>% 
+  dplyr::select(one_of(c('sample','beta','pos'))) %>%
+  tidyr::pivot_wider(values_from = beta,names_from = sample)
+dim(betaMatrix)
+betaMatrix <- dplyr::arrange(betaMatrix,pos)
+.rownames <- betaMatrix$pos
+betaMatrix <- dplyr::select(betaMatrix,-pos)
+dim(betaMatrix)
+rownames(betaMatrix) <- .rownames
+
+## GET THE DEPTH MATRIX
+depthMatrix <- betaMatrix.tidy %>% 
+  dplyr::select(one_of(c('sample','depth','pos'))) %>%
+  tidyr::pivot_wider(values_from = depth,names_from = sample)
+dim(depthMatrix)
+depthMatrix <- dplyr::arrange(depthMatrix,pos)
+.rownames <- depthMatrix$pos
+depthMatrix <- dplyr::select(depthMatrix,-pos)
+dim(depthMatrix)
+rownames(depthMatrix) <- .rownames
+
+## filter betaMatrix if needed
+# mir200.index4mat <- which(rownames(betaMatrix) %in% paste(mir200c.probes.pos$seqnames,mir200c.probes.pos$start,sep=":"))
+# betaMatrix <- betaMatrix[mir200.index4mat,]
+# rownames(betaMatrix) <- .rownames[mir200.index4mat]
+# dim(betaMatrix)
+```
+
+## Heatmap
+
+```{r heatmapMIR200cgh,fig.height=7.5,fig.width=9.5,dev=c('png','pdf'),eval=TRUE}
+
+# get the depth
+avgDepth <- (betaMatrix.tidy %>% dplyr::group_by(sample) %>% dplyr::summarise(avgDepth = mean(depth)))$avgDepth
+avgDepthSamples <- (betaMatrix.tidy %>% dplyr::group_by(sample) %>% dplyr::summarise(avgDepth = mean(depth)))$sample
+
+# triple check ordering!
+stopifnot(all(avgDepthSamples==colnames(betaMatrix)) && all(avgDepthSamples==colnames(betaMatrix)))
+
+pal = c(
+  viridis::viridis(n=3),
+  viridis::turbo(n=5)[c(2,4)]
+)
+
+myPosColors <- rep('black',nrow(betaMatrix))
+mir200c.pos.index <- which(rownames(betaMatrix) %in% paste(mir200c.probes.pos$CpG_chrm,mir200c.probes.pos$CpG_beg+1,sep=":")); mir200c.pos.index
+myPosColors[
+  mir200c.pos.index
+] <- 'red'
+
+### Make the annotation
+# haCol <- HeatmapAnnotation(
+haRow <- rowAnnotation(
+  # `Mean\nBeta` = anno_barplot(colMeans(betaMatrix[mir200c.pos.index,],na.rm = TRUE), width = unit(0.5, "in"),ylim=c(0,1)),
+  # `Mean\nDepth` = anno_barplot(avgDepth, width = unit(0.5, "in"))
+  # > viridis::rocket(n=9)
+# [1] "#03051AFF" "#30173AFF" "#611F53FF" "#961C5BFF" "#CB1B4FFF"
+# [6] "#EC4B3EFF" "#F4875EFF" "#F6BB97FF" "#FAEBDDFF"
+  # just the mir200 probes
+  `Mean\nBeta` = anno_barplot(colMeans(betaMatrix,na.rm = TRUE), width = unit(0.5, "in"),ylim=c(0,1),border=FALSE,gp = gpar(fill='gray12')),
+  `Mean\nDepth` = anno_barplot(avgDepth,gp = gpar(fill='gray45'), width = unit(0.5, "in"),border=FALSE)
+)
+
+
+# Get sample depths
+avgDepth <- round((betaMatrix.tidy %>% dplyr::group_by(sample) %>% dplyr::summarise(avgDepth = mean(depth,na.rm=TRUE)))$avgDepth,2)
+avgBeta <- round((betaMatrix.tidy %>% dplyr::group_by(sample) %>% dplyr::summarise(avgBeta = mean(beta,na.rm=TRUE)))$avgBeta,2)
+
+# check that positions depth names match matrix rownames
+stopifnot(all(rownames(betaMatrix)==avgDepthPosPositions))
+# stopifnot(all(colnames(betaMatrix)==meta$SVC))
+
+haRow_MIR141 <- rowAnnotation(
+  `Mean\nDepth` = anno_barplot(avgDepth, width = unit(0.5, "in")),
+  `Mean\nBeta` = anno_barplot(avgBeta, width = unit(0.5, "in"),ylim=c(0,1))
+)
+
+
+
+## Make the heatmap
+# .meta <- dplyr::filter(meta,SVC%in%colnames(betaMatrix))
+hm.mir200 <- ComplexHeatmap::Heatmap(
+  t(betaMatrix),
+  show_column_names = TRUE,
+  show_row_names = FALSE,
+  col=viridis::cividis(20),
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  heatmap_legend_param = list(title='Beta'),
+  row_title_gp = gpar(fontsize = 9),
+  row_names_gp = gpar(fontsize = 5),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 8#,
+    # col = myPosColors
+  ),
+  column_title = "MIR200cgh CpG Methylation", 
+  column_title_gp = gpar(fontsize = 22),
+  # right_annotation = haRowMaster,
+  # right_annotation = haRow_MIR141,
+  right_annotation = c(haRowMaster,haRow_MIR141),
+  heatmap_width = unit(6, "in"),  
+  heatmap_height = unit(5, "in"),  
+  # row_split = paste0(meta$ReproductiveStatus,'\n',meta$groupBRCA),
+  # row_split = paste0(meta$groupBRCA),
+  row_title_rot = 0
+)
+
+  pdf('hm.mir200.pdf',width=10,height=7)
+  print(hm.mir200)
+  dev.off()
+# colnames(betaMatrix)
+# paste(rownames(betaMatrix)[1])
+
+# plotEpiread(
+#     epibed.gr.tabulated.list[[1]],
+#     show_readnames = FALSE,
+#     plot_read_ave = FALSE
+# ) + ggtitle('test')
+
+
+
+```
+
+
+use the chunk above this one!
+```{r heatmapMIR200cgh_wDensity,fig.height=7.5,fig.width=9.5,dev=c('png','pdf'),eval=FALSE}
+
+
+pal = c(
+  viridis::viridis(n=3),
+  viridis::turbo(n=5)[c(2,4)]
+)
+
+myPosColors <- rep('black',nrow(betaMatrix))
+mir200c.pos.index <- which(rownames(betaMatrix) %in% paste(mir200c.probes.pos$seqnames,mir200c.probes.pos$start,sep=":"))
+myPosColors[
+  mir200c.pos.index
+] <- 'red'
+
+## Make the annotation
+## Rows are the samples
+# Per sample beta
+lt0 = apply(betaMatrix, 2, function(x) data.frame(density(na.omit(x))[c("x", "y")]))
+# Per sample depth
+lt1 = apply(depthMatrix, 2, function(x) data.frame(density(na.omit(x))[c("x", "y")]))
+
+haRow <- HeatmapAnnotation(
+  `Mean\nBeta` = anno_joyplot(lt0),#, width = unit(0.5, "in")),
+  `Mean\nDepth` = anno_joyplot(lt1)#, width = unit(0.5, "in"))
+)
+
+# Per position beta
+lt2 = apply(betaMatrix, 1, function(x) data.frame(density(na.omit(x))[c("x", "y")]))
+# Per position depth
+lt3 = apply(depthMatrix, 1, function(x) data.frame(density(na.omit(x))[c("x", "y")]))
+haCol_MIR141 <- rowAnnotation(
+  `Mean\nBeta` = anno_joyplot(lt2, width = unit(0.5, "in")),
+  `Mean\nDepth` = anno_joyplot(lt3, width = unit(0.5, "in"))
+)
+
+
+## Make the heatmap
+
+ComplexHeatmap::Heatmap(
+  betaMatrix,
+  show_column_names = TRUE,
+  col=heatmapColorPal,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  heatmap_legend_param = list(title='Beta'),
+  row_title_gp = gpar(fontsize = 9),
+  row_names_gp = gpar(fontsize = 12),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 8#,
+    # col = myPosColors
+  ),
+  row_title = "MIR200cgh CpG Methylation", 
+  column_title_gp = gpar(fontsize = 22),
+  right_annotation = haCol_MIR141,
+  top_annotation = haRow,
+  heatmap_width = unit(9, "in"),  
+  heatmap_height = unit(7, "in"),  
+  column_split = paste0(meta$ReproductiveStatus,'\n',meta$groupBRCA),
+  row_title_rot = 0
+)
+
+```
+
+
+# ADD MIR200C TO META
+
+
+```{r compare_MIR200expr_w_methylation,dev=c('png','pdf'),fig.height=5,fig.width=5}
+
+d <- data.frame(colMeans(betaMatrix[mir200c.pos.index,],na.rm=TRUE))
+colnames(d) <- 'MIR200cAvgBeta'
+d$SVC <- rownames(d)
+if(any(colnames(meta)=='MIR200cAvgBeta')){
+  meta <- meta %>% dplyr::select(-matches('MIR200cAvgBeta'))
+  meta <- dplyr::left_join(meta,d)
+}else{
+  meta <- dplyr::left_join(meta,d)
+}
+saveRDS(d,'MIR200cAvgBeta_dataframe.Rds')
+d <- data.frame(colMeans(betaMatrix,na.rm=TRUE))
+colnames(d) <- 'MIR200cAvgBetaAll'
+d$SVC <- rownames(d)
+
+
+if(any(colnames(meta)=='MIR200cAvgBetaAll')){
+  meta <- meta %>% dplyr::select(-matches('MIR200cAvgBetaAll'))
+  meta <- dplyr::left_join(meta,d)
+}else{
+  meta <- dplyr::left_join(meta,d)
+}
+
+ggplot(meta,aes(y=MIR200cAvgBetaAll,x=MIR200cAvgBeta,color=groupBRCA)) + geom_point(size=5) +
+ylab('MIR200c Beta All') + xlim(c(0,1)) + ylim(c(0,1)) +
+xlab('MIR200c Beta') +
+scale_color_manual(values=viridis::mako(n=4)[1:3]) +
+theme_bw()
+
+.meta <- meta
+.meta$PilotColor <- ifelse(.meta$Pilot=='B','red','blue')
+ggplot(meta,aes(x=groupBRCA,y=MIR200cAvgBeta)) + 
+      geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+      geom_jitter(size = 1, alpha = 1, width = 0.1,color=.meta$PilotColor) +
+      xlab('') +
+      bbc_style() +
+      viridis::scale_color_viridis(discrete = TRUE) +
+      theme(legend.position="none") +
+      theme(plot.title = element_text(size=12)) +
+      theme(axis.text.x = element_text(angle=45,hjust=1)) +
+      ylab('MIR200C Beta')
+
+library(rstatix)
+meta %>%
+  pairwise_wilcox_test(MIR200cAvgBeta ~ groupBRCA)
+  
+
+# add also in predicted ages from Horvath
+pred <- read.csv('predicted_ages.csv')
+meta <- dplyr::left_join(meta,pred[,2:3])
+# saveRDS(meta,file='meta_N103.Rds')
+
+
+
+
+require(bbplot)
+xdwew <- ggplot(meta,aes(x=groupBRCA,y=MIR200cAvgBeta,color=groupBRCA)) +
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  # geom_jitter(size = 3, alpha = 1, width = 0.1,color=.meta$PilotColor) +
+  geom_jitter(size = 2, alpha = 1, width = 0.1) +
+  theme_minimal() + theme(legend.position = 'none') +
+  xlab('') + ylab('') +
+  scale_color_manual(values=viridis::mako(n=4)[1:3]) + 
+  ylim(c(0.15,0.9)) + scale_y_continuous(breaks = c(0.2,0.4,0.6,0.8)) +
+  ggtitle('')
+pdf(file='MIR200cAvgBeta_by_groupBRCA_dotplot.pdf',height = 3,width = 3); xdwew; dev.off()
+
+meta %>%
+  pairwise_wilcox_test(MIR200cAvgBeta ~ groupBRCA)
+meta %>%
+  pairwise_wilcox_test(MIR200cAvgBeta ~ ReproductiveStatus)
+
+```
+
+```{r ComplexHeatmapAnnotationsWithMIR200c}
+
+pal = c(
+  viridis::viridis(n=2),
+  viridis::rocket(n=5)[2:4],
+  viridis::turbo(n=5)[c(2,4)]
+)
+
+# haCol <- HeatmapAnnotation(
+haRowMIR200 <- rowAnnotation(
+  `MIR200c` = meta$MIR200cAvgBeta,
+  `Reproductive Status` = meta$ReproductiveStatus,
+  `BRCA Mutation` = meta$groupBRCA,
+  `Race` = meta$Race,
+  col = list(
+    `MIR200c` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 1, length = 20),
+                              colors = colorRampPalette(c("white", "black"))(20)
+    ),
+    Pilot = c(
+      'A' = pal[1],
+      'B' = pal[2]
+    ),
+    `Reproductive Status` = c(
+      'Pre' = pal[6],
+      'Post' = pal[7]
+    ),
+    `BRCA Mutation` = c(
+      'BRCA1' = pal[3],
+      'BRCA2' = pal[4],
+      'NON-BRCA' = pal[5]
+    ),
+    Race = c(
+      'Asian' = pal2[1],
+      'Black' = pal2[2],
+      'East Indian' = pal2[3],
+      'Hispanic Latino/White' = pal2[4],
+      'White' = pal2[5]
+    ),
+    Pregnancy = c('Pregnant'='pink','Normal'='gray22')
+  )
+)
+
+meta.ord <- meta
+meta.ord$groupBRCA = factor(meta.ord$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+  
+meta.ord <- dplyr::arrange(meta.ord,ReproductiveStatus,groupBRCA)
+
+haRowMIR200_ordered <- rowAnnotation(
+  `MIR200c` = meta.ord$MIR200cAvgBeta,
+  `Reproductive Status` = meta.ord$ReproductiveStatus,
+  `BRCA Mutation` = meta.ord$groupBRCA,
+  `Race` = meta.ord$Race,
+  col = list(
+    `MIR200c` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 1, length = 20),
+                              colors = colorRampPalette(c("white", "black"))(20)
+    ),
+    Pilot = c(
+      'A' = pal[1],
+      'B' = pal[2]
+    ),
+    `Reproductive Status` = c(
+      'Pre' = pal[6],
+      'Post' = pal[7]
+    ),
+    `BRCA Mutation` = c(
+      'BRCA1' = pal[3],
+      'BRCA2' = pal[4],
+      'NON-BRCA' = pal[5]
+    ),
+    Race = c(
+      'Asian' = pal2[1],
+      'Black' = pal2[2],
+      'East Indian' = pal2[3],
+      'Hispanic Latino/White' = pal2[4],
+      'White' = pal2[5]
+    )
+  )
+)
+
+```
+
+
+# Age & Predicted Age Plots
+
+
+```{r plots_with_age_v_groupBRCA_etc}
+
+ggplot(meta,aes(x=`Age at time of surgery`,y=PredictedAges)) + geom_point() + theme_minimal() 
+meta$age_differential <- meta$PredictedAges - meta$`Age at time of surgery`
+meta %>% rstatix::anova_test(age_differential~groupBRCA)
+
+a <- ggplot(meta,aes(x=groupBRCA,y=age_differential,color=groupBRCA)) + geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+      geom_jitter(size = 3, alpha = 1, width = 0.1,aes(color=groupBRCA)) + theme_minimal() + scale_color_manual(values=viridis::mako(n=4)[1:3]) + labs(caption='ANOVA Pval=0.56') + xlab('')
+
+
+tmp <- meta
+tmp$x_axis <- ifelse(!is.na(tmp$LMP_explanation),tmp$LMP_explanation,as.character(tmp$ReproductiveStatus))
+# table(tmp$x_axis)
+tmp %>% rstatix::anova_test(age_differential~x_axis)
+b <- ggplot(tmp,aes(x=x_axis,y=age_differential))  +
+  geom_jitter(size = 3, alpha = 1, width = 0.1,aes(color=DaysSinceLMP)) + 
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  theme_minimal() + scale_color_viridis_c() + labs(caption='ANOVA Pval=0.000674') + xlab('')
+
+tmp$x_axis2 <- ifelse(is.na(tmp$LMP_explanation)|tmp$LMP_explanation!='Pregnancy',as.character(tmp$groupBRCA),'Pregnancy')
+table(tmp$x_axis2)
+tmp %>% rstatix::anova_test(age_differential~x_axis2)
+c <- ggplot(tmp,aes(x=x_axis2,y=age_differential))  +
+  geom_jitter(size = 3, alpha = 1, width = 0.1) + 
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  theme_minimal() + scale_color_viridis_c() + labs(caption='ANOVA Pval=0.41') + xlab('')
+
+c
+pdf(file='age_differential_by_groupBRCA.pdf',height = 5,width = 5); a; dev.off()
+pdf(file='age_differential_by_LMP_explanation.pdf',height = 5,width = 5); b; dev.off()
+
+
+# ggplot(meta,aes(x=age_differential,y=DaysSinceLMP)) + geom_point()
+
+```
+
+# PCA with Table S1
+
+```{r consistent_PCAs}
+
+# new one using Table S1
+require(bbplot)
+require(tidyverse)
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+dim(m0)
+
+m0$groupBRCA=factor(m0$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+m0$ReproductiveStatus <- factor(m0$ReproductiveStatus,levels=c('Pre','Post'))
+
+m0$PC1_Methylation <- as.numeric(m0$PC1_Methylation)
+m0$PC2_Methylation <- as.numeric(m0$PC2_Methylation)
+m0$PC1_RNA <- as.numeric(m0$PC1_RNA)
+m0$PC2_RNA <- as.numeric(m0$PC2_RNA)
+m0$PC1_Protein <- as.numeric(m0$PC1_Protein)
+m0$PC2_Protein <- as.numeric(m0$PC2_Protein)
+m0$MIR200cAvgBeta <- as.numeric(m0$MIR200cAvgBeta)
+
+
+## % stroma (a-c)
+a <- ggplot(m0, aes(x=PC1_Methylation, y=PC2_Methylation)) +
+    geom_point(size=3,aes(color = MIR200cAvgBeta,pch=groupBRCA)) +
+    theme_bw() +
+    viridis::scale_color_viridis(option='cividis',discrete = FALSE,limits=c(0,1)) +
+      theme(legend.position='none',axis.title.x=element_blank(),axis.title.y=element_blank(),
+        axis.text.x=element_blank(),axis.text.y=element_blank(),
+        axis.ticks.x=element_blank(),axis.ticks.y=element_blank())
+
+b <- ggplot(m0, aes(x=PC1_RNA, y=PC2_RNA)) +
+    geom_point(size=3,aes(color = MIR200cAvgBeta,pch=groupBRCA)) +
+    theme_bw() +
+    viridis::scale_color_viridis(option='viridis',discrete = FALSE,limits=c(0,1)) +
+      theme(legend.position='none',axis.title.x=element_blank(),axis.title.y=element_blank(),
+        axis.text.x=element_blank(),axis.text.y=element_blank(),
+        axis.ticks.x=element_blank(),axis.ticks.y=element_blank())
+
+c <- ggplot(m0, aes(x=PC1_Protein, y=PC2_Protein)) +
+    geom_point(size=3,aes(color = MIR200cAvgBeta,pch=groupBRCA)) +
+    theme_bw() +
+    viridis::scale_color_viridis(option='magma',discrete = FALSE,limits=c(0,1)) +
+      theme(legend.position='none',axis.title.x=element_blank(),axis.title.y=element_blank(),
+        axis.text.x=element_blank(),axis.text.y=element_blank(),
+        axis.ticks.x=element_blank(),axis.ticks.y=element_blank())
+
+
+## BRCA (d-f)
+d <- ggplot(m0, aes(x=PC1_Methylation, y=PC2_Methylation)) +
+    geom_point(size=3,aes(color = groupBRCA)) +
+    theme_bw() +
+    # scale_color_manual(values=c("#28BBECFF","#FB8022FF",'grey33')) +   
+    scale_color_manual(values=c('black','#40498e','#38aaac')) +
+    theme(legend.position='none',axis.title.x=element_blank(),axis.title.y=element_blank(),
+        axis.text.x=element_blank(),axis.text.y=element_blank(),
+        axis.ticks.x=element_blank(),axis.ticks.y=element_blank())
+
+e <- ggplot(m0, aes(x=PC1_RNA, y=PC2_RNA)) +
+    geom_point(size=3,aes(color = groupBRCA)) +
+    theme_bw() +
+    scale_color_manual(values=c('black','#40498e','#38aaac')) +
+    theme(legend.position='none',axis.title.x=element_blank(),axis.title.y=element_blank(),
+        axis.text.x=element_blank(),axis.text.y=element_blank(),
+        axis.ticks.x=element_blank(),axis.ticks.y=element_blank())
+
+f <- ggplot(m0, aes(x=PC1_Protein, y=PC2_Protein)) +
+    geom_point(size=3,aes(color = groupBRCA)) +
+    theme_bw() +
+    scale_color_manual(values=c('black','#40498e','#38aaac')) +
+    theme(legend.position='none',axis.title.x=element_blank(),axis.title.y=element_blank(),
+        axis.text.x=element_blank(),axis.text.y=element_blank(),
+        axis.ticks.x=element_blank(),axis.ticks.y=element_blank())
+
+
+### Meno Status (g - i)
+m0$MenoStatus <- ifelse(m0$Postpartum==TRUE,'Postpartum',as.character(m0$ReproductiveStatus))
+table(m0$MenoStatus)
+m0$MenoStatus <- factor(m0$MenoStatus,levels=c('Pre','Post','Postpartum'))
+g <- ggplot(m0, aes(x=PC1_Methylation, y=PC2_Methylation)) +
+    geom_point(size=3,aes(color = MenoStatus)) +
+    theme_bw() +
+    scale_color_manual(values=c("#28BBECFF","#FB8022FF",'grey33')) +   
+    theme(legend.position='none',axis.title.x=element_blank(),axis.title.y=element_blank(),
+        axis.text.x=element_blank(),axis.text.y=element_blank(),
+        axis.ticks.x=element_blank(),axis.ticks.y=element_blank())
+
+h <- ggplot(m0, aes(x=PC1_RNA, y=PC2_RNA)) +
+    geom_point(size=3,aes(color = MenoStatus)) +
+    theme_bw() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF",'grey33')) +   
+    theme(legend.position='none',axis.title.x=element_blank(),axis.title.y=element_blank(),
+        axis.text.x=element_blank(),axis.text.y=element_blank(),
+        axis.ticks.x=element_blank(),axis.ticks.y=element_blank())
+
+i <- ggplot(m0, aes(x=PC1_Protein, y=PC2_Protein)) +
+    geom_point(size=3,aes(color = MenoStatus)) +
+    theme_bw() +
+    scale_color_manual(values=c("#28BBECFF","#FB8022FF",'grey33')) +   
+    theme(legend.position='none',axis.title.x=element_blank(),axis.title.y=element_blank(),
+        axis.text.x=element_blank(),axis.text.y=element_blank(),
+        axis.ticks.x=element_blank(),axis.ticks.y=element_blank())
+
+
+
+###
+
+###
+
+
+###
+
+library(patchwork)
+layout <- '
+abc
+def
+ghi'
+
+# pdf(file='pca_plots_3x_brca.pdf',height = 3,width = 9);
+pdf(file='pca_plots_9x.pdf',height = 9,width = 9);
+a + b + c + d + e + f + g + h + i + plot_layout(design = layout) + plot_annotation(tag_levels = 'a'); 
+dev.off()
+
+
+```
+
+# PCA 100kb bins
+
+```{r PCA.100kb_bin.loadData}
+
+# load data as a matrix
+dir = '../Biscuit_Snakemake_Workflow/analysis/binned_averages/'
+files <- list.files(dir,pattern = '_100kb.bed.gz$')
+names <- gsub('_100kb.bed.gz','',files)
+length(names)
+binnedDF <- NULL
+for(i in 1:length(files)){
+  tmp <- read.delim(paste0(dir,files[i]),sep="\t",header=FALSE)
+  colnames(tmp) <- c('chr','start','end',names[i])
+  if(is.null(binnedDF)){
+    binnedDF <- tmp
+  }else{
+    binnedDF <- dplyr::left_join(binnedDF,tmp,by=c('chr'='chr','start'='start','end'='end'))
+  }
+}
+
+dim(binnedDF)
+
+binnedDF <- dplyr::select(binnedDF,c('chr','start','end',meta$SVC))
+
+# subset to normal chromosomes
+chrs <- paste0('chr',c(1:22,'M','X','Y'))
+
+binnedDF <- dplyr::filter(binnedDF,chr %in% chrs)
+nrow(binnedDF)
+
+removeTheseRows <- which(apply(binnedDF,1,function(x){
+  length(which(x=='.'))
+})>0)
+
+cat('Removing',length(removeTheseRows)/nrow(binnedDF)*100,'% of bins for missing data\n')
+
+binnedDF <- binnedDF[-removeTheseRows,c('chr','start','end',meta$SVC)] 
+
+binnedDF[] <- lapply(binnedDF, function(x) {
+    if(is.character(x)) as.numeric(x) else x
+})
+
+```
+
+```{r PCA.100kb_bin,results='asis',dev=c('pdf'),fig.height=5,fig.width=5}
+
+pca <- prcomp(t(binnedDF[,-c(1:3)]))
+pr_comps <- data.frame(pca$x)
+pr_comps$sample <- rownames(pr_comps)
+pr_comps_100kb <- pr_comps
+saveRDS(pr_comps_100kb,'pr_comps_100kb_methylation.Rds')
+pr_comps <- dplyr::left_join(pr_comps,meta,by=c('sample'='SVC'))
+prop_var <- data.frame(t(summary(pca)$importance))
+names(prop_var) = c("sd", "prop", "cum")
+prop_var$num = 1:nrow(prop_var)
+
+var_plot <- ggplot(prop_var %>% dplyr::filter(.data$num <= 
+    12), aes_string(x = "num", y = "prop")) + geom_point(size = 1.5) + 
+    geom_line() + scale_x_continuous(breaks = seq(1, 100, 
+    2)) + xlab("Principal Component") + ylab("Variance Explained") + 
+    ggtitle("") + theme_minimal() + xlim(c(1,5))
+    # theme(axis.title.y = element_text(vjust = 1,size=9), plot.margin = unit(c(0, 
+      # 0, 0, 6), "mm")) 
+pdf('PCA_var_plot_Methylation_100kb.pdf',height = 1.5,width = 2.5); var_plot; dev.off()
+
+a <- ggplot(pr_comps, aes(x=PC1, y=PC2)) +
+    geom_point(size=3,aes(color = groupBRCA)) +
+    theme_bw() +
+    scale_color_manual(values=viridis::mako(n=4)[1:3])
+    # viridis::scale_color_viridis(discrete = TRUE)
+pdf('PCA_w_groupBRCA.pdf',height = 3.5,width = 5); a; dev.off()
+
+aXX <- ggplot(pr_comps, aes(x=PC1, y=PC2)) +
+    geom_point(size=3,aes(color = `DaysSinceLMP`)) +
+    theme_bw() +
+    # scale_color_manual(values=viridis::mako(n=4)[1:3])
+    viridis::scale_color_viridis(discrete = FALSE)
+pdf('PCA_w_LMPdays.pdf',height = 3.5,width = 5); aXX; dev.off()
+
+b <- ggplot(pr_comps, aes(x=PC1, y=PC2)) +
+    geom_point(size=7,aes(color = Race)) +
+    theme_bw() +
+    scale_color_manual(values=viridis::plasma(n=6))
+
+c <- ggplot(pr_comps, aes(x=PC1, y=PC2)) +
+    geom_point(size=7,aes(color = ReproductiveStatus)) +
+    theme_bw() +
+    # viridis::scale_color_viridis(discrete = TRUE)
+    scale_color_manual(values=viridis::turbo(n=5)[c(2,4)])
+
+d <- ggplot(pr_comps, aes(x=PC1, y=PC2)) +
+    geom_point(size=7,aes(color = `Age at time of surgery`)) +
+    theme_bw() +
+    viridis::scale_color_viridis(discrete = FALSE)
+
+f <- ggplot(pr_comps, aes(x=PC1, y=PC2)) +
+    geom_point(size=3,aes(color = MIR200cAvgBeta)) +
+    theme_bw() +
+    viridis::scale_color_viridis(discrete = FALSE)
+cor.test(pr_comps$MIR200cAvgBeta,pr_comps$PC1,method='spearman')
+pdf('PCA_MIR200C.pdf',height = 3.5,width = 5); f; dev.off()
+
+e <- ggplot(pr_comps, aes(x=PC1, y=PC2)) +
+    geom_point(size=7,aes(color = Optimally.Aligned.Reads)) +
+    theme_bw()# +
+    # viridis::scale_color_viridis(discrete = FALSE)
+    # scale_color_manual(values=viridis::turbo(n=5)[c(2,4)])
+
+ggplot(pr_comps, aes(x=PC1, y=PC2)) +
+    geom_point(size=7,aes(color = Pilot)) +
+    theme_bw()# +
+
+ggplot(pr_comps, aes(x=PC1, y=PC2)) +
+    geom_point(size=7,aes(color = Pilot)) +
+    theme_bw()# +
+
+layout <- '
+A
+A
+A
+A
+B
+'
+
+
+a + var_plot +
+  plot_layout(design = layout) + plot_annotation(tag_levels = 'A')
+
+
+
+(a + geom_label_repel(aes(label=sample)) ) + var_plot +
+  plot_layout(design = layout) + plot_annotation(tag_levels = 'A')
+
+a
+
+b
+
+c
+
+d
+
+e
+
+f
+
+
+cor.test(meta$`Age at time of surgery`,meta$MIR200cAvgBeta,method='spearman') 
+
+x3 <- ggplot(meta,aes(x=`Age at time of surgery`,y=MIR200cAvgBeta,color=ReproductiveStatus)) + geom_point(size=3) + theme_minimal() +   ylim(c(0,1)) + scale_y_continuous(breaks = c(0.25,0.5,0.75,1)) + scale_color_manual(values=c('#FB8022FF','#28BBECFF'))
+  # labs(title=' ',
+       # subtitle = 'Spearman\'s rho 0.423; p-value = 8.2e-6') +
+  # scale_color_viridis_d(option='turbo') +
+  # scale_color_manual(values=rev(viridis::mako(n=4)[1:3])) #+
+  # ggtitle('Stromal Content Increases With Age')
+x3 #+ facet_wrap(~ReproductiveStatus,nrow = 2)
+pdf('age_vs_composition.pdf',height = 3,width = 5); x3; dev.off()
+
+xx <- ggplot(pr_comps,aes(x=PC1,y=MIR200cAvgBeta)) + geom_point(size=2) + theme_minimal() + 
+  # scale_color_viridis_d(option='mako') + 
+  # scale_color_manual(values=viridis::mako(n=4)[1:3]) +
+  ggtitle('') + ylim(c(0.15,0.9)) + scale_y_continuous(breaks = c(0.2,0.4,0.6,0.8))
+xx + geom_smooth(se = FALSE)
+pdf('Composition_PC1.pdf',height = 3,width = 3); xx; dev.off()
+
+# NM_007294.4(BRCA1):c.68_69del (p.Glu23fs)
+ggplot(pr_comps, aes(x=PC1, y=PC2)) +
+    geom_point(size=7,aes(color = 
+        ifelse(meta$ConfirmedClinVar=='NM_007294.4(BRCA1):c.68_69del (p.Glu23fs)','NM_007294.4(BRCA1):c.68_69del (p.Glu23fs)',groupBRCA)                    
+    )) +
+    theme_bw()
+
+
+cor.test(pr_comps$PC1,pr_comps$MIR200cAvgBeta,method='spearman')
+cor.test(pr_comps$PC1,pr_comps$age_in_years,method='spearman')
+```
+
+## Figure 2B - PCA
+```{r PCA_w_Boxplots_GroupB,fig.height=5,fig.width=5,dev=c('pdf')}
+
+require(cowplot)
+
+# myValues <- viridis::viridis(n=3)
+myValuesBRCAcol <- viridis::mako(n=4)[1:3]
+
+pmain <- a <- ggplot(pr_comps, aes(x=PC1, y=PC2)) +
+    geom_point(size=3,aes(color = MIR200cAvgBeta)) +
+    theme_bw() +
+    scale_color_viridis_c(limits=c(0,1),option='cividis') +
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)"))
+    # scale_color_manual(values=myValues)
+
+xbox <- axis_canvas(pmain, axis = "x", coord_flip = TRUE) + 
+  geom_boxplot(data = pr_comps, aes(y = PC1, x = groupBRCA, fill = groupBRCA)) + 
+  scale_x_discrete() + coord_flip() +
+  # viridis::scale_fill_viridis(option='mako',discrete = TRUE)
+  ggplot2::scale_fill_manual(values=myValuesBRCAcol)
+
+ybox <- axis_canvas(pmain, axis = "y") + 
+  geom_boxplot(data = pr_comps, aes(y = PC2, x = groupBRCA, fill = groupBRCA)) +
+  scale_x_discrete() +
+  # viridis::scale_fill_viridis(option='mako',discrete = TRUE) +
+  ggplot2::scale_fill_manual(values=myValuesBRCAcol) +
+  scale_x_discrete()
+
+p1 <- insert_xaxis_grob(pmain, xbox, grid::unit(1, "in"), position = "top")
+
+p2 <- insert_yaxis_grob(p1, ybox, grid::unit(1, "in"), position = "right")
+
+layout <- '
+A
+A
+A
+B'
+
+# ggdraw(p2) + var_plot +
+  # plot_layout(design = layout) + plot_annotation(tag_levels = 'A',title = '')
+pdf('PCA_methylation_100kb_bins_MIR200C.pdf',height = 5,width=7); ggdraw(p2); dev.off()
+ggdraw(p2)
+```
+
+<!-- The control vectors were **NOT** included in this project - do not include -->
+```{r control_vector_plot,eval=FALSE}
+
+# source("Biscuit_Snakemake_Workflow/bin/control_vector.R")
+
+import_emseq <- function(dir){
+  myReturnDF <- NULL
+  files <- list.files(dir)
+  for(f in files){
+    if(file.info(paste0(dir,f))$size>0){
+      name <- gsub('\\.bed','',f)
+      print(cat('File',f,name,'\n'))
+      myBed <- read.delim(paste0(dir,f),sep="\t",header=FALSE)
+      colnames(myBed) <- c('chr','start','end','beta','depth','info')
+      myBed$sample <- rep(name,nrow(myBed))
+      myReturnDF <- rbind(
+        myReturnDF,
+        myBed
+      )
+    }
+  }
+  return(myReturnDF)
+}
+
+# set the base directory
+baseDir <- 'Biscuit_Snakemake_Workflow/'
+posControlDir <- 'analysis/qc_vectors/puc19/'
+negControlDir <- 'analysis/qc_vectors/lambda/'
+# NEGATIVE CONTROL
+dir <- paste0(baseDir,negControlDir)
+# dir <- '../analysis/qc_vectors/lambda/'
+lambda <- import_emseq(dir)
+dim(lambda)
+nSamples <- length(unique(lambda$sample))
+
+if(exists("x")){
+  x <- lambda
+  
+  topleft <- ggplot(x,aes(x=sample,y=depth)) +
+    geom_boxplot(color='#357BA2FF') +
+    theme_bw() +
+    # ylim(c(0,max(x$depth,na.rm=TRUE))) +
+    theme(
+      # axis.text.x = element_text(angle=60,hjust=1,size=12), 
+      axis.text.x = element_blank(),
+      axis.text.y = element_text(size=12), 
+      axis.title.y = element_text(size=25), 
+      plot.title = element_text(size=25,hjust=0.5),
+      plot.subtitle = element_text(size=15,hjust=0.5)
+          
+    ) +
+    scale_color_manual() +
+    ggtitle('Unmethylated',subtitle = paste('N =',nSamples,'Samples')) +
+    ylab('Coverage') +
+    xlab('')
+  
+  bottomleft <- ggplot(x,aes(x=sample,y=beta)) +
+    geom_boxplot(color='#357BA2FF') +
+    theme_bw() +
+    ylim(c(0,1)) +
+    theme(
+      axis.text.x = element_text(angle=60,hjust=1,size=10), 
+      axis.text.y = element_text(size=12), 
+      axis.title.y = element_text(size=25), 
+      plot.title = element_text(size=25,hjust=0.5),
+      plot.subtitle = element_text(size=15,hjust=0.5)
+          
+    ) +
+    scale_color_manual() +
+    ylab('Beta') +
+    xlab('')
+} 
+
+# POSITIVE CONTROL
+dir2 <- paste0(baseDir,posControlDir)
+# dir2 <- '../analysis/qc_vectors/puc19/'
+puc19 <- import_emseq(dir2)
+dim(puc19)
+nSamples2 <- length(unique(puc19$sample))
+x <- puc19
+
+if(exists("x")){
+  topright <- ggplot(x,aes(x=sample,y=depth)) +
+    geom_boxplot(color='#357BA2FF') +
+    theme_bw() +
+    # ylim(c(0,max(x$depth,na.rm=TRUE))) +
+    theme(
+      # axis.text.x = element_text(angle=60,hjust=1,size=12), 
+      axis.text.x = element_blank(),
+      axis.text.y = element_text(size=12), 
+      axis.title.y = element_text(size=27), 
+      plot.title = element_text(size=27,hjust=0.5),
+      plot.subtitle = element_text(size=15,hjust=0.5)
+      
+    ) +
+    scale_color_manual() +
+    ggtitle('Methylated',subtitle = paste('N =',nSamples,'Samples')) +
+    xlab('') +
+    ylab('')
+  
+  bottomright <- ggplot(x,aes(x=sample,y=beta)) +
+    geom_boxplot(color='#357BA2FF') +
+    theme_bw() +
+    ylim(c(0,1)) +
+    theme(
+      axis.text.x = element_text(angle=60,hjust=1,size=10), 
+      axis.text.y = element_text(size=12), 
+      axis.title.y = element_text(size=25), 
+      plot.title = element_text(size=25,hjust=0.5),
+      plot.subtitle = element_text(size=15,hjust=0.5)
+      
+    ) +
+    scale_color_manual() +
+    ylab('') +
+    xlab('')
+}
+
+if(exists("topright") & exists("topleft")){
+  layout <- '
+  AB
+  CD
+  '
+  
+  pdf(file=paste0(baseDir,'analysis/qc_vectors/control_vector_boxplot.pdf'),width = 7,height = 10)
+  
+  topleft + topright + bottomleft + bottomright + 
+    patchwork::plot_annotation(tag_levels = 'A',title = 'Control Vectors') + 
+    patchwork::plot_layout(design = layout)  & theme(plot.tag = element_text(face = 'bold'))  & theme(plot.title = element_text(size=27,hjust=0.5))
+  
+  dev.off()
+}else{
+  pdf(file=paste0(baseDir,'analysis/qc_vectors/control_vector_boxplot.pdf'),width = 7,height = 10)
+  plot.new()
+  text(x = 0.5,y=0.5,"NO PLOT CREATED.\nLIKELY SOLUTION: NO DEPTH FOR CONTROL VECTOR(S)\n IN SUPPLIED MERGECG FILES")  # first 2 numbers are xy-coordinates within [0, 1]
+  dev.off()
+  
+}
+
+
+
+```
+
+<!-- # Promoters -->
+```{r Promoters.runFunctions,eval=FALSE}
+library(tictoc)
+
+bs_list <- generate_or_load_bsseq_list(
+   path='../Biscuit_Snakemake_Workflow/analysis/genomicFeaturesIntersectBedFiles/cpg_islands',
+   vcf_header_path = '../Biscuit_Snakemake_Workflow/analysis/pileup',
+   name='CpG_Islands',
+   sampNames=meta$SVC,
+   readBiscuitMergedFlag=TRUE
+)
+# length(bs_exp_prom) 
+# [1] 33
+# class(bs_exp_prom[[1]])
+# [1] "BSseq"
+# attr(,"package")
+# [1] "bsseq"
+
+# NOT NEEDED RIGHT NOW
+# dp <- getMult_densPlots(
+#   myBSlist = bs_list,
+#   name = 'CpG_Islands',
+#   ylim = 1,
+#   CovFilter = 10
+# )
+
+dp_exp_prom[[2]] 
+
+```
+
+# RNA counts import
+
+and add MIR200c expression to meta and resave meta.Rds!
+
+```{r import_RNAseq_counts}
+
+# norm_log_counts <- read.delim('/Volumes/projects_secondary/shen/projects/2020_12_17_Canary/canaryRNAseq_Rproj/log_cpm.tsv',sep="\t") # PilotB only
+
+raw_counts0 <- read.delim('count_pilotB_pilotC.txt',sep="\t")
+
+raw_counts1 <- read.delim('../rnaseq_count_noF2Mpreg_pilotABCD.txt',sep="\t") # only really need the pilot D samples from this! However, Ritu for some unkown reason changed the names of these ones...
+stopifnot(all(paste0('SVC00',substr(x = dplyr::filter(meta,Pilot=='D')$sample, start=1,stop = 4)) %in% colnames(raw_counts1)))
+x <- which(colnames(raw_counts1) %in% paste0('SVC00',substr(x = dplyr::filter(meta,Pilot=='D')$sample, start=1,stop = 4)))
+colnames(raw_counts1)[x] <- dplyr::filter(meta,Pilot=='D')$sample
+
+stopifnot(all(raw_counts0$ensemblId==raw_counts$ensemblId))
+raw_counts <- cbind(
+  raw_counts0,
+  raw_counts1[,x] 
+)
+
+dim(raw_counts) # [1] 58302   108 aka 106 samples
+
+
+
+# remove samples resequenced (including 3 resequenced from PilotA) - the samples that got resequenced in PilotD where never included by Ritu!
+remove <- paste0(meta.rna$SVC[which(meta.rna$resequencedRNA & meta.rna$Pilot=='B')],'_pilotC') # don't remove the ones 'resequenced' in D originally from C b/c these are not included in raw_counts1
+remove <- c(remove,"SVC001399_pilotC", "SVC001382_pilotC",  "SVC001394_pilotC") # add those to the ones from PilotA that got resequenced
+# > remove
+# [1] "SVC001870_pilotC" "SVC001875_pilotC" "SVC001876_pilotC"
+# [4] "SVC001877_pilotC" "SVC001880_pilotC" "SVC001882_pilotC"
+# [7] "SVC001399_pilotC" "SVC001382_pilotC" "SVC001394_pilotC"
+
+raw_counts <- raw_counts[,-which(colnames(raw_counts)%in%remove)]
+dim(raw_counts) # [1] 58302    100 aka 98 samples with 4 to be dropped b/c low coverage = 94 which matches meta.rna -- yes!
+colnames(raw_counts) <- gsub('_pilot[BC]','',colnames(raw_counts))
+# table(colnames(raw_counts) %in% meta.rna$SVC)
+
+dim(raw_counts)
+colnames(raw_counts)[which(!colnames(raw_counts) %in% meta.rna$SVC)]
+# [1] "ensemblId"  "geneSymbol" "SVC003342"  "SVC003357"  "SVC003366"  "SVC003373" - these 4 have useRNA==FALSE, so OK
+raw_counts <- raw_counts[,c('ensemblId','geneSymbol',meta.rna$SVC)]
+dim(raw_counts)
+
+# add in Pilot A
+dat_pilotA <- read.delim("Canary.SHEH_20191203_FFPEtest_RNA.summary.genes.expected-counts.tab",sep="\t",header=TRUE,row.names=1,as.is=TRUE)
+dim(dat_pilotA)
+dim(raw_counts) # [1] 58302    96
+raw_counts <- cbind(raw_counts,dat_pilotA)
+dim(raw_counts) #[1] 558302   116
+## this is the level1 data to upload to synapse (before removing samples w/o matched methylation)
+saveRDS(raw_counts,'raw_counts_N114.Rds')
+# and remove the samples from PilotA that are from 2010
+raw_counts <- raw_counts[,-which(colnames(raw_counts)%in%dplyr::filter(meta2,Year=="2010")$SVC)]
+dim(raw_counts) #  58302   106
+saveRDS(raw_counts,'raw_counts_N104.Rds')
+
+# write.table(raw_counts,'level3_RNA_counts_N92.tsv',sep="\t",quote = FALSE,row.names = FALSE)
+
+raw_counts_withMeth <- raw_counts[,c("ensemblId","geneSymbol",meta$SVC[which(meta$SVC%in%colnames(raw_counts))])]
+dim(raw_counts_withMeth) # [1] 58302    94 aka dropped 5 w/o methylation (4 after 3345)
+
+# now get cpm
+cpm <- cbind(raw_counts[,1:2],
+             edgeR::cpm(raw_counts[,3:ncol(raw_counts)])
+)
+rownames(cpm) <- cpm$ensemblId
+saveRDS(cpm,'cpm_N104.Rds')
+dim(cpm)
+
+mir200c.expr <- cpm['ENSG00000257084',]; 
+d <- data.frame(
+  MIR200c_CPM = mir200c.expr,
+  SVC = names(mir200c.expr),
+  check.names=FALSE
+)
+dim(d)
+saveRDS(d,file='MIR200c_CPM_N94.Rds')
+
+dim(meta)
+meta <- dplyr::left_join(meta,d)
+dim(meta)
+
+ggplot(meta,aes(x=MIR200cAvgBeta,y=log(MIR200c_CPM),color=`Age at time of surgery`)) + geom_point() + theme_minimal() +
+  xlim(c(0,1)) 
+
+# means <- readRDS('solo_wcgw_beta_means.Rds')
+# meta <- dplyr::left_join(meta,means,by=c('SVC'='sample'))
+
+# saveRDS(meta,'meta.Rds')
+
+```
+
+```{r combat_adjustment_for_batch}
+# BiocManager::install('sva')
+library(sva)
+all(colnames(raw_counts)==meta.rna$SVC)
+raw_counts_adjusted <- ComBat_seq(
+  counts = as.matrix(raw_counts[,meta.rna$SVC]),
+  batch = meta.rna$Pilot,
+  group = meta.rna$groupBRCA
+)
+  
+# Found 3 batches
+# Using full model in ComBat-seq.
+# Adjusting for 2 covariate(s) or covariate level(s)
+# Estimating dispersions
+# Fitting the GLM model
+# Shrinkage off - using GLM estimates for parameters
+# Adjusting the data
+
+class(raw_counts_adjusted)
+dim(raw_counts_adjusted)==dim(raw_counts)
+raw_counts_adjusted <- cbind(raw_counts[,1:2],raw_counts_adjusted)
+dim(raw_counts_adjusted)==dim(raw_counts)
+
+saveRDS(object=raw_counts_adjusted,'raw_counts_adjusted_N94.Rds')
+```
+
+```{r MIR200c_RNA_METH_plot,eval=FALSE}
+
+ggplot(meta,aes(x=MIR200cAvgBeta,y=MIR200c_CPM)) +
+  geom_point()
+
+cor.test(x=meta$MIR200cAvgBeta,y=meta$MIR200c_CPM)
+
+```
+
+```{r format_RNAseq_counts_for_gray_foundation,eval=FALSE}
+
+dat_pilotA <- read.delim("Canary.SHEH_20191203_FFPEtest_RNA.summary.genes.expected-counts.tab",sep="\t",header=TRUE,row.names=1,as.is=TRUE)
+dat_pilotB <- read.delim("Canary-5Aug2021.genes.expeceted-counts.summary",sep="\t",header=TRUE,row.names=1,as.is=TRUE)
+newColNames <- gsub(x = colnames(dat_pilotB),pattern = '^output\\.',replacement = ''); #newColNames
+newColNames <- gsub(x = newColNames,pattern = '\\.SVC00\\d\\d\\d\\d\\.rsem\\.genes\\.results', replacement = '')
+colnames(dat_pilotB) <- newColNames
+
+
+# nrow(dat_pilotA)==nrow(dat_pilotB)
+c <- cbind(dat_pilotA,dat_pilotB)
+c <- c %>% rownames_to_column(var='ENSEMBL')
+
+annot <- select(org.Hs.eg.db,
+  keys = keys(org.Hs.eg.db),
+  columns = c('ENTREZID','SYMBOL','ENSEMBL'),
+  keytype = 'ENTREZID')
+head(annot)
+
+c <- dplyr::left_join(c,annot)
+
+head(c)
+dim(c)
+# get tmp meta
+tmp <- readxl::read_excel(path=master.meta.file,sheet=sheet) %>% dplyr::filter(sequencedRNA==TRUE)
+
+c <- c %>% dplyr::select(c('SYMBOL','ENTREZID',tmp$SVC))
+
+dim(c)
+
+head(c)
+colnames(c)[1:2] <- c('Hugo_Symbol','Entrez_Gene_Id')
+
+write.table(c,file='level3_RNA_counts.tsv',sep="\t",quote=FALSE,row.names = FALSE)
+# For each gene (row) in the data file, the following columns are required in the order specified:
+# Hugo_Symbol
+# Entrez_Gene_Id
+```
+
+
+# PCA with Meth - & MIR200
+
+```{r knitExit34t4,eval=FALSE}
+
+colnames(meta)
+
+knitr::knit_exit()
+
+```
+
+```{r pcaWith.Mir200c,dev=c('png','pdf'),fig.height=5,fig.width=5}
+ 
+# colnames(pr_comps_100kb)
+
+pr_comps <- dplyr::left_join(pr_comps_100kb,meta,by=c('sample'='SVC'))
+
+e <- ggplot(pr_comps, aes(x=PC1, y=PC2)) +
+    geom_point(size=7,aes(color = MIR200cAvgBeta)) +
+    theme_bw() +
+    viridis::scale_color_viridis(discrete = FALSE,limits=c(0,1))
+
+ggExtra::ggMarginal(e,data = meta$groupBRCA, type = 'violin')
+
+
+require(cowplot)
+pmain <- ggplot(pr_comps, aes(x=PC1, y=PC2)) +
+    geom_point(size=3,aes(color = `MIR200cAvgBeta`)) +
+    theme_bw() +
+    viridis::scale_color_viridis(option='viridis',discrete = FALSE)
+
+xbox <- axis_canvas(pmain, axis = "x", coord_flip = TRUE) + 
+  geom_boxplot(data = pr_comps, aes(y = PC1, x = groupBRCA, fill = groupBRCA)) + 
+  scale_x_discrete() + coord_flip() +
+  # viridis::scale_fill_viridis(option='mako',discrete = TRUE)
+  ggplot2::scale_fill_manual(values=viridis::plasma(n=4)[2:4])
+
+ybox <- axis_canvas(pmain, axis = "y") + 
+  geom_boxplot(data = pr_comps, aes(y = PC2, x = groupBRCA, fill = groupBRCA)) +
+  scale_x_discrete() +
+  # viridis::scale_fill_viridis(option='mako',discrete = TRUE) +
+  ggplot2::scale_fill_manual(values=viridis::plasma(n=4)[2:4]) +
+  scale_x_discrete()
+
+p1 <- insert_xaxis_grob(pmain, xbox, grid::unit(1, "in"), position = "top")
+
+p2 <- insert_yaxis_grob(p1, ybox, grid::unit(1, "in"), position = "right")
+
+# ggdraw(p2)
+require(patchwork)
+layout <- '
+A
+A
+A
+B'
+
+# pdf('PCA_plot_g)
+ggdraw(p2) + var_plot +
+  plot_layout(design = layout) + plot_annotation(tag_levels = 'A',title = '100kb Binned Averages')
+
+# knitr::knit_exit()
+```
+
+<!-- ## Gviz Heatmap -->
+
+<!-- not the best way to vizualize -->
+
+```{r mir200chg.Gviz.Heatmap,eval=FALSE}
+
+cols <- as.character(
+      plyr::mapvalues(
+        meta$groupBRCA, unique(meta$groupBRCA),
+        # viridis::rocket(n=length(unique(BRCA_status_for_model))))
+        viridis::viridis(n=3)
+        # c('#38AAACFF','#342346FF')
+      )
+)
+names(cols) <- meta$groupBRCA
+
+dmr.plot.modified( # from methFunctions.R
+          ranges=GRanges(
+              seqnames='chr12',
+              ranges=IRanges(
+                start=mir200.start,
+                end=mir200.end, 
+                width=(mir200.end-mir200.start+1)
+              ),
+              strand='*'
+          ),
+          dmr = 1,
+          CpGs=myBS, # A BSseq object containing per-CpG methylation and coverage counts for the samples to be plotted
+          phen.col = cols,
+          genome="hg38",
+          what="Beta"
+)
+
+```
+
+# PCA with RNA data
+
+this is all done in the nurDGE_canary.Rmd 
+
+# Epibed
+
+```{r read_epibed,eval=TRUE}
+
+epiread.dir <- "../Biscuit_Snakemake_Workflow/analysis/epiread/"
+.files <- list.files(epiread.dir,pattern='.epibed.gz$')
+
+# Filter files from meta
+Fnames <- gsub('.epibed.gz','',.files)
+files <- .files[Fnames %in% meta$SVC]
+Fnames <- Fnames[Fnames %in% meta$SVC]
+listNames <- Fnames
+files <- files[match(Fnames,meta$SVC)]
+# make files full paths
+filesFull <- paste0(epiread.dir,files)
+
+epibed.gr.list <- lapply(filesFull,FUN = function(
+                          epibed.gz,
+                          chr = "chr12",
+                          genome = "hg38",
+                          start = 6963245, # mir200chg TSS
+                          # start = 6964077,
+                          # end = 6964085
+                          end = 6964102
+){
+  epibed.gr <- readEpibed(
+    epibed = epibed.gz,
+    genome = genome,
+    chr = chr,
+    start = start, # end 3 EPIC mir141 promoter probes
+    end = end, # end 3 EPIC mir141 promoter probes
+    fragment_level = FALSE
+  )
+  return(epibed.gr)
+})
+
+names(epibed.gr.list) <- listNames
+
+
+epibed.gr.tabulated.list <- lapply(epibed.gr.list,FUN = function(epibed.gr){
+  tabulated <- tabulateEpibed(
+    epibed.gr,
+    filter_empty_reads = TRUE,
+
+  )
+  return(tabulated)
+})
+  
+names(epibed.gr.tabulated.list) <- listNames
+
+
+
+
+# Get these to a summary matrix for the region of interest:
+avg.meth.list <- lapply(epibed.gr.tabulated.list, function(x){
+  avgMeth = apply(x,2,FUN=function(read){
+    nMeth <- length(which(read=='M'))
+    nUnmeth <- length(which(read=='U'))
+    avgMeth <- round(nMeth/(nUnmeth+nMeth),2)
+    depth <- nMeth + nUnmeth
+    return(list(avgMeth=avgMeth,depth=depth))
+  })
+})
+
+avg.meth.df.list <- lapply(seq_along(avg.meth.list), function(
+    avg.meth.list, 
+    names,  
+    index
+  ){
+    # paste(names[[index]])
+    # paste(names(avg.meth.list[[index]]),
+          # avg.meth.list[[index]])
+    .DF <- data.frame(
+      sample = rep(names[[index]],length(avg.meth.list[[index]])),
+      pos = names(avg.meth.list[[index]]),
+      beta = unlist(lapply(avg.meth.list[[index]], function(l) l[[1]])), # get 1st element of avg.meth.list[[index]] which is each position in this case
+      depth = unlist(lapply(avg.meth.list[[index]], function(l) l[[2]])) # second element is depth of coverage
+    )
+    return(.DF)
+  }, 
+  avg.meth.list=avg.meth.list, 
+  names=names(avg.meth.list)
+)
+
+length(avg.meth.df.list)
+# 33
+
+names(avg.meth.df.list) <- listNames
+
+# avg.meth.df.list[[1]]
+```
+
+```{r explore_readEpiBed_behaviour,eval=FALSE}
+
+
+
+chr = "chr12"
+genome = "hg38"
+# start = 6963245
+# end = 6964102
+start = 6963101
+end = 6964102
+
+test1 <- readEpibed(
+    epibed = '/Volumes/researchtemp/hpctmp/ian.beddows/canary_WGBS_snakemake/Biscuit_Snakemake_Workflow/analysis/epiread/SVC001879.epibed.gz',
+    genome = genome,
+    chr = chr,
+    start = start, # end 3 EPIC mir141 promoter probes
+    end = end, # end 3 EPIC mir141 promoter probes
+    fragment_level = FALSE
+)
+
+test2 <- readEpibed(
+    epibed = '/Volumes/researchtemp/hpctmp/ian.beddows/canary_WGBS_snakemake/Biscuit_Snakemake_Workflow/analysis/epiread/SVC001880.epibed.gz',
+    genome = genome,
+    chr = chr,
+    start = start, # end 3 EPIC mir141 promoter probes
+    end = end, # end 3 EPIC mir141 promoter probes
+    fragment_level = FALSE
+)
+
+test1 <- biscuiteer::removeInsertions(test1)
+test2 <- biscuiteer::removeInsertions(test2)
+# ranges(test1)
+# ranges(test2)
+
+test1.1 <- tabulateEpibed(
+    test1,
+    filter_empty_reads = TRUE,
+)
+test2.1 <- tabulateEpibed(
+    test2,
+    filter_empty_reads = TRUE,
+)
+
+colnames(test1.1)
+colnames(test2.1)
+```
+
+```{r mir200chg.Epibed}
+for(i in 1:length(epibed.gr.tabulated.list)){
+  index.mir200 <- c( # this is to avoid off by 1 errors
+    which(colnames(epibed.gr.tabulated.list[[i]]) %in% paste0(mir200c.probes.pos$seqnames,':',mir200c.probes.pos$start)[7:9]), # [7:9 for just 3 close ones]
+    which(colnames(epibed.gr.tabulated.list[[i]]) %in%
+    paste0(mir200c.probes.pos$seqnames,':',mir200c.probes.pos$start+1)[7:9]) # [7:9 for just 3 close ones]
+  )
+  if(any(is.na(index.mir200))){index.mir200 <- index.mir200[-which(is.na(index.mir200))]}
+  
+  
+  new <- epibed.gr.tabulated.list[[i]][,index.mir200] # subset to correct positons
+  new <- new[-which(colSums(apply(new,1,is.na))==ncol(new)),] # drop reads with no values for remaining
+  
+  print(
+    plotEpiread(
+        new,
+        show_readnames = FALSE,
+        plot_read_ave = FALSE
+    ) + ggtitle(names(epibed.gr.tabulated.list)[i])
+  )
+}
+```
+
+
+
+<!-- # HOXC4 450k probes -->
+
+<!-- The Bartlett et al. 2016 paper raw idats are not available. They provided ?signal intensity of methylated and unmethylated, but also no indication of mutation status, so it is not possible to redo their analysis. -->
+
+# Multiscale methylation plot 
+
+```{r multiscale_methylation,fig.height=2,fig.width=10,eval=FALSE}
+
+
+# BiocManager::install("huishenlab/bisplotti")
+# source('~/Desktop/bisplotti/R/multiscalePlot.R')
+# source('~/Desktop/bisplotti/R/multiscaleGroupAverage.R')
+library(bisplotti)
+library(tidyverse)
+library(viridis)
+library(GenomicRanges)
+
+# Get the mean multiscale data
+# GenomeInfoDb::getChromInfoFromUCSC(genome = 'hg38')[1:25,]
+## chr17
+chr17 <- GRanges(Rle(c("chr17"), c(1)), IRanges(1, width = 90338345))
+chr17beg <- GRanges(Rle(c("chr17"), c(1)), IRanges(1, width = 3e6))
+chr13 <- GRanges(Rle(c("chr13"), c(1)), IRanges(1, width = 114364328))
+# chr1 <- GRanges(Rle(c("chr1"), c(1)), IRanges(1, width = 248956422))
+chr1 <- GRanges(Rle(c("chr1"), c(1)), IRanges(1, width = 36522826)) # distal part
+# chr1 <- GRanges(Rle(c("chr1"), c(1)), IRanges(47439462, width = 42757)) # distal part
+
+#########################
+# toggle here
+myGRANGES <- chr17beg 
+chr.to.plot.arg <- 'chr17'
+#########################
+
+means <- lapply(
+    # list.files("../Biscuit_Snakemake_Workflow/multiscale_methylation_plot_pipeline/analysis/stats", 
+    list.files("../Biscuit_Snakemake_Workflow/multiscale_methylation_plot_pipeline/analysis/means", 
+               # pattern="cross_sample_mean", 
+               pattern=meta$sample[1],
+               full.names=TRUE), function(x) {
+        return(rtracklayer::import(x, format = "bedGraph",which=myGRANGES))
+    }
+)
+cnames <- list.files("../Biscuit_Snakemake_Workflow/multiscale_methylation_plot_pipeline/analysis/stats", pattern="cross_sample_mean")
+cnames <- gsub("cross_sample_mean", "mean", cnames)
+cnames <- gsub(".bed.gz", "", cnames)
+names(means) <- cnames
+
+myGRANGES.means <- as(means, "GRangesList")
+
+bisplotti::multiscaleMethylationPlot(myGRANGES.means, chr.to.plot = chr.to.plot.arg, colors = "cividis",config = config.multiscale)
+
+
+###
+# files.loc <- system.file("extdata", package="bisplotti")
+# files <- lapply(
+#     list.files(files.loc, pattern="Heyn_2012_100yr", full.names=TRUE), function(x) {
+#         return(rtracklayer::import(x, format="bedGraph"))
+#     }
+# )
+# cnames <- list.files(files.loc, pattern="Heyn_2012_100yr")
+# cnames <- gsub("Heyn_2012_100yr", "100yr", cnames)
+# cnames <- gsub(".bed.gz", "", cnames)
+# names(files) <- cnames
+# files.grl <- as(files, "GRangesList")
+# multiscaleMethylationPlot(files.grl)
+
+```
+
+```{r multiscale_methylation_BRCA1,fig.height=2,fig.width=10,eval=FALSE}
+# missing SVC003325
+samples = dplyr::filter(meta,groupBRCA=='BRCA1' & Pilot=='C')$SVC
+samples <- samples[-which(samples=='SVC003325')]
+grl.brca1 <- multiscaleGroupAverage(
+    multiscale_means_directory = "../Biscuit_Snakemake_Workflow/multiscale_methylation_plot_pipeline/analysis/means/",
+    samples = samples,
+    config = config.multiscale,
+    # which =  GRanges(Rle(c("chr17"), c(1)), IRanges(45e6, width = 5e6))
+    which =  myGRANGES
+)
+  
+brca1.mmp <- bisplotti::multiscaleMethylationPlot(
+  grl=grl.brca1,
+  chr.to.plot = chr.to.plot.arg, 
+  colors = "cividis", 
+  config = config.multiscale
+) + ggtitle(paste0('BRCA1 N=',length(samples)))
+
+brca1.mmp
+# saveRDS(brca1.mmp,'multiscale_brca1.Rds')
+# saveRDS(grl.brca1,'multiscale_grl.brca1.Rds')
+```
+
+```{r multiscale_methylation_BRCA2,fig.height=2,fig.width=10,eval=FALSE}
+
+samples = dplyr::filter(meta,groupBRCA=='BRCA2' & Pilot=='C')$SVC
+samples <- samples[-which(samples=='SVC003340')] # SVC003340 is missing
+
+grl.brca2 <- multiscaleGroupAverage(
+    multiscale_means_directory = "../Biscuit_Snakemake_Workflow/multiscale_methylation_plot_pipeline/analysis/means/",
+    samples = samples,
+    config = config.multiscale,
+    # which =  GRanges(Rle(c("chr17"), c(1)), IRanges(45e6, width = 5e6))
+    which =  myGRANGES
+)
+
+brca2.mmp <- bisplotti::multiscaleMethylationPlot(
+  grl = grl.brca2,
+  chr.to.plot = chr.to.plot.arg, 
+  colors = "cividis", 
+  config = config.multiscale
+) + ggtitle(paste0('BRCA2 N=',length(samples)))
+
+brca2.mmp
+# saveRDS(brca2.mmp,'multiscale_brca2.Rds')
+# saveRDS(grl.brca2,'multiscale_grl.brca2.Rds')
+```
+
+```{r multiscale_methylation_NON-BRCA,fig.height=2,fig.width=10,eval=FALSE}
+
+samples = dplyr::filter(meta,groupBRCA=='NON-BRCA' & Pilot=='C')$SVC[1:9]
+
+grl.nonbrca <- multiscaleGroupAverage(
+    multiscale_means_directory = "../Biscuit_Snakemake_Workflow/multiscale_methylation_plot_pipeline/analysis/means/",
+    samples = samples,
+    config = config.multiscale,
+    # which =  GRanges(Rle(c("chr17"), c(1)), IRanges(45e6, width = 5e6))
+    which =  myGRANGES
+)
+
+nonbrca.mmp <- bisplotti::multiscaleMethylationPlot(
+  grl = grl.nonbrca,
+  chr.to.plot = chr.to.plot.arg, 
+  colors = "cividis", 
+  config = config.multiscale
+) + ggtitle(paste0('BRCA2 N=',length(samples)))
+
+nonbrca.mmp
+# saveRDS(nonbrca.mmp,'multiscale_nonbrca.mmp.Rds')
+# saveRDS(grl.nonbrca.mmp,'multiscale_grl.nonbrca.mmp.Rds')
+
+```
+
+```{r MULTISCALE,dev=c('png','pdf'),fig.height=4,fig.width=7,eval=FALSE}
+library(patchwork)
+layout <- '
+A
+B
+C
+'
+
+pdf('multiscale_groupBRCA.pdf',height=5,width=5)
+(brca1.mmp + theme(legend.position='none')) + 
+(brca2.mmp + theme(legend.position='none')) + 
+(nonbrca.mmp  + theme(legend.position='none')) +
+patchwork::plot_annotation(tag_levels = 'A',title = '') + 
+    patchwork::plot_layout(design = layout)  & theme(plot.tag = element_text(face = 'bold'))  & theme(plot.title = element_text(size=12,hjust=0.5))
+dev.off()
+```
+
+```{r ideogram_track,eval=FALSE}
+library(Gviz)
+# pdf('chr17_Ideogram.pdf',height = 2,width = 7)
+plotTracks(IdeogramTrack(chromosome = 'chr17',genome='hg38'),
+           GenomeAxisTrack(),from=1,to=90338345)
+# dev.off()
+```
+
+## Pre vs. Post multiscale
+
+```{r multiscale_pre_vs_post}
+# SVC003371 is 20y
+# SVC003364 is 72y
+# solo.wcgw <- read.delim('solo_WCGW_hg38.bed',sep="\t",header=FALSE)
+# colnames(solo.wcgw) <- c('chr','start','end','context')
+# solo.wcgw.gr <- makeGRangesFromDataFrame(
+#     solo.wcgw
+# )
+# myGRANGES.solo <- subsetByOverlaps(solo.wcgw.gr,myGRANGES)
+
+grl.20y <- multiscaleGroupAverage(
+    multiscale_means_directory = "../Biscuit_Snakemake_Workflow/multiscale_methylation_plot_pipeline/analysis/means/",
+    samples = 'SVC003371',
+    config = config.multiscale,
+    # which =  GRanges(Rle(c("chr17"), c(1)), IRanges(45e6, width = 5e6))
+    which =  myGRANGES
+)
+
+grl.72y <- multiscaleGroupAverage(
+    multiscale_means_directory = "../Biscuit_Snakemake_Workflow/multiscale_methylation_plot_pipeline/analysis/means/",
+    samples = 'SVC003364',
+    config = config.multiscale,
+    # which =  GRanges(Rle(c("chr17"), c(1)), IRanges(45e6, width = 5e6))
+    which =  myGRANGES
+)
+
+mmp20 <- bisplotti::multiscaleMethylationPlot(
+  grl = grl.20y,
+  chr.to.plot = chr.to.plot.arg, 
+  colors = "cividis", 
+  config = config.multiscale
+) + ggtitle('20y FT')
+
+mmp72 <- bisplotti::multiscaleMethylationPlot(
+  grl = grl.72y,
+  chr.to.plot = chr.to.plot.arg, 
+  colors = "cividis", 
+  config = config.multiscale
+) + ggtitle('72y FT')
+
+
+pdf('multiscale_20v72y.pdf',height=4,width=5)
+(mmp20 + theme(legend.position='none')) + 
+(mmp72 + theme(legend.position='none')) + 
+patchwork::plot_annotation(tag_levels = 'A',title = '') + 
+    patchwork::plot_layout(design = layout)  & theme(plot.tag = element_text(face = 'bold'))  & theme(plot.title = element_text(size=12,hjust=0.5))
+dev.off()
+
+
+# saveRDS(nonbrca.mmp,'multiscale_nonbrca.Rds')
+# saveRDS(grl.brca2,'multiscale_grl.nonbrca.Rds')
+```
+
+
+<!-- # FOXK1 -->
+
+```{r FOXK1_Heatmap,eval=FALSE,fig.height=11,fig.width=11}
+
+# 12:54016931-54056030
+# myCaption <- 'chr7:4767261-4767473'
+myCaption <- 'FOXK1'
+pdf('FOXK1_DMR.pdf',height=11,width=11)
+myMat <- HeatmapFromBed(myChr = 'chr7',
+                   myRanges = IRanges(4767261,width = 212),
+                   nameArg = myCaption
+)
+dev.off()
+    
+saveRDS(object = myMat,file = paste0(myCaption,'_BetaMatrix.Rds'))
+
+```
+
+```{r FOXK1,dev=c('png','pdf'),fig.height=5,fig.width=5,eval=FALSE}
+
+# Get FOXK1 DMR beta matrix
+tmp <- readRDS('FOXK1_BetaMatrix.Rds')
+tmp2 <- data.frame(rowMeans(tmp))
+colnames(tmp2) <- 'FOXK1_avg_meth_DMR'
+tmp2$SVC <- rownames(tmp2)
+
+# cpm <- data.frame(edgeR::cpm(raw_counts))
+# colnames(cpm) <- gsub('output\\.','',colnames(cpm))
+# colnames(cpm) <- gsub('\\.SVC00\\d{4,4}.rsem.genes.results','',colnames(cpm))
+# FOXK1 <- cpm['ENSG00000164916',]
+
+# FOXK1.tidy <- tidyr::gather(FOXK1,SVC,cpm)
+
+# FOXK1.tidy <- dplyr::left_join(FOXK1.tidy,meta)
+# FOXK1.tidy <- dplyr::left_join(FOXK1.tidy,tmp2)
+FOXK1.tidy <- dplyr::left_join(tmp2,meta)
+
+ggplot(FOXK1.tidy,aes(x=age_in_years,y=FOXK1_avg_meth_DMR,color=groupBRCA)) + 
+  geom_point() +
+  bbc_style()
+
+cor.test(FOXK1.tidy$FOXK1_avg_meth_DMR,FOXK1.tidy$age_in_years,method='spearman')
+
+# ggplot(FOXK1.tidy,aes(x=groupBRCA,y=cpm,color=groupBRCA)) +
+#       # geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+#       geom_violin(fill=NA) +
+#       geom_jitter(size = 1, alpha = 1, width = 0.1) +
+#       xlab('') +
+#       ylab('CPM') +
+#       # ylim(c(0,1)) +
+#       theme_bw() +
+#       # viridis::scale_color_viridis(discrete = TRUE) +
+#       scale_color_manual(values=viridis::mako(n=4)[1:3]) +
+#       theme(legend.position="none") +
+#       theme(plot.title = element_text(size=12)) +
+#       theme(axis.text.x = element_text(angle=45,hjust=1))
+
+
+# p <- ggplot(FOXK1.tidy,aes(x=FOXK1_avg_meth_DMR,y=cpm,color=groupBRCA)) + geom_point(size=5) + theme_bw() + scale_color_manual(values=viridis::mako(n=4)[1:3]) + xlim(c(0,1))
+# 
+# p + ylab('FOXK1 Counts per Million') + xlab('FOXK1 DMR Average Methylation')
+
+# p + geom_smooth(se = FALSE,aes(group=groupBRCA))
+# p + ggrepel::geom_text_repel(aes(label=SVC),size=1,max.overlaps=5)
+
+ggplot(FOXK1.tidy,aes(x=groupBRCA,color=groupBRCA,y=FOXK1_avg_meth_DMR)) + 
+    geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+    geom_jitter(size = 5, alpha = 1, width = 0.1) +
+  # geom_boxplot() + 
+  theme_bw() + scale_color_viridis_d(option='turbo')
+
+library(rstatix)
+FOXK1.tidy %>%
+  # dplyr::filter(Pilot=='C') %>%
+  pairwise_wilcox_test(FOXK1_avg_meth_DMR ~ groupBRCA)
+
+## norm_log_counts
+FOXK1 <- norm_log_counts['ENSG00000164916',]
+
+FOXK1.tidy <- tidyr::gather(FOXK1,SVC,norm_log_count)
+
+FOXK1.tidy <- dplyr::left_join(FOXK1.tidy,meta)
+
+ggplot(FOXK1.tidy,aes(x=groupBRCA,color=groupBRCA,y=norm_log_count)) + 
+  # geom_boxplot() + theme_bw()
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+      geom_jitter(size = 5, alpha = 1, width = 0.1) + theme_bw()
+
+```
+
+# PROMOTER EPIREAD WORKFLOW
+
+## BRCA1
+
+```{r BRCA1_Heatmap,eval=FALSE,fig.height=11,fig.width=11}
+# chr17:43044295-43125364
+# 
+# BRCA1
+# chr17:43044295-43125364
+# id = NM_007300.4
+# --------------
+# Exon number: 1
+# chr17:43125271-43125364
+
+# 12:54016931-54056030
+# myCaption <- 'chr7:4767261-4767473'
+myCaption <- 'BRCA1_promoter_plusMinus1kb'
+pdf('BRCA1_promoter.pdf',height=11,width=11)
+myMat <- HeatmapFromBed(myChr = 'chr17',
+                   # myRanges = IRanges(43125364,width = 2000), # this is BRCA exon1 start +2000kb
+                   myRanges = IRanges(43124364,width = 2000), # this is BRCA exon1 start +2000kb
+                   nameArg = myCaption,
+                   cluster_rows = FALSE
+)
+dev.off()
+    
+saveRDS(object = myMat,file = paste0(myCaption,'_BetaMatrix.Rds'))
+
+```
+
+### step1
+done in shell!
+```{r BRCA1_promoter_region_epibed_SHELL,eval=FALSE}
+# these files were generated in analysis/BRCA1_promoter
+# biscuit epiread -N -@ {threads} -B <(zcat {input.snps}) {input.ref} {input.bam} | sort -k1,1 -k2,2n > {params.epibed} 2> {log}
+
+# first create the subset SNPs and subset bams
+
+module load bbc2/biscuit/biscuit_1_2_0 
+module load bbc2/samtools/samtools-1.17
+
+for VARIABLE in SVC001850 SVC001851 SVC001852 SVC001853 SVC001854 SVC001855 SVC001856 SVC001857 SVC001858 SVC001859 SVC001860 SVC001861 SVC001862 SVC001863 SVC001864 SVC001865 SVC001866 SVC001867 SVC001868 SVC001869 SVC001870 SVC001871 SVC001872 SVC001873 SVC001874 SVC001875 SVC001876 SVC001877 SVC001878 SVC001879 SVC001880 SVC001881 SVC001882 SVC003349 SVC003350 SVC003351 SVC003352 SVC003353 SVC003355 SVC003356 SVC003357 SVC003358 SVC003359 SVC003360 SVC003361 SVC003362 SVC003363 SVC003364 SVC003365 SVC003366 SVC003367 SVC003368 SVC003369 SVC003370 SVC003371 SVC003372 SVC003373 SVC003374 SVC003375 SVC003376 SVC003317 SVC003318 SVC003319 SVC003320 SVC003321 SVC003322 SVC003323 SVC003325 SVC003326 SVC003328 SVC003329 SVC003330 SVC003332 SVC003333 SVC003334 SVC003335 SVC003336 SVC003337 SVC003338 SVC003339 SVC003340 SVC003342 SVC003343 SVC003344 SVC003346 60270005 60290005 60310005 60350005 60390005 60430005 60470005 60490005 60510005 60570004 60610004 60630004 60650004 60690004 60730004 60770004 60810004 60850004
+do
+
+# for VARIABLE in SVC001850
+# do 
+# samtools v1.17
+samtools view -h -o ${VARIABLE}.bam ../align/${VARIABLE}.sorted.markdup.bam chr17:43125271-43125557
+
+
+# BRCA1
+# chr17:43044295-43125364
+# id = NM_007300.4
+# --------------
+# Exon number: 1
+# chr17:43125271-43125364
+samtools index ${VARIABLE}.bam
+
+# bedtools Version:   v2.30.0
+# bedtools intersect -wa -a ../snps
+
+biscuit pileup -o ${VARIABLE}.vcf /varidata/researchtemp/hpctmp/biscuit_reference_hg38/EMseq_GRCh38.primary_assembly.genome.fa.gz ${VARIABLE}.bam
+
+# biscuit vcf2bed -t snp {input.vcf_gz} > {params.snp_bed} 2> {log}
+biscuit vcf2bed -t snp ${VARIABLE}.vcf > ${VARIABLE}.snps.bed
+
+biscuit epiread /varidata/researchtemp/hpctmp/biscuit_reference_hg38/EMseq_GRCh38.primary_assembly.genome.fa.gz ${VARIABLE}.bam | sort -k1,1 -k2,2n > ${VARIABLE}.epibed
+
+bgzip ${VARIABLE}.epibed
+tabix -p bed ${VARIABLE}.epibed.gz
+
+done
+
+
+```
+
+### step2
+this was done on the HPC with R-4.2.1 --- not working here, problem with lib versions that should be resolved with next update
+```{r epibed.brca1_hpc_generate_tabulated_epibeds,eval=FALSE}
+# module load bbc2/R/R-4.2.1
+
+# R
+
+# devtools::install_github("huishenlab/bisplotti")
+library(bisplotti)
+library(biscuiteer)
+# help(package='bisplotti')
+
+# getwd()
+# /varidata/researchtemp/hpctmp/ian.beddows/canary_WGBS_snakemake/Biscuit_Snakemake_Workflow/analysis/BRCA1_promoter
+
+meta00 <- readRDS('../../../canary_meth_Rproj//meta_N103.Rds')
+
+for(s in meta00$SVC){
+  if(file.exists(paste0(s,'.epibed.gz'))){
+    tmp0 <- biscuiteer::readEpibed(paste0(s,'.epibed.gz'),chr='chr17')
+    
+    teb <- tabulateEpibed(gr = tmp0)
+    saveRDS(teb,paste0(s,'_tabulated_epibed.Rds'))
+  }
+}
+```
+
+### step3
+done locally, read in tabulated epibeds and make plots
+```{r plot_Epibeds_locally}
+
+
+tebDIR <- '/Volumes/researchtemp/hpctmp/ian.beddows/canary_WGBS_snakemake/Biscuit_Snakemake_Workflow/analysis/BRCA1_promoter/'
+
+for(i in 1:nrow(meta)){
+# for(i in 1:3){
+  s <- meta$SVC[i]
+  if(! file.exists(paste0(tebDIR,s,'.epibed.gz'))){next}
+  teb <- readRDS(paste0(tebDIR,s,'_tabulated_epibed.Rds'))
+  
+  return <- bisplotti::plotEpibed(teb$cg_table,show_positions=TRUE,force=TRUE,show_readnames = FALSE,size=3) 
+  p004 <- return$epi + theme_bw() +  ggtitle(paste(s,meta$groupBRCA[i],meta$ReproductiveStatus[i],round(meta$`Age at time of surgery`[i],0),sep = "; "))
+
+  pdf(paste0('epibed_plots/',s,'_epibed_plot.pdf')); print(p004); dev.off()
+}
+
+
+library(Gviz)
+ideoTrack <- IdeogramTrack(genome = "hg38", chromosome = "chr17")
+# library(GenomicRanges)
+# data(cpgIslands)
+# class(cpgIslands)
+## [1] "GRanges"
+## attr(,"package")
+## [1] "GenomicRanges"
+gtrack <- GenomeAxisTrack()
+grtrack <- GeneRegionTrack(geneModels, genome = gen,
+                           chromosome = chr, name = "Gene Model")
+
+plotTracks(list(ideoTrack,gtrack),from=43125271,to=43125557)
+
+```
+
+```{r dmr_Gviz,results='asis',fig.height=9,fig.width=9,dev=c('png','pdf'),eval=FALSE}
+library(ExperimentHub)
+dmr.ranges <- readRDS('dmr.ranges.chr7.Rds')
+myBS <- readRDS('bsseq_chr7.Rds')
+
+cat("Found",length(dmr.ranges),"dmr.ranges\n")
+
+all(colnames(myBS)==meta.wgbs$SVC)
+
+cols <- as.character(
+      plyr::mapvalues(
+          meta.wgbs$groupBRCA, unique(meta.wgbs$groupBRCA),
+          # viridis::rocket(n=length(unique(BRCA_status_for_model))))
+          rev(viridis::mako(n=4)[1:3])
+          # c('#38AAACFF','#342346FF')
+      )
+)
+names(cols) <- meta.wgbs$groupBRCA
+
+for(i in 1:length(dmr.ranges)){
+  options(ucscChromosomeNames=FALSE)
+  myTitle = paste('DMR',i)
+  
+  dmr.plot.modified( # from methFunctions.R
+        ranges=dmr.ranges,
+        dmr = i,
+        CpGs=myBS, # A BSseq object containing per-CpG methylation and coverage counts for the samples to be plotted
+        phen.col = cols,
+        genome="hg38",
+        # genome="hg19",
+        what="Beta",
+        main_title = myTitle
+  )
+}
+
+```
+
+# IRS1
+
+```{r IRS1,eval=FALSE}
+
+# Get IRS1 DMR beta matrix
+tmp <- readRDS('chr2:226797882-226797966_BetaMatrix.Rds')
+tmp2 <- data.frame(rowMeans(tmp))
+colnames(tmp2) <- 'IRS1_avg_meth_DMR'
+tmp2$SVC <- rownames(tmp2)
+
+# cpm <- data.frame(edgeR::cpm(raw_counts))
+# colnames(cpm) <- gsub('output\\.','',colnames(cpm))
+# colnames(cpm) <- gsub('\\.SVC00\\d{4,4}.rsem.genes.results','',colnames(cpm))
+# irs1 <- cpm['ENSG00000169047',]
+
+irs1.tidy <- tidyr::gather(irs1,SVC,cpm)
+
+irs1.tidy <- dplyr::left_join(irs1.tidy,meta)
+irs1.tidy <- dplyr::left_join(irs1.tidy,tmp2)
+
+ggplot(irs1.tidy,aes(x=groupBRCA,y=cpm,color=groupBRCA)) + 
+      # geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+      geom_violin(fill=NA) +
+      geom_jitter(size = 1, alpha = 1, width = 0.1) +
+      xlab('') +
+      ylab('CPM') +
+      # ylim(c(0,1)) +
+      theme_bw() +
+      # viridis::scale_color_viridis(discrete = TRUE) +
+      scale_color_manual(values=viridis::viridis(n=4)[1:3]) +
+      theme(legend.position="none") +
+      theme(plot.title = element_text(size=12)) +
+      theme(axis.text.x = element_text(angle=45,hjust=1))
+
+
+p <- ggplot(irs1.tidy,aes(x=IRS1_avg_meth_DMR,y=cpm,color=groupBRCA)) + geom_point() + theme_bw() + scale_color_viridis_d() + xlim(c(0,1))
+
+p + ggrepel::geom_text_repel(aes(label=SVC),size=1,max.overlaps=5)
+
+
+ggplot(irs1.tidy,aes(x=groupBRCA,color=groupBRCA,y=IRS1_avg_meth_DMR)) + geom_boxplot() + theme_bw() + scale_color_viridis_d()
+
+## norm_log_counts
+irs1 <- norm_log_counts['ENSG00000164916',]
+
+irs1.tidy <- tidyr::gather(irs1,SVC,norm_log_count)
+
+irs1.tidy <- dplyr::left_join(irs1.tidy,meta)
+
+ggplot(irs1.tidy,aes(x=groupBRCA,color=groupBRCA,y=norm_log_count)) + geom_boxplot() + theme_bw() 
+
+```
+
+# KLHL6
+
+```{r KLHL6,fig.height=12,fig.width=10,eval=FALSE}
+
+  chr='chr3'
+  start <- 183491637
+  end <- 183492259
+  width = end-start
+  myCaption <- 'KLHL6'
+  myMat <- HeatmapFromBed(myChr = chr,
+                     myRanges = IRanges(start,width = end-start),
+                     nameArg = myCaption
+  )
+      
+
+```
+
+# HOXC4
+
+```{r hoxc4,fig.height=11,fig.width=11}
+
+# 12:54016931-54056030
+# myCaption <- 'chr12:54016931-54056030'
+myCaption <- 'HOXC4_b'
+pdf('HOXC4_DMR.pdf',height=11,width=11)
+myMat <- HeatmapFromBed(myChr = 'chr12',
+                   myRanges = IRanges(54016931,width = 39099),
+                   nameArg = myCaption
+)
+dev.off()
+saveRDS(object = myMat,file = paste0(myCaption,'_BetaMatrix.Rds'))
+
+```
+
+```{r hoxC4_EPICpositionsOnlyGrayedOut,eval=FALSE}
+
+mat <- readRDS('HOXC4_b_BetaMatrix.Rds')
+m <- readRDS('sesameData.EPIC.hg38.manifest.Rds')
+class(m)
+# keep <- which(colnames(mat) %in% paste0(
+#   m@seqnames,':',data.frame(m@ranges)$start
+# ))
+
+k2 <- which(m$gene_HGNC=='HOXC4')
+keep <- paste0(
+  m@seqnames[k2],':',data.frame(m@ranges)$start[k2]
+)
+table(keep %in% colnames(mat))
+
+make_blank <- colnames(mat)[which(!colnames(mat)%in%keep)]
+mat2 <- mat
+mat2[,make_blank] <- NA
+dim(mat2)
+class(mat2)
+myHM <- ComplexHeatmap::Heatmap(
+    mat2,
+    show_column_names = FALSE,
+    show_row_names = FALSE,
+    col=viridis::cividis(n=20),
+    cluster_rows = TRUE,
+    cluster_columns = FALSE,
+    heatmap_legend_param = list(title='Beta'),
+    row_title_gp = gpar(fontsize = 9),
+    row_names_gp = gpar(fontsize = 7),
+    column_names_rot = 90,
+    column_names_gp = gpar(
+      fontsize = 8#,
+      # col = myPosColors
+    ),
+    column_title = 'HOXC4 EPIC Array CpGs',
+    column_title_gp = gpar(fontsize = 22),
+    # right_annotation = haRowMIR200,
+    right_annotation = haRowMaster,
+    # top_annotation = haCol_MIR141,
+    heatmap_width = unit(9, "in"),
+    heatmap_height = unit(7, "in"),
+    # row_split = paste0(meta$groupBRCA),
+    # row_split = paste0(meta$ReproductiveStatus,'\n',meta$groupBRCA),
+    row_title_rot = 0
+  )
+
+pdf('HOXC4_arrayPositions.pdf',height=11,width=11)
+myHM
+dev.off()
+```
+
+```{r hoxC4_EPICpositionsOnly,eval=FALSE}
+
+mat <- readRDS('HOXC4_BetaMatrix.Rds')
+m <- readRDS('sesameData.EPIC.hg38.manifest.Rds')
+class(m)
+# keep <- which(colnames(mat) %in% paste0(
+#   m@seqnames,':',data.frame(m@ranges)$start
+# ))
+
+k2 <- which(m$gene_HGNC=='HOXC4')
+keep <- paste0(
+  m@seqnames[k2],':',data.frame(m@ranges)$start[k2]
+)
+table(keep %in% colnames(mat))
+
+mat2 <- mat[,keep]
+dim(mat2)
+
+myHM <- ComplexHeatmap::Heatmap(
+    mat2,
+    show_column_names = FALSE,
+    show_row_names = FALSE,
+    col=viridis::cividis(n=20),
+    cluster_rows = TRUE,
+    cluster_columns = FALSE,
+    heatmap_legend_param = list(title='Beta'),
+    row_title_gp = gpar(fontsize = 9),
+    row_names_gp = gpar(fontsize = 7),
+    column_names_rot = 90,
+    column_names_gp = gpar(
+      fontsize = 8#,
+      # col = myPosColors
+    ),
+    column_title = 'HOXC4 EPIC Array CpGs', 
+    column_title_gp = gpar(fontsize = 22),
+    # right_annotation = haRowMIR200,
+    # right_annotation = haRowMaster,
+    # top_annotation = haCol_MIR141,
+    heatmap_width = unit(9, "in"),  
+    heatmap_height = unit(7, "in"),  
+    # row_split = paste0(meta$groupBRCA),
+    # row_split = paste0(meta$ReproductiveStatus,'\n',meta$groupBRCA),
+    row_title_rot = 0
+  )
+
+pdf('HOXC4_arrayPositions2.pdf',height=11,width=11)
+myHM
+dev.off()
+```
+
+```{r hoxc4_boxplot_RNA_expr,eval=FALSE}
+
+x <- readRDS('cpm_N104.Rds')['ENSG00000198353',meta.rna$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta.rna) 
+
+pdf('HOXC4_CPM_groupBRCA_boxplot.pdf',width=3,height=3)
+x %>%
+  ggplot(aes(x=groupBRCA,y=CPM)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.1,aes(color=ReproductiveStatus)) +
+  theme_classic() +
+  xlab('') + theme(legend.position='none') +
+  scale_color_manual(values=rev(c("#28BBECFF","#FB8022FF")))
+dev.off() 
+
+pdf('HOXC4_CPM_vs_age.pdf',width=3,height=3)
+x %>%
+  ggplot(aes(x=`Age at time of surgery`,y=CPM,color=ReproductiveStatus)) + 
+  geom_point(size=2) +
+  theme_classic() +
+  xlab('') + theme(legend.position='none') +
+  scale_color_manual(values=rev(c("#28BBECFF","#FB8022FF")))
+dev.off() 
+cor.test(x$`Age at time of surgery`,x$CPM,method='spearman')
+
+
+
+## and check AID expression
+x <- readRDS('cpm_N104.Rds')['ENSG00000111732',meta.rna$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta.rna) 
+pdf('AID_CPM_groupBRCA_boxplot.pdf',width=3,height=3)
+x %>%
+  ggplot(aes(x=groupBRCA,y=log2(CPM))) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.1,aes(color=ReproductiveStatus)) +
+  theme_classic() +
+  xlab('') + theme(legend.position='none') +
+  scale_color_manual(values=rev(c("#28BBECFF","#FB8022FF")))
+dev.off() 
+cor.test(x$`Age at time of surgery`,log2(x$CPM),method='spearman')
+
+pdf('AID_CPM_vs_age.pdf',width=3,height=3)
+x %>%
+  ggplot(aes(x=`Age at time of surgery`,y=log2(CPM),color=ReproductiveStatus)) + 
+  geom_point(size=2) +
+  theme_classic() +
+  xlab('') + theme(legend.position='none') +
+  scale_color_manual(values=rev(c("#28BBECFF","#FB8022FF")))
+dev.off() 
+
+```
+
+# HOXD3
+
+```{r HOXD3,fig.height=11,fig.width=11}
+
+# > grep('HOXD3',dmr.ranges@elementMetadata$overlapping.genes)
+# [1] 13 16 17
+# > dmr.ranges[c(13,16,17),]
+# GRanges object with 3 ranges and 8 metadata columns:
+#       seqnames              ranges strand |   no.cpgs min_smoothed_fdr
+#          <Rle>           <IRanges>  <Rle> | <integer>        <numeric>
+#   [1]     chr2 176150926-176151264      * |        10      3.60443e-16
+#   [2]     chr2 176172730-176175468      * |        77      1.91787e-31
+#   [3]     chr2 176156874-176157517      * |        41      8.55245e-15
+#        Stouffer     HMFDR    Fisher   maxdiff  meandiff overlapping.genes
+#       <numeric> <numeric> <numeric> <numeric> <numeric>       <character>
+#   [1]  0.885990  0.583348  0.967478 -0.712385 -0.492919             HOXD3
+#   [2]  0.999991  0.539387  1.000000  0.944085 -0.393497      HOXD3, HAGLR
+#   [3]  1.000000  0.667697  1.000000 -0.756604 -0.345443             HOXD3
+#   -------
+#   seqinfo: 1 sequence from an unspecified genome; no seqlengths
+
+# 12:54016931-54056030
+# myCaption <- 'chr12:54016931-54056030'
+myCaption <- 'HOXD3'
+pdf('HOXD3_DMR.pdf',height=11,width=11)
+myMat <- HeatmapFromBed(myChr = 'chr2',
+                   myRanges = IRanges(176150926,width = 338),
+                   nameArg = myCaption
+)
+dev.off()
+saveRDS(object = myMat,file = paste0(myCaption,'_BetaMatrix.Rds'))
+
+```
+
+# 1.5kb from TSS for selected known genes
+
+```{r 1.5kbFromTSS,fig.height=11,fig.width=11}
+genes <- c('HNF1B','AMT','CCL21','SPARCL1')
+chrs <- c('chr17','chr3','chr9','chr4')
+TSSs <- c(37745059,49422685,34710136,87531061)
+
+for(i in 1:length(genes)){          
+          
+  start <- TSSs[i] - 1500
+  end <- TSSs[i] + 1500
+  width = end-start
+  myCaption <- paste0(genes[i],'_',chrs[i],'_',start,'-',end)
+  myMat <- HeatmapFromBed(myChr = chrs[i],
+                     myRanges = IRanges(start,width = end-start),
+                     nameArg = myCaption
+  )
+      
+  # saveRDS(object = myMatx,file = paste0(myCaption,'_BetaMatrix.Rds'))
+}
+
+```
+
+
+# Depth of coverage along
+
+```{r depthOfCovPetitChr1,eval=FALSE}
+
+bs_list <- generate_or_load_bsseq_list(
+   path='../Biscuit_Snakemake_Workflow/analysis/pileup/',
+   vcf_header_path = '../Biscuit_Snakemake_Workflow/analysis/pileup/',
+   name='chr1_petite',
+   sampNames=meta$SVC,
+   readBiscuitMergedFlag=TRUE,
+   whichFlag = GRanges(
+      seqnames='chr1',
+      ranges=IRanges(0, width=122000000), # petite chr1
+      strand='*'
+   )
+)
+
+names(bs_list) <-  meta$SVC
+# names(bs_list) <- gsub('_mergecg.bed.gz','',list.files('Biscuit_Snakemake_Workflow/analysis/pileup/',pattern = '_mergecg.bed.gz$')) # these are the same but one is easier...
+
+tictoc::tic("Unionize")
+myBS <- bs_list[[1]]
+for (i in (2:length(bs_list))){
+      myBS <- biscuiteer::unionize(myBS,bs_list[[i]])
+}
+tictoc::toc()
+
+betaMatrix.tidy <- do.call('rbind',
+  lapply(
+    seq_along(bs_list), FUN = function(
+        x,n,i
+      ){
+        # print(paste(x[i],n[i],i))
+        cbind(
+          data.frame(rowRanges(x[[i]])),
+          beta = as.numeric(round(x[[i]]@assays@data$M / x[[i]]@assays@data$Cov, 2)),
+          depth = as.numeric(x[[i]]@assays@data$Cov),
+          sample = rep(n[[i]],nrow(x[[i]]))
+        )
+      },
+    x=bs_list,
+    n=names(bs_list)
+  )
+)
+
+betaMatrix.tidy <- dplyr::left_join(betaMatrix.tidy,meta[,c('SVC','groupBRCA')],by=c('sample'='SVC'))
+
+betaMatrix.tidy.subset <- sample_n(betaMatrix.tidy, 1000000)
+
+ggplot(betaMatrix.tidy.subset,aes(x=start,y=depth,group=groupBRCA,color=groupBRCA)) + geom_smooth(se = TRUE) + ylim(c(0,15)) + scale_color_viridis_d() + theme_bw()
+
+
+betaMatrix.tidy.subset <- dplyr::filter(betaMatrix.tidy,start<1.5e7)
+
+betaMatrix.tidy.subset <- sample_n(betaMatrix.tidy.subset, 1000000)
+
+ggplot(betaMatrix.tidy.subset,aes(x=start,y=depth,group=groupBRCA,color=groupBRCA)) + geom_smooth(se = TRUE) + ylim(c(0,15)) + scale_color_viridis_d() + theme_bw()
+
+```
+
+
+
+# soloWCGW & PMI boxplot methylation
+
+To get the means (and avoid ‘Error: vector memory exhausted (limit reached?)’), run this on the singularity R container on the HPC
+
+```{r solo.wcgw.beta_boxplots,eval=FALSE}
+
+myBS <- readRDS('BRCA1_and_BRCA2_v_WT_bsseq_chr2.Rds')
+
+  ### SOLO WCGW
+  solo.wcgw <- read.delim('solo_WCGW_hg38.bed',sep="\t",header=FALSE)
+  colnames(solo.wcgw) <- c('chr','start','end','context')
+  solo.wcgw.gr <- makeGRangesFromDataFrame(
+    solo.wcgw
+  )
+  tmp <- subsetByOverlaps(myBS,solo.wcgw.gr)
+  # # now get the avg methylation
+  coverage <- data.frame(getCoverage(tmp, type = "Cov"))
+  # > summary(colMeans(coverage))
+  #  Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+  # 11.90   15.73   18.06   18.26   20.52   25.95 
+  methylation <- getCoverage(tmp, type = "M")
+  m <- data.frame(round(methylation / coverage,2))
+  # m[coverage<10] <- NA
+  colnames(m) <- colnames(tmp)
+  means <- data.frame(sample = colnames(m),
+              wcgw.beta = colMeans(m,na.rm=TRUE)
+              # wcgw.beta = apply(m,2,FUN=function(x){
+                # mean(subset(x,x>0)) # NOT CORRECT
+              # })
+  )
+  # saveRDS(means,'solo.wcgw.mean.beta.Rds')
+  
+  .meta <- dplyr::left_join(meta,means,by=c('SVC'='sample'))
+  
+  pdf('boxplot_solo.wcgw.beta.BRCA.group.pdf',height = 7,width = 7)
+  
+  .meta %>%
+  # dplyr::filter(.meta,Pilot=='C') %>%
+  ggplot(aes(x=paste(group),y=wcgw.beta,color=age_in_years)) + 
+        geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+        geom_jitter(size = 1, alpha = 1, width = 0.1) +
+        xlab('') +
+        # ylim(c(0,100)) +
+        theme_bw() +
+        # viridis::scale_color_viridis(discrete = TRUE) +
+        # scale_color_manual(values=c(pal69[1],pal69[2])) +
+        # theme(legend.position="none") +
+        theme(plot.title = element_text(size=12)) +
+        theme(axis.text.x = element_text(angle=45,hjust=1))
+  dev.off() 
+  
+  # test if there are differenes is mean WCGW beta
+  # .meta %>%
+  # dplyr::filter(.meta,Pilot=='B') %>% # Neither is significant together, but is significant when combined which is interesting
+  # pairwise_wilcox_test(wcgw.beta ~ group) # P = 0.018
+  summary(lm(.meta$wcgw.beta ~ .meta$group + .meta$MIR200cAvgBeta + .meta$age_in_years))
+  
+  ggplot(.meta,aes(x=MIR200cAvgBeta,y=wcgw.beta)) + geom_point() + theme_bw()
+  ggplot(.meta,aes(x=age_in_years,y=wcgw.beta)) +
+    geom_point() + geom_smooth() + facet_wrap(~group)
+  
+  wilcox.test(
+    c(
+      filter(meta,groupBRCA=='BRCA1')$wcgw.beta,
+      filter(meta,groupBRCA=='BRCA2')$wcgw.beta
+    ),
+    filter(meta,groupBRCA=='NON-BRCA')$wcgw.beta,
+    alternative='less'
+  )
+  
+  summary(lm(.meta$wcgw.beta ~ .meta$MIR200cAvgBeta + .meta$group + .meta$predAges))
+  
+  meta <- dplyr::left_join(meta,means,by=c('SVC'='sample'))
+  
+  ggplot(meta,aes(y=wcgw.beta,x=MIR200cAvgBeta)) + geom_point()
+  ggplot(meta,aes(y=wcgw.beta,x=age,color=groupBRCA)) + geom_point()
+  summary(lm(meta$wcgw.beta ~ meta$age))
+  
+saveRDS(means,file='solo_wcgw_beta_means.Rds')
+```
+
+
+
+
+
+
+# chromHMM Segmentation
+
+this is post 5/19/2022 and should be included in github once that is worked out.
+
+Downloaded the ensembl segmentation from 
+
+Vu_and_Ernst_GenomeBiol2022_full_stack_chromHMM_states
+
+/secondary/projects/shen/genomic_resources/Vu_and_Ernst_GenomeBiol2022_full_stack_chromHMM_states
+
+
+From a list of beds, get the bsseq objects for all CpGs intersecting each
+
+This was done in 'chromHMM_workflow_Singularity.Rmd'
+
+```{r chromHMM_analysis_methylation,eval=TRUE}
+# test <- readRDS('dmr.ranges.BRCA1_and_BRCA2_v_WT.Rds')
+# res2 <- readRDS('chromHMM_result.Rds')
+res2 <- readRDS('chromHMM_result_chr2_N85.Rds')
+
+# unique(res2$chromHMM)
+
+class(res2)
+res2 <- dplyr::left_join(res2,meta,by=c('sample'='SVC'))
+
+dim(res2)
+
+pdf(file='chromHMM_boxplot_chr2.pdf',width = 9,height = 9)
+p0 <- res2 %>%
+  ggplot(aes(x=groupBRCA,y=meanCov,color=Pilot)) +
+      geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+      geom_jitter(size = 1, alpha = 1, width = 0.1) +
+      xlab('') +
+      ylab('Mean Coverage') +
+      theme_bw() +
+      # viridis::scale_color_viridis(discrete = TRUE) +
+      scale_color_manual(values=viridis::viridis(n=4)[1:3]) +
+      theme(legend.position="none") +
+      theme(plot.title = element_text(size=12)) +
+      theme(axis.text.x = element_text(angle=45,hjust=1)) +
+      facet_wrap(~chromHMM,scales='free')
+p0
+
+
+p0 + ylim(c(0,30))
+
+
+
+p1 <- ggplot(res2,aes(x=groupBRCA,y=meanM/meanCov)) + 
+      geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+      geom_jitter(size = 1, alpha = 1, width = 0.1) +
+      xlab('') +
+      ylab('Mean Methylation') +
+      ylim(c(0,1)) +
+      theme_bw() +
+      # viridis::scale_color_viridis(discrete = TRUE) +
+      # scale_color_manual(values=viridis::viridis(n=4)[1:3]) +
+      theme(legend.position="none") +
+      theme(plot.title = element_text(size=12)) +
+      theme(axis.text.x = element_text(angle=45,hjust=1)) + 
+  facet_wrap(~chromHMM,scales='free',ncol=4)
+
+p2 <- p1 %+% dplyr::filter(res2,chromHMM%in%c('HET.bed','TSS.bed','BivProm.bed','PromF.bed')) + theme_bw() + theme(axis.text.x = element_text(angle=45,hjust=1))
+pdf('MeanMethChromHMM.pdf',width = 5,height = 2.5); p2; dev.off()
+
+
+
+ggplot(res2,aes(x=groupBRCA,y=meanM/meanCov,color=Pilot)) + 
+      geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+      geom_jitter(size = 1, alpha = 1, width = 0.1) +
+      xlab('') +
+      ylab('Mean Methylation') +
+      # ylim(c(0,1)) +
+      theme_bw() +
+      # viridis::scale_color_viridis(discrete = TRUE) +
+      scale_color_manual(values=viridis::viridis(n=4)[1:3]) +
+      theme(legend.position="none") +
+      theme(plot.title = element_text(size=12)) +
+      theme(axis.text.x = element_text(angle=45,hjust=1)) + 
+  facet_wrap(~chromHMM,scales='free')
+
+dev.off()
+
+
+
+# check if meanM in BivProm.bed is correlated with MIR200c
+
+dplyr::filter(res2,chromHMM=='BivProm.bed') %>%
+  ggplot(aes(x=MIR200cAvgBeta,y=meanM/meanCov,color=groupBRCA)) +
+  geom_point() +
+  bbc_style() + ggtitle('MIR200C Beta vs. BivProm.bed Beta')
+
+x <- dplyr::filter(res2,chromHMM=='BivProm.bed')
+cor.test((x$meanM/x$meanCov),x$MIR200cAvgBeta,method='spearman')
+
+
+# check if stroma % really dictates read coverage
+res2 %>% dplyr::group_by(sample) %>% summarize(meanCoverage=mean(meanCov)) %>% left_join(meta,by=c('sample'='SVC')) %>%
+dplyr::filter(Pilot=='B') %>%
+ggplot(aes(x=MIR200cAvgBeta,y=meanCoverage,color=groupBRCA)) + geom_point()
+
+
+
+# get summary stats foreach chromHMM state
+# res2 %>% group_by(sample) %>% dplyr::summarize(meanMeth=meanM)
+
+```
+
+
+<!-- # generating 1 bsseq -->
+
+```{r gen_bsseq,eval=FALSE}
+source("biscuiteer_adjacent_R_functions/methFunctions.R")
+config <- yaml::yaml.load_file("../Biscuit_Snakemake_Workflow/config/config.yaml")
+contrast.name <- 'N85'
+sampNames <- meta$sample
+myRDSunion <- paste0(contrast.name,"_bsseq.Rds")
+
+myBS <- NULL
+if(!file.exists(myRDSunion)){
+  for(i in 1:length(sampNames)){
+    print(cat('sample',sampNames[i],i,"\n"))
+    bs_list <- biscuiteer::readBiscuit(
+      BEDfile = paste0('../Biscuit_Snakemake_Workflow/analysis/pileup/',sampNames[i],"_mergecg.bed.gz"),
+      VCFfile = paste0('../Biscuit_Snakemake_Workflow/analysis/pileup/',sampNames[i],".vcf.gz"),          genome = config$ref$fasta,
+      merged = TRUE,
+      which = NULL
+    )
+    if(i==1 & is.null(myBS)){
+      myBS <- bs_list
+    }else{
+      myBS <- biscuiteer::unionize(myBS,bs_list)
+    }
+  
+    
+  } # go to next sample
+  
+  colnames(myBS) <- gsub('.sorted.markdup','',colnames(myBS))
+  
+}else{
+  # load file that exists
+}
+    
+ 
+    
+      
+    # Subset the BS to canonical chromosomes else get an error with dmrcate "need at least two non-NA values to interpolate" when works on small contigs with <2 CpGs
+    myBS <- myBS[seqnames(myBS) %in% myChrs]
+    myBS
+
+
+```
+
+<!-- # Filter bsseq to EPIC array positions -->
+
+```{r filter_bsseq_to_EPIC,eval=FALSE}
+
+# first load the EPIC array manifest for hg38
+m <- readRDS('sesameData.EPIC.hg38.manifest.Rds')
+class(m)
+# m
+
+# load chr1 bsseq 
+bsseq <- readRDS('BRCA1_and_BRCA2_v_WT_bsseq_chr1.Rds')
+bsseq
+
+test0 <- subsetByOverlaps(bsseq,m)
+test01 <- findOverlaps(bsseq,m)
+test02 <- bsseq[test01@from]
+rowData(test02) <- m[test01@to]
+
+test2 <- bsseq::getMeth(BSseq = test,type="raw")
+class(test2)
+
+length(which(is.na(test2[1,])))
+
+missingFracList <- apply(test2,1,FUN=function(x){
+  missing <- length(which(is.na(x)))
+  return(missing / length(x))
+})
+class(missingFracList)
+length(missingFracList)
+
+summary(missingFracList)
+
+
+```
+
+# Region Centered Bin Averages
+
+## CPGIs
+
+```{r region.centered.bin.avgs,eval=TRUE}
+
+if(!file.exists('CPGI.Rds')){  
+  rcba_dir <- '../Biscuit_Snakemake_Workflow/analysis/region_centered_bin_averages_cpgi/'
+  # list.files(rcba_dir)
+  rcba_colnames <- c('chr','start','stop','bin','strand','meth')
+  rm(res.rcba)
+  for(s in meta$sample){
+    b <- read.delim(paste0(rcba_dir,s,'.bed'),sep="\t",header=FALSE)
+    colnames(b) <- rcba_colnames
+    b2 <- b %>% dplyr::group_by(bin) %>% dplyr::summarise(meanMeth=mean(meth))
+    b2$sample <- rep(s,nrow(b2))
+    if(! exists("res.rcba")){
+      res.rcba <- b2
+    }else{
+      res.rcba <- rbind(res.rcba,b2)
+    }
+  }
+  dim(res.rcba)
+  length(unique(res.rcba$sample))
+  res.rcba <- dplyr::left_join(res.rcba,meta)
+  res.rcba.cpgi <- res.rcba
+  saveRDS(res.rcba.cpgi,'CPGI.Rds')
+}else{
+  res.rcba.cpgi <- readRDS('CPGI.Rds')
+}
+aux <- seq(0, 200, 50)[-1]
+aux <- c(-aux, 0, aux)
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+
+# pdf('/Volumes/projects_secondary/shen/projects/TEIJ_20200116_WGMS/analysis/ctcf_plot/test.pdf', width=12, height=7)
+
+# dplyr::filter(res.rcba,groupBRCA=='BRCA2') %>%
+# dplyr::filter(res.rcba,sample!='SVC003340') %>% # This sample looks weird!
+pXX <- res.rcba.cpgi %>%
+ggplot() +
+    geom_line(aes(x=bin, y=meanMeth,group=sample,color=groupBRCA)) +
+    xlab('Position') +
+    ylab('DNA Methylation Level') +
+    scale_x_continuous('Distance to CpG Island Center', aux, labels=sprintf("%dbp", aux*5)) + 
+  # facet_grid(. ~ factor(groupBRCA,levels=brca.lvls)) +
+  # facet_grid(sample ~ .) + 
+  bbc_style() + scale_color_manual(values=c('black','#40498e','#38aaac')) + ylim(c(0,1)) +  theme(axis.text.x = element_text(angle=45,hjust=1))
+
+pdf('BinCentered_CPGI.pdf',height = 7,width = 7)
+pXX
+dev.off()
+
+pXX
+
+```
+
+## HET
+
+```{r region.centered.bin.avgs_HET,eval=TRUE}
+
+# first read them in
+  # getwd()
+if(!file.exists('HET.Rds')){  
+  rcba_dir <- '../Biscuit_Snakemake_Workflow/analysis/region_centered_bin_averages_HET/'
+  # list.files(rcba_dir)
+  rcba_colnames <- c('chr','start','stop','bin','strand','meth')
+  res.rcba <- NULL
+  for(s in meta$sample){
+    b <- read.delim(paste0(rcba_dir,s,'_1M.bed'),sep="\t",header=FALSE)
+    colnames(b) <- rcba_colnames
+    b2 <- b %>% dplyr::group_by(bin) %>% dplyr::summarise(meanMeth=mean(meth))
+    b2$sample <- rep(s,nrow(b2))
+    if(! exists("res.rcba")){
+      res.rcba <- b2
+    }else{
+      res.rcba <- rbind(res.rcba,b2)
+    }
+  }
+  dim(res.rcba)
+  length(unique(res.rcba$sample))
+  res.rcba.het <- dplyr::left_join(res.rcba,meta)
+  saveRDS(res.rcba.het,'HET.Rds')
+}else{
+  res.rcba.het <- readRDS('HET.Rds')
+}
+
+aux <- seq(0, 200, 50)[-1]
+aux <- c(-aux, 0, aux)
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+
+# pdf('/Volumes/projects_secondary/shen/projects/TEIJ_20200116_WGMS/analysis/ctcf_plot/test.pdf', width=12, height=7)
+
+# dplyr::filter(res.rcba,groupBRCA=='BRCA2') %>%
+# dplyr::filter(res.rcba,sample!='SVC003340') %>% # This sample looks weird!
+pdf('BinCentered_HET.pdf',height = 5,width = 7)
+pXX2 <- res.rcba.het %>%
+ ggplot() +
+    geom_line(aes(x=bin, y=meanMeth,group=sample,color=groupBRCA)) +
+    xlab('Position') +
+    ylab('DNA Methylation Level') +
+    scale_x_continuous('Distance to CpG Island Center', aux, labels=sprintf("%dbp", aux*5)) + 
+  facet_grid(. ~ factor(groupBRCA,levels=brca.lvls)) +
+  # facet_grid(sample ~ .) + 
+  theme_bw() + scale_color_manual(values=c('black','#40498e','#38aaac'))  + ylim(c(0,1)) +  theme(axis.text.x = element_text(angle=45,hjust=1)) + theme(legend.position = 'None')
+
+dev.off()
+
+
+pXX2 %+% res.rcba.het + theme(axis.text.x = element_blank())
+
+```
+
+## TSS
+
+```{r region.centered.bin.avgs_TSS,eval=TRUE}
+
+# first read them in
+if(!file.exists('TSS.Rds')){  
+  rcba_dir <- '../Biscuit_Snakemake_Workflow/analysis/region_centered_bin_averages_TSS/'
+  # list.files(rcba_dir)
+  rcba_colnames <- c('chr','start','stop','bin','strand','meth')
+  res.rcba <- NULL
+  for(s in meta$sample){
+    b <- read.delim(paste0(rcba_dir,s,'.bed'),sep="\t",header=FALSE)
+    colnames(b) <- rcba_colnames
+    b2 <- b %>% dplyr::group_by(bin) %>% dplyr::summarise(meanMeth=mean(meth))
+    b2$sample <- rep(s,nrow(b2))
+    if(! exists("res.rcba")){
+      res.rcba <- b2
+    }else{
+      res.rcba <- rbind(res.rcba,b2)
+    }
+  }
+  dim(res.rcba)
+  length(unique(res.rcba$sample))
+  res.rcba.tss <- dplyr::left_join(res.rcba,meta)
+  saveRDS(res.rcba.tss,'TSS.Rds')
+}else{
+  res.rcba.tss <- readRDS('TSS.Rds')
+}
+aux <- seq(0, 200, 50)[-1]
+aux <- c(-aux, 0, aux)
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+
+# pdf('/Volumes/projects_secondary/shen/projects/TEIJ_20200116_WGMS/analysis/ctcf_plot/test.pdf', width=12, height=7)
+
+# dplyr::filter(res.rcba,groupBRCA=='BRCA2') %>%
+# dplyr::filter(res.rcba,sample!='SVC003340') %>% # This sample looks weird!
+
+
+pXX %+% res.rcba.tss + theme(axis.text.x = element_blank())
+```
+
+## CTCF
+
+```{r region.centered.bin.avgs_CTCF,eval=TRUE}
+
+if(!file.exists('CTCF.Rds')){  
+  
+  rcba_dir <- '../Biscuit_Snakemake_Workflow/analysis/region_centered_bin_averages_CTCF/'
+  # list.files(rcba_dir)
+  rcba_colnames <- c('chr','start','stop','bin','strand','meth')
+  res.rcba <- NULL
+  for(s in meta$sample){
+    b <- read.delim(paste0(rcba_dir,s,'.bed'),sep="\t",header=FALSE)
+    colnames(b) <- rcba_colnames
+    b2 <- b %>% dplyr::group_by(bin) %>% dplyr::summarise(meanMeth=mean(meth))
+    b2$sample <- rep(s,nrow(b2))
+    if(! exists("res.rcba")){
+      res.rcba <- b2
+    }else{
+      res.rcba <- rbind(res.rcba,b2)
+    }
+  }
+  dim(res.rcba)
+  length(unique(res.rcba$sample))
+  res.rcba.ctcf <- dplyr::left_join(res.rcba,meta)
+  saveRDS(res.rcba.ctcf,'CTCF.Rds')
+}else{
+  res.rcba.ctcf <- readRDS('CTCF.Rds')
+}
+aux <- seq(0, 200, 50)[-1]
+aux <- c(-aux, 0, aux)
+
+(pXX %+% res.rcba.ctcf  + theme(axis.text.x = element_blank()) + labs(title='CTCF Binding Sites'))
+
+
+
+
+
+```
+
+```{r HET_TSS_CTCF}
+
+pXX2 %+% res.rcba.het + theme(axis.text.x = element_blank())
+pXX %+% res.rcba.tss + theme(axis.text.x = element_blank())
+(pXX %+% res.rcba.ctcf  + theme(axis.text.x = element_blank()) + labs(title='CTCF Binding Sites'))
+
+```
+
+
+## chromHMM boxplots
+
+```{r BinCentered_chromHMM_FIGURES,fig.height=7,fig.width=7}
+
+layout <- 'abc'
+
+
+# (pXX %+% res.rcba.cpgi + theme(axis.text.x = element_blank()) + labs(title='CpG Islands')) +
+(pXX %+% res.rcba.ctcf + theme(axis.text.x = element_blank()) + labs(title='CTCF Binding Sites')) +
+(pXX %+% res.rcba.tss + theme(axis.text.x = element_blank(),legend.position = 'none') + labs(title='TSSs')) +
+(pXX %+% res.rcba.het + theme(legend.position = 'none') + labs(title='Heterochromatin')) + 
+    patchwork::plot_layout(design = layout) 
+
+
+# now do all three as one figure
+a <- pXX2 %+% res.rcba.het + theme(axis.text.x = element_blank())
+b <- pXX2 %+% res.rcba.tss + theme(axis.text.x = element_blank())
+c <- pXX2 %+% res.rcba.ctcf #+ theme(axis.text.x = element_blank())
+
+
+
+
+# (pXX %+% res.rcba.ctcf + theme(axis.text.x = element_blank()) + labs(title='CTCF Binding Sites')) +
+# (pXX %+% res.rcba.tss + theme(axis.text.x = element_blank(),legend.position = 'none') + labs(title='TSSs')) +
+# (pXX %+% res.rcba.het + theme(legend.position = 'none') + labs(title='Heterochromatin')) + 
+
+pdf('BinCentered_chromHMM_3x.pdf',height = 2.5,width = 7)
+a + b + c + patchwork::plot_layout(design = layout) 
+dev.off()
+```
+
+## Ciliated marker genes
+see create_ciliated_TSS_file.sh in the snakemake directory for info
+basically TSS +/- 250 bp for ciliated marker genes used in RNA heatmap
+
+```{r region.centered.bin.avgs_Ciliated,eval=TRUE}
+
+if(!file.exists('Ciliated_regionCentered.Rds')){  
+  
+  rcba_dir <- '../Biscuit_Snakemake_Workflow/analysis/region_centered_bin_averages_Ciliated/'
+  # list.files(rcba_dir)
+  rcba_colnames <- c('chr','start','stop','bin','strand','meth')
+  res.rcba <- NULL
+  for(s in meta$sample){
+    b <- read.delim(paste0(rcba_dir,s,'.bed'),sep="\t",header=FALSE)
+    colnames(b) <- rcba_colnames
+    b2 <- b %>% dplyr::group_by(bin) %>% dplyr::summarise(meanMeth=mean(meth))
+    b2$sample <- rep(s,nrow(b2))
+    if(! exists("res.rcba")){
+      res.rcba <- b2
+    }else{
+      res.rcba <- rbind(res.rcba,b2)
+    }
+  }
+  dim(res.rcba)
+  length(unique(res.rcba$sample))
+  res.rcba.ciliated <- dplyr::left_join(res.rcba,meta)
+  saveRDS(res.rcba.ciliated,'Ciliated_regionCentered.Rds')
+}else{
+  res.rcba.ciliated <- readRDS('Ciliated_regionCentered.Rds')
+}
+aux <- seq(0, 200, 50)[-1]
+aux <- c(-aux, 0, aux)
+
+# (pXX %+% res.rcba.ctcf + theme(axis.text.x = element_blank()) + labs(title='CTCF Binding Sites'))
+res.rcba.ciliated$newGrouping <- ifelse(is.na(res.rcba.ciliated$LMP_explanation),
+         as.character(res.rcba.ciliated$ReproductiveStatus),
+         ifelse(res.rcba.ciliated$LMP_explanation=='Pregnancy','Pregnancy',as.character(res.rcba.ciliated$ReproductiveStatus)))
+  
+
+tmp <- res.rcba.ciliated %>% mutate(binAge = cut_interval(`Age at time of surgery`, n = 5))
+c0 <- ggplot(tmp) +
+    geom_line(aes(x=bin, y=meanMeth,group=sample,alpha=0.01,color=`Age at time of surgery`)) +
+    stat_smooth(aes(x = bin, y = meanMeth,group=sample), method = "lm",
+              formula = y ~ poly(x, 2), se = FALSE) +
+    xlab('Position') +
+    ylab('DNA Methylation Level') +
+    scale_x_continuous('Distance to Ciliated Marker TSS', aux, labels=sprintf("%dbp", aux*5)) +
+  theme_minimal() + 
+  scale_color_viridis_c(option = 'turbo') +
+  # scale_color_manual(values=viridis::mako(n=4)[1:3]) + 
+  ylim(c(0,1)) +  theme(axis.text.x = element_text(angle=45,hjust=1)) +
+  facet_wrap(~binAge,nrow=1) + theme(legend.position = 'none')
+
+c1 <- ggplot(tmp) +
+    geom_line(aes(x=bin, y=meanMeth,group=sample,alpha=0.01,color=`Age at time of surgery`)) +
+    stat_smooth(aes(x = bin, y = meanMeth,group=sample), method = "lm",
+              formula = y ~ poly(x, 2), se = FALSE) +
+    xlab('Position') +
+    ylab('DNA Methylation Level') +
+    scale_x_continuous('Distance to Ciliated Marker TSS', aux, labels=sprintf("%dbp", aux*5)) +
+  theme_minimal() + 
+  scale_color_viridis_c(option = 'turbo') +
+  # scale_color_manual(values=viridis::mako(n=4)[1:3]) + 
+  ylim(c(0,1)) +  theme(axis.text.x = element_text(angle=45,hjust=1)) +
+  facet_wrap(~newGrouping,nrow=1)# + theme(legend.position = 'none')
+
+pdf(file='ciliated_marker_TSS_methylation_by_binAge.pdf',height = 3,width = 5); c0; dev.off()
+pdf(file='ciliated_marker_TSS_methylation_by_PrePostCsec.pdf',height = 3,width = 5); c1; dev.off()
+
+```
+
+# Histology staining
+
+5 high 7 5 low MIR200C from PilotC with mRNA data as well
+
+```{r getHEsamples}
+
+x <- dplyr::filter(meta,is.na(useRNAData) & Pilot=='C' & groupBRCA=='NON-BRCA'); dim(x)
+
+x %>% dplyr::arrange(desc(MIR200cAvgBeta)) %>% 
+  select('Original ID') %>%
+  # select('MIR200cAvgBeta') %>%
+  tail(n=7)
+
+x %>% dplyr::arrange(desc(MIR200cAvgBeta)) %>% 
+  select('Original ID') %>%
+  # select('MIR200cAvgBeta') %>%
+  head(n=7)
+```
+
+```{r plotResults}
+
+# read in the results from Ronny 12/29/31
+
+hne <- readxl::read_excel(path='Stromal % in select Gray Foundation samples.xlsx')
+
+hne <- dplyr::left_join(hne,meta[,c('Original ID','MIR200cAvgBeta')],by=c('Sample ID number'='Original ID'))
+
+test <- cor.test(hne$MIR200cAvgBeta,hne$mean_stromal,method='spearman')
+
+g <- ggplot(hne,aes(y=MIR200cAvgBeta,x=mean_stromal)) + geom_point(size=2) + theme_minimal() +
+  labs(caption=paste(
+            'Pval:',signif(test$p.value,2),
+            test$method,
+            signif(test$estimate,2)
+          )
+  ) + theme_bw() + ylim(c(0,1)) + xlim(c(0,100)) +
+  # xlab('Estimate from methylation (MIR200c average beta)') +
+  # ylab('Estimate from pathology (percent stromal)')
+  xlab('') +
+  ylab('') #+ scale_y_continuous(breaks = c(0, 0.5 ,1))
+
+g
+pdf('stromal_estimates_comparison_dotplot.pdf',height = 3,width = 3); g; dev.off()
+
+
+```
+
+# Get samples for RNA resequencing
+
+Two of the BRCA1 samples have expression of the alternate (mutant) allele that is already detectable
+Two samples do not have known mutation - EXCLUDE
+
+
+```{r get_samples2reqequence_RNA}
+
+x <- dplyr::filter(meta,is.na(useRNAData) & group=='BRCA' & sequencedRNA==TRUE)
+dim(x)
+
+# RNA_allelic_expr_fragments_noDups_ref_alt has the number of RNA alleles that I observed in the previous library
+x %>% dplyr::arrange(desc(RNA_allelic_expr_fragments_noDups_ref_alt)) %>% 
+  dplyr::filter(groupBRCA=='BRCA2') %>%
+  select(c('Original ID','RNA_allelic_expr_fragments_noDups_ref_alt','Pilot','ReproductiveStatus'))# %>%
+  # select('MIR200cAvgBeta') %>%
+  # head(n=7)
+
+x %>% dplyr::arrange(desc(RNA_allelic_expr_fragments_noDups_ref_alt)) %>% 
+  dplyr::filter(groupBRCA=='BRCA1') %>%
+  select(c('Original ID','RNA_allelic_expr_fragments_noDups_ref_alt','Pilot','ReproductiveStatus'))# %>%
+
+
+
+x %>% dplyr::arrange(desc(RNA_allelic_expr_fragments_noDups_ref_alt)) %>% 
+  dplyr::filter(Pilot=='B') %>%
+  select(c('SVC','RNA_allelic_expr_fragments_noDups_ref_alt','Pilot','ReproductiveStatus'))# %>%
+
+```
+
+this section of code is deprecated and has been moved to nurDGE_canary.Rmd
+# Ciliated / Secretory Marker Heatmap w/ RNA
+
+```{r ciliated_secretory_markers, fig.height=11,fig.width=11}
+
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# get the other clin data as well to get info on contraception use
+mX <- readxl::read_excel('../MasterCanaryClinData_20230913.xlsx')
+
+# filter to samples with RNA
+m1 <- dplyr::filter(m0,useRNA_2==TRUE); dim(m1)
+
+m1 <- dplyr::left_join(m1,mX[c('SVC','contraception use','# of Years of Contraception Use')])
+
+
+# load the cpm
+cpm <- readRDS('cpm_N104.Rds')[,m1$SVC]; dim(cpm)
+
+# set up meno status!
+all(colnames(cpm) %in% m1$SVC)
+all(m1$SVC %in% colnames(cpm))
+m1$MenoStatus <- ifelse(m1$Postpartum==TRUE,'Postpartum',as.character(m1$ReproductiveStatus))
+table(m1$MenoStatus)
+m1$MenoStatus <- factor(m1$MenoStatus,levels=c('Pre','Post','Postpartum'))
+m1$`Days since LMP` <- as.numeric(m1$`Days since LMP`)
+m1 <- m1 %>% mutate(DaysSinceLMP_categ = cut(`Days since LMP`, breaks=c(0, 12, 16, 30,60),include.lowest=TRUE)); table(m1$DaysSinceLMP_categ)
+# m1$menstrPh_by_Endom
+m1$MIR200cAvgBeta <- as.numeric(m1$MIR200cAvgBeta)
+# set up the annotation
+
+
+
+markers1 <- read.csv('top50_geneIDs_ciliated_secretory_and_others_use_this.csv')
+markers1 <- markers1[,1:3]
+# markers1 <- dplyr::filter(markers1,cell_type!='stem cells')
+markers1 <- dplyr::filter(markers1,cell_type%in%c('ciliated','secretory')) # this matches what was done for the CCOC/ENOC/HGSOC data
+
+# markers for Hui
+markers33 <- data.frame(
+  # ext_gene = c('ESR1','PGR','HNF1B'),
+  ext_gene = c('ESR1','PGR'),
+  # ens_gene = c('ENSG00000091831','ENSG00000082175','ENSG00000275410'),
+  ens_gene = c('ENSG00000091831','ENSG00000082175'),
+  cell_type = c(rep('',2))
+)
+
+# markers <- markers1
+markers <- rbind(markers1,markers33)
+
+# filter to just ciliated!
+# markers <- dplyr::filter(markers,cell_type == 'secretory' | cell_type=='')
+markers <- dplyr::filter(markers,cell_type == 'secretory' | cell_type=='' | cell_type=='ciliated')
+
+# remove those markers not present in the sec/pro/histotype RNAseq data
+markers <- dplyr::filter(markers,!ext_gene %in% c("C1orf194","EFCAB1","TTC25"))
+
+# markers <- rbind(markers1,markers2,markers22)
+length(unique(markers$ens_gene))
+length(unique(markers$ext_gene))
+dim(markers)
+# which(duplicated(markers$ens_gene))
+table(markers$ens_gene %in% rownames(cpm))
+markers$ext_gene[which(! markers$ens_gene %in% rownames(cpm))]
+
+cpm2 <- cpm[which(rownames(cpm) %in% markers$ens_gene),]
+markersFilt <- dplyr::filter(markers,ens_gene %in% rownames(cpm)); dim(markersFilt)
+dim(cpm2)
+cpm2 <- cpm2[markersFilt$ens_gene,]
+rownames(cpm2) <- markersFilt$ext_gene
+stopifnot(all(colnames(cpm2)==m1$SVC))
+# colnames(cpm2) <- m1$`Reason for surgery 2`
+colnames(cpm2) <- m1$patientID
+
+# write.table(file='CiliatedSecretoryMarkers.tsv',
+# (markersF %>% dplyr::rename('ensemblID'='ens_gene','geneSymbol'='ext_gene') %>%
+#   dplyr::select(one_of(c('geneSymbol','cell_type')))),
+# quote=FALSE,row.names=FALSE,sep="\t"
+# )
+
+mat <- cpm2
+matScaled <- t(scale(t(mat),center = TRUE))
+matScaled[matScaled>2] <- 2
+matScaled[matScaled<(-2)] <- -2
+# mat <- dplyr::select(mat,one_of(meta$SVC))
+dim(matScaled)
+
+
+haRowRNA <- heatmapColorPal <- viridis::viridis(n=100)
+pal = c(
+  viridis::viridis(n=4),
+  viridis::rocket(n=5)[2:4],
+  viridis::turbo(n=5)[c(2,4)]
+)
+# pal2 = viridis::mako(n=5)
+pal2 = viridis::turbo(n=5)
+
+meta00 <- m1
+haCol_ciliatedSec <- HeatmapAnnotation(
+  `Path Report Menstrual Phase` = meta00$menstrPh_by_Endom,
+  # `contraception use` = meta00$`contraception use`,
+  `Age` = meta00$`Age at time of surgery`,
+  `Stromal Content` = meta00$MIR200cAvgBeta,
+  `Menopause Status` = meta00$MenoStatus,
+  `BRCAm` = meta00$groupBRCA,
+  `Race` = meta00$Race,
+  # `Days since LMP` = meta00$`Days since LMP`,
+  DaysSinceLMP_categ = meta00$DaysSinceLMP_categ,
+  `Surgical Indication` = meta00$`Reason for surgery 2`,
+  # `Number of Pregnancies` = as.numeric(meta00$`# of Pregnancies`),
+
+  # `Immune Score` = meta00$ImmuneScore,
+  col = list(
+    `Stromal Content` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 1, length = 20),
+                              colors = viridis::cividis(20)
+    ),
+    `Days since LMP` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 50, length = 20),
+                              colors = colorRampPalette(c("grey88", "blue"))(20)
+    ),
+    `Age` = circlize::colorRamp2(
+                              breaks = seq(from = 20, to = 72, length = 20),
+                              colors = colorRampPalette(c("gray75", "black"))(20)
+    ),
+    `Menopause Status` = c(
+      'Pre' = "#28BBECFF",
+      'Post' = "#FB8022FF",
+      'Postpartum' = 'grey33'
+    ),
+    `BRCAm` = c(
+      'BRCA1' = '#40498e',
+      'BRCA2' = '#38aaac',
+      'NON-BRCA' = 'black'
+    ),
+    Race = c(
+      'Asian' = '#30123BFF',
+      'Black' = "#28BBECFF",
+      'East Indian' = "#A2FC3CFF",
+      'Hispanic Latino/White' = "#FB8022FF",
+      'White' = "#7A0403FF",
+      'Other' = 'gray48'
+    ),
+    DaysSinceLMP_categ=c(
+      '[0,12]' = '#67001F',
+      '(12,16]' = '#92C5DE',
+      '(16,30]' = '#053061',
+      '(30,60]' = 'black'
+    ),
+    `Path Report Menstrual Phase` = c(
+      'Secretory'= "#CA0020",
+      'Weakly Proliferative'='#F2E2F7',
+      'Proliferative' = '#92C5DE',
+      'Late Proliferative/Early Secretory'='#0571B0',
+      'Inactive'='black'
+    ),
+    `Surgical Indication` = c(
+      'Uterine Fibroids'='dodgerblue',
+      'Uterine Fibroids + Endometriosis'='dodgerblue2',
+      'Uterine Fibroids + Adenomyosis'='dodgerblue4',
+      'Uterine Prolapse'='darkorchid3',
+      'Cesarean Section'='pink',
+      'Cervical Dysplasia'='darkorchid1',
+      'Menorrhagia'='red',
+      'Endometriosis'='firebrick4',
+      'Ovarian Serous Cystadenoma'='blue2',
+      'Ovarian Cyst (Sex chord stromal tumor)'='blue3',
+      'Ovarian Cyst'='blue1',
+      'Pelvic mass'='blue4',
+      'Adnexal Mass' = 'darkblue',
+      'Tubal Sterilization' = 'azure4',
+      'Gender Affirmation'='green',
+      'Risk Reduction' = 'darkgreen'
+    ),
+    `contraception use` = c(
+      'NA'='grey66',
+      'Former'='purple',
+      'Current'='blue',
+      'Y'='blue3',
+      'Y - BTL'='darkblue',
+      'N' = 'red'
+    )
+  ),na_col='white'
+)
+
+
+
+myHM <- ComplexHeatmap::Heatmap(
+    # matLogCPM,
+    matScaled,
+    show_column_names = TRUE,
+    # col=heatmapColorPal,
+    col=viridis::viridis(20),
+    cluster_rows = TRUE,
+    cluster_columns = TRUE,
+    # heatmap_legend_param = list(title='log2(CPM)'),
+    heatmap_legend_param = list(title='Z-Score'),
+    row_title_gp = gpar(fontsize = 9),
+    row_names_gp = gpar(fontsize = 4),
+    column_names_rot = 90,
+    column_names_gp = gpar(
+      fontsize = 8#,
+      # col = myPosColors
+    ),
+    # column_title = nameArg, 
+    column_title_gp = gpar(fontsize = 12),
+    column_title_rot = 0,
+    top_annotation = haCol_ciliatedSec,
+    heatmap_width = unit(8, "in"),  
+    heatmap_height = unit(10, "in"),  
+    row_title_rot = 0,
+    column_split = meta00$MenoStatus,
+    row_split = markersFilt$cell_type,
+    show_row_dend = TRUE,
+    cluster_column_slices = FALSE,
+    # right_annotation = rowANNO
+  )
+
+# pdf('CiliatedSecretoryMarkersByAge_Zscore.pdf',width = 15,height = 13); myHM; dev.off()
+# pdf('SecretoryMarkers_grouped_by_MenoStatus.pdf',width = 15,height = 13); myHM; dev.off()
+pdf('CiliatedSecretoryMarkers_grouped_by_MenoStatus.pdf',width = 15,height = 13); myHM; dev.off()
+
+
+
+```
+
+```{r ciliated_secretory_with_HGSOC}
+# now do the two heatmaps next to each other
+hm2 <- readRDS('/Users/ianbeddows/Desktop/currentProjects/Hui_CCOC_ENOC_HGSC_Rproj/ciliated_secretory_markers_heatmap.Rds')
+# hm2 <- readRDS('/Users/ianbeddows/Desktop/currentProjects/Hui_CCOC_ENOC_HGSC_Rproj/secretory_markers_heatmap.Rds')
+
+cat('Missing in canary data\n')
+rownames(hm2@matrix)[which(! rownames(hm2@matrix) %in% rownames(myHM@matrix))]
+cat('Missing in sec/pro data\n')
+rownames(myHM@matrix)[which(! rownames(myHM@matrix) %in% rownames(hm2@matrix))]
+
+# pdf('CiliatedSecretoryMarkers_Zscore_with_sec_pro_data2.pdf',width = 20,height = 13); hm2 + myHM; dev.off()
+# pdf('SecretoryMarkers_Zscore_with_sec_pro_data2.pdf',width = 20,height = 13); hm2 + myHM; dev.off()
+# pdf('SecretoryMarkers_Zscore_with_sec_pro_data2_grouped_by_MenoStatus.pdf',width = 20,height = 13); hm2 + myHM; dev.off()
+pdf('CiliatedSecretoryMarkers_Zscore_with_sec_pro_data2_grouped_by_MenoStatus.pdf',width = 20,height = 13); hm2 + myHM; dev.off()
+
+```
+
+
+## with markers from Pro v Sec Normal Endom.
+
+```{r separate_with_highPro_highSec_markers_normal_endometrium}
+
+markersSP <- readxl::read_excel('~/Desktop/MasterMarkers.xlsx',sheet='Table S4 Beddows 2024')
+markersSP <- dplyr::arrange(markersSP,logFC)
+markersSP2 <- markersSP
+# markersSP2 <- rbind(markersSP[1:20,],markersSP[780:799,])
+
+cpm2 <- cpm[which(rownames(cpm) %in% markersSP2$ENSEMBL),]
+markersFilt <- dplyr::filter(markersSP2,ENSEMBL %in% rownames(cpm)); dim(markersFilt)
+dim(cpm2)
+cpm2 <- cpm2[markersFilt$ENSEMBL,]
+rownames(cpm2) <- ifelse(is.na(markersFilt$SYBMOL),markersFilt$ENSEMBL,markersFilt$SYBMOL)
+stopifnot(all(colnames(cpm2)==m1$SVC))
+# colnames(cpm2) <- m1$`Reason for surgery 2`
+colnames(cpm2) <- m1$patientID
+
+mat <- cpm2
+matScaled <- t(scale(t(mat),center = TRUE))
+matScaled[matScaled>2] <- 2
+matScaled[matScaled<(-2)] <- -2
+# mat <- dplyr::select(mat,one_of(meta$SVC))
+dim(matScaled)
+r <- which(rownames(matScaled)=='NA')
+if(length(r)){
+  matScaled <- matScaled[-r,]
+}
+# remove NAs
+# matScaled <- matScaled[rowSums(is.na(matScaled)) != ncol(matScaled), ]
+
+myHM_sec_pro <- ComplexHeatmap::Heatmap(
+    # matLogCPM,
+    matScaled,
+    show_column_names = TRUE,
+    # col=heatmapColorPal,
+    col=viridis::viridis(20),
+    cluster_rows = TRUE,
+    cluster_columns = TRUE,
+    # heatmap_legend_param = list(title='log2(CPM)'),
+    heatmap_legend_param = list(title='Z-Score'),
+    row_title_gp = gpar(fontsize = 9),
+    row_names_gp = gpar(fontsize = 4),
+    column_names_rot = 90,
+    column_names_gp = gpar(
+      fontsize = 8#,
+      # col = myPosColors
+    ),
+    # column_title = nameArg, 
+    column_title_gp = gpar(fontsize = 12),
+    column_title_rot = 0,
+    top_annotation = haCol_ciliatedSec,
+    heatmap_width = unit(8, "in"),  
+    heatmap_height = unit(10, "in"),  
+    row_title_rot = 0,
+    column_split = meta00$MenoStatus,
+    row_split = markersFilt$cell_type,
+    show_row_dend = TRUE,
+    cluster_column_slices = FALSE,
+    # right_annotation = rowANNO
+  )
+# myHM_sec_pro
+```
+
+```{r ciliated_secretory_with_HGSOC_using_sec_pro_markers}
+## now do the two heatmaps next to each other
+hm44 <- readRDS('/Users/ianbeddows/Desktop/currentProjects/Hui_CCOC_ENOC_HGSC_Rproj/ciliated_secretory_markers_heatmap_pro_sec.Rds')
+
+cat('Missing in canary data\n')
+rownames(hm44@matrix)[which(! rownames(hm44@matrix) %in% rownames(myHM_sec_pro@matrix))]
+cat('Missing in sec/pro data\n')
+rownames(myHM_sec_pro@matrix)[which(! rownames(myHM_sec_pro@matrix) %in% rownames(hm44@matrix))]
+
+pdf('Sec_v_Pro_NormalEndom_DEGs.pdf',width = 20,height = 13); hm44 + myHM_sec_pro; dev.off()
+pdf('Sec_v_Pro_NormalEndom_DEGs_without_normals.pdf',width = 15,height = 13); myHM_sec_pro; dev.off()
+
+```
+
+FOJX1, PAX8, KRT18, FAP - HEATMAP
+```{r fig.height=11,fig.width=11}
+
+markers <- data.frame(
+  ext_gene = c('FAP','KRT18','PAX8','FOXJ1'),
+  ens_gene = c('ENSG00000078098','ENSG00000111057','ENSG00000125618','ENSG00000129654')
+)
+
+
+mat <- cpm[markers$ens_gene,]
+rownames(mat) <- mat$geneSymbol
+mat <- dplyr::select(mat,one_of(meta$SVC))
+dim(mat)
+metaX <- dplyr::filter(meta,SVC %in% colnames(mat)); dim(metaX)
+metaX <- dplyr::arrange(metaX,age_in_years)
+mat <- mat[,metaX$SVC]
+table(metaX$SVC==colnames(mat))
+
+# make the heatmap
+
+
+# annotation
+
+haRowRNA <- HeatmapAnnotation(
+  `MIR200c` = metaX$MIR200cAvgBeta,
+  # `Reproductive Status` = metaX$ReproductiveStatus,
+  `Age` = metaX$age_in_years,
+  `BRCA Mutation` = metaX$groupBRCA,
+  # `Race` = metaX$Race,
+  col = list(
+    `MIR200c` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 1, length = 20),
+                              colors = colorRampPalette(c("white", "black"))(20)
+    ),
+    Pilot = c(
+      'A' = pal[1],
+      'B' = pal[2]
+    ),
+    `Reproductive Status` = c(
+      'Pre' = pal[6],
+      'Post' = pal[7]
+    ),
+    `BRCA Mutation` = c(
+      'BRCA1' = pal[3],
+      'BRCA2' = pal[4],
+      'NON-BRCA' = pal[5]
+    ),
+    Race = c(
+      'Asian' = pal2[1],
+      'Black' = pal2[2],
+      'East Indian' = pal2[3],
+      'Hispanic Latino/White' = pal2[4],
+      'White' = pal2[5],
+      'Other' = 'grey44'
+    ),
+    `Age` = circlize::colorRamp2(
+                              breaks = seq(from = 20, to = 72, length = 20),
+                              colors = colorRampPalette(c("gray75", "gray10"))(20)
+    )
+  )
+)
+
+# remove not expressed genes
+remove <- which(rowSums(mat)==0)
+if(length(remove)){mat <- mat[-remove,]}
+matScaled <- t(scale(t(mat),center = TRUE))
+matScaled[matScaled>2] <- 2
+matScaled[matScaled<(-2)] <- -2
+myHM <- ComplexHeatmap::Heatmap(
+    matScaled,
+    show_column_names = FALSE,
+    col=heatmapColorPal,
+    cluster_rows = TRUE,
+    cluster_columns = FALSE,
+    heatmap_legend_param = list(title='Z-Score'),
+    row_title_gp = gpar(fontsize = 9),
+    row_names_gp = gpar(fontsize = 12),
+    column_names_rot = 90,
+    column_names_gp = gpar(
+      fontsize = 8#,
+      # col = myPosColors
+    ),
+    # column_title = nameArg, 
+    column_title_gp = gpar(fontsize = 12),
+    top_annotation = haRowRNA,
+    heatmap_width = unit(5, "in"),  
+    heatmap_height = unit(5, "in"),  
+    row_title_rot = 0,
+    column_split = metaX$groupBRCA,
+    row_split = markers$cell_type
+  )
+
+pdf('CiliatedSecretoryMarkersByAge4Markers.pdf',width = 9,height = 7); myHM; dev.off()
+```
+
+top ciliated/secretory marker ratio (can even be FOXJ1/PAX8) versus age, with three lines indicating BRCA wt, BRCA1, BRCA2;
+you can take average of FOXJ1+CAPS for ciliated, PAX8+ASS1 for secretory and then take the different between average z score
+
+```{r ciliated_v_secRatio_v_age}
+
+# get the mean of the Zscore
+df <- data.frame(mat)
+cil.score <- colMeans(df[c('FOXJ1','CAPS'),])
+sec.score <- colMeans(df[c('PAX8','ASS1'),])
+score <- (cil.score / sec.score)
+score.scaled <- scale(score) 
+
+tmp <- data.frame(
+  SVC = colnames(matScaled),
+  score = score.scaled
+)
+tmp <- dplyr::left_join(tmp,meta)
+
+ggplot(tmp,aes(x=score,y=age_in_years,color=groupBRCA)) + geom_point()
+cor.test(tmp$score,tmp$age_in_years,method='spearman')
+```
+
+# Molecular clock / Age - using predAges variable generated by Svetlana 
+
+horvath age estimate boxplots by three groups; solo-WCGW median/mean boxplots by three groups (and tests with and without adjustment for stroma).
+
+```{r horvath}
+
+meta <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta<- dplyr::filter(m0,useMethylation==TRUE);
+
+meta$`Age at time of surgery`=as.numeric(meta$`Age at time of surgery`)
+meta$PredictedAges=as.numeric(meta$PredictedAges)
+meta$MIR200cAvgBeta=as.numeric(meta$MIR200cAvgBeta)
+meta$solo.wcgw.beta=as.numeric(meta$solo.wcgw.beta)
+meta$MenopauseStatus=ifelse(meta$Postpartum,'Postpartum',meta$ReproductiveStatus)
+meta$MenopauseStatus=factor(meta$MenopauseStatus,levels=c('Pre','Post','Postpartum'))
+
+p0 <- ggplot(meta,aes(x=`Age at time of surgery`,y=PredictedAges)) + geom_point() + theme_bw() + geom_smooth(method='glm') 
+  # scale_color_manual(values=c("#28BBECFF","#FB8022FF",'grey32'))
+# scale_color_viridis_c(option="cividis")
+pdf('Fig6a_Age_vs_MethClockAge.pdf',width=3,height=3); p0; dev.off()
+
+cor.test(x=meta$`Age at time of surgery`,meta$PredictedAges,method='spearman')
+
+p.wcgw <- ggplot(meta,aes(x=groupBRCA,y=solo.wcgw.beta,color=groupBRCA)) +
+      geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+      geom_jitter(size = 1.5, alpha = 1, width = 0.2) +
+      xlab('') +
+      ylab('Mean Solo-WCGW Beta') +
+      theme_bw() +
+      scale_color_manual(values=c('#7df5f5','#38aaac','black')) +
+      theme(legend.position="none") +
+      theme(plot.title = element_text(size=12)) +
+      # theme(axis.text.x = element_text(angle=45,hjust=1)) +
+      ggtitle('')
+pdf('Fig6c_solo.wcgw.beta_by_groupBRCA.pdf',width=3,height=3); p.wcgw; dev.off()
+
+
+p.diff <- ggplot(meta,aes(x=groupBRCA,y=`Age at time of surgery`-PredictedAges,color=groupBRCA)) +
+      geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+      geom_jitter(size = 1.5, alpha = 1, width = 0.1) +
+      xlab('') +
+      ylab('') +
+      theme_bw() +
+      scale_color_manual(values=c('#7df5f5','#38aaac','black')) +
+      theme(legend.position="none") +
+      theme(plot.title = element_text(size=12)) +
+      # theme(axis.text.x = element_text(angle=45,hjust=1)) +
+      ggtitle('')
+pdf('Fig6b_true_minus_clock.pdf',width=3,height=3); p.diff; dev.off()
+
+layout <- 'ab'
+pdf('Fig6b_and_c.pdf',width=5,height=3);
+p.wcgw + p.diff + 
+plot_layout(design = layout)
+dev.off()
+
+## Tests 
+
+library(rstatix)
+meta %>%
+  pairwise_wilcox_test(PredictedAges ~ groupBRCA)
+meta %>%
+  pairwise_wilcox_test(`Age at time of surgery` ~ groupBRCA)
+
+# assign difference betwee clinical age and predicted age 
+meta$age_in_years_minus_predAges <- meta$`Age at time of surgery` - meta$PredictedAges
+meta %>%
+  pairwise_wilcox_test(age_in_years_minus_predAges ~ groupBRCA)
+
+# do an anova
+rstatix::anova_test(meta,age_in_years_minus_predAges ~ groupBRCA)
+
+meta %>%
+  pairwise_wilcox_test(age_in_years_minus_predAges ~ group)
+
+
+meta %>%
+  pairwise_wilcox_test(wcgw.beta ~ groupBRCA)
+
+meta %>%
+  pairwise_wilcox_test(wcgw.beta ~ group)
+
+meta %>%
+  pairwise_wilcox_test(wcgw.beta ~ ReproductiveStatus)
+
+
+# Wilcox tests
+
+```
+
+# EXPRESSION
+
+generic gene
+```{r generic_gene_expr,eval=FALSE}
+
+dim(meta.rna)
+x <- readRDS('cpm_N104.Rds')['ENSG00000139970',meta.rna$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta.rna) 
+
+
+pB1 <- x %>%
+  ggplot(aes(x=groupBRCA,y=CPM)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 1, alpha = 1, width = 0.1) +
+  theme_minimal() +
+  xlab('BRCA germline') + ggtitle('') + ylim(c(0,30))
+
+pB1
+
+library(rstatix)
+x %>%
+  pairwise_wilcox_test(CPM ~ groupBRCA)
+
+# pdf(file='BRCA1_cpm_by_BRCAgroup.pdf',height = 3,width = 3);pB1;dev.off()
+
+```
+
+```{r plot_disrt_all_gene_expr,eval=FALSE}
+
+meta.rna.use <- dplyr::filter(meta,sequencedRNA==TRUE & Pilot!='D') # !!!!
+
+
+## first I am interested in getting the expression of other genes
+cpm.df$ENSEMBL <- rownames(cpm.df)
+xTidy <- cpm.df[,c('ENSEMBL',meta.rna.use$SVC)] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = matches('^SVC')) %>%
+ dplyr::left_join(y=meta[,c('SVC','groupBRCA')]) 
+head(xTidy)
+
+length(unique(xTidy$ENSEMBL))
+# get BRCA1 and BRCA2 expression averages
+tmp <- filter(xTidy,ENSEMBL=='ENSG00000012048') %>% group_by(groupBRCA) %>% summarize(medCPM=median(CPM)) # BRCA1
+tmp2 <- filter(xTidy,ENSEMBL=='ENSG00000139618') %>% group_by(groupBRCA) %>% summarize(medCPM=median(CPM)) # BRCA2
+
+xTidy %>% ggplot(aes(group=groupBRCA,x=CPM,color=groupBRCA)) + geom_density(fill=NA) + xlim(c(0,100)) + theme_minimal() + scale_color_manual(values=viridis::mako(n=4)[1:3]) + theme(legend.position='none') + geom_vline(xintercept=12.5,col='red') + geom_vline(xintercept = 16.5,col='blue') + ggtitle(paste0('N=',length(unique(xTidy$ENSEMBL)),' genes'))
+
+```
+
+## BRCA1
+
+```{r BRCA1_expr,eval=FALSE}
+
+x <- readRDS('cpm_N104.Rds')['',meta.rna$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta) 
+
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+x$groupBRCA <- factor(x$groupBRCA,levels=levels(meta$groupBRCA))
+pB1 <- x %>%
+  ggplot(aes(x=groupBRCA,y=CPM)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=ReproductiveStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) +
+  xlab('BRCA germline') + ggtitle('BRCA1 expression (HGNC:1100):') + ylim(c(0,30)) + theme(legend.position = 'none') 
+
+library(rstatix)
+x %>%
+  anova_test(CPM ~ groupBRCA)
+
+cor.test(x$`Age at time of surgery`,x$CPM,method='spearman')
+pXX2 <- ggplot(x,aes(x=`Age at time of surgery`,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'BRCA1',subtitle='rho=-0.27; Pval=0.0075') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+
+
+cor.test(x$MIR200cAvgBeta,x$CPM,method='spearman')
+vmdwe <- ggplot(x,aes(x=MIR200cAvgBeta,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'BRCA1',subtitle='rho=-0.35; Pval=0.0006001') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+
+# pdf(file='BRCA1_cpm_by_BRCAgroup.pdf',height = 3,width = 3);pB1;dev.off()
+pdf(file='BRCA1_cpm_vs_age.pdf',height = 3,width = 3);pXX2;dev.off()
+pdf(file='BRCA1_cpm_vs_MIR200C.pdf',height = 3,width = 3);vmdwe;dev.off()
+
+```
+
+## BRCA2 
+
+```{r BRCA2_expr,eval=FALSE}
+
+x <- readRDS('cpm_N104.Rds')['ENSG00000139618',meta.rna$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta) 
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+x$groupBRCA <- factor(x$groupBRCA,levels=levels(meta$groupBRCA))
+pB2 <- x %>%
+  ggplot(aes(x=groupBRCA,y=CPM)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=ReproductiveStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) +
+  xlab('BRCA germline') + ggtitle('BRCA2 expression (HGNC:1101)') + ylim(c(0,30)) +
+  theme(legend.position = 'none') 
+
+library(rstatix)
+x %>%
+  pairwise_wilcox_test(CPM ~ groupBRCA)
+
+cor.test(x$`Age at time of surgery`,x$CPM,method='spearman')
+pA2 <- ggplot(x,aes(x=`Age at time of surgery`,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'BRCA2',subtitle='rho=0.002; Pval=0.9817') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+
+cor.test(x$MIR200cAvgBeta,x$CPM,method='spearman')
+p9 <- ggplot(x,aes(x=MIR200cAvgBeta,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'BRCA2',subtitle='rho=-0.32; Pval=0.00198') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+
+
+pdf(file='BRCA2_cpm_by_BRCAgroup.pdf',height = 3,width = 3);pB2;dev.off()
+pdf(file='BRCA2_cpm_vs_age.pdf',height = 3,width = 3);pA2;dev.off()
+pdf(file='BRCA2_cpm_vs_MIR200C.pdf',height = 3,width = 3);p9;dev.off()
+
+```
+
+## WT1 
+
+```{r WT1_expr,eval=FALSE}
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE); dim(meta00)
+x <- readRDS('cpm_N104.Rds')['ENSG00000184937',meta00$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta00) 
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+x$groupBRCA <- factor(x$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+x$MIR200cAvgBeta <- as.numeric(x$MIR200cAvgBeta)
+pWT1 <- x %>%
+  ggplot(aes(x=groupBRCA,y=CPM)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=ReproductiveStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) +
+  xlab('BRCA germline') + ggtitle('WT1 expression') + 
+  # ylim(c(0,30)) +
+  theme(legend.position = 'none') 
+pWT1
+
+p9WT1 <- ggplot(x,aes(x=MIR200cAvgBeta,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'WT1',subtitle='') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+p9WT1
+
+pAgeWT1 <- ggplot(x,aes(x=`Age at time of surgery`,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'WT1',subtitle='') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+pAgeWT1
+
+cor.test(x$`Age at time of surgery`,x$CPM,method='spearman')
+cor.test(x$MIR200cAvgBeta,x$CPM,method='spearman')
+
+pdf(file='WT1_expression_by_groupBRCA.pdf',height = 3,width = 3);pWT1;dev.off()
+
+```
+
+## BCAR3 
+
+```{r BCAR3_expr,eval=FALSE}
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE); dim(meta00)
+x <- readRDS('cpm_N104.Rds')['ENSG00000137936',meta00$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta00) 
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+x$groupBRCA <- factor(x$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+x$MIR200cAvgBeta <- as.numeric(x$MIR200cAvgBeta)
+x$MenopauseStatus = factor(ifelse(x$Postpartum,'Postpartum',as.character(x$ReproductiveStatus)),levels=c('Pre','Post','Postpartum'))
+pWT1 <- x %>%
+  ggplot(aes(x=MenopauseStatus,y=log2(CPM))) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=MenopauseStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF","#545454")) +
+  xlab('') + ggtitle('BCAR3 expression') + 
+  # ylim(c(0,30)) +
+  theme(legend.position = 'none') 
+pWT1
+
+p9WT1 <- ggplot(x,aes(x=MIR200cAvgBeta,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'WT1',subtitle='') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+p9WT1
+
+pAgeWT1 <- ggplot(x,aes(x=`Age at time of surgery`,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'WT1',subtitle='') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+pAgeWT1
+
+cor.test(x$`Age at time of surgery`,x$CPM,method='spearman')
+cor.test(x$MIR200cAvgBeta,x$CPM,method='spearman')
+
+pdf(file='BCAR3_expression_by_MenopauseStatus.pdf',height = 3,width = 3);pWT1;dev.off()
+
+# ANOVA test
+x$log2_CPM <- log2(x$CPM)
+rstatix::anova_test(x,log2_CPM ~ MenopauseStatus)
+```
+
+## COA8 
+
+```{r COA8_expr,eval=FALSE}
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE); dim(meta00)
+x <- readRDS('cpm_N104.Rds')['ENSG00000256053',meta00$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta00) 
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+x$groupBRCA <- factor(x$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+x$MIR200cAvgBeta <- as.numeric(x$MIR200cAvgBeta)
+x$MenopauseStatus = factor(ifelse(x$Postpartum,'Postpartum',as.character(x$ReproductiveStatus)),levels=c('Pre','Post','Postpartum'))
+pWT1 <- x %>%
+  ggplot(aes(x=MenopauseStatus,y=log2(CPM))) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=MenopauseStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF","#545454")) +
+  xlab('') + ggtitle('COA8 expression') + 
+  # ylim(c(0,30)) +
+  theme(legend.position = 'none') 
+pWT1
+
+p9WT1 <- ggplot(x,aes(x=MIR200cAvgBeta,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'WT1',subtitle='') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+p9WT1
+
+pAgeWT1 <- ggplot(x,aes(x=`Age at time of surgery`,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'WT1',subtitle='') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+pAgeWT1
+
+cor.test(x$`Age at time of surgery`,x$CPM,method='spearman')
+cor.test(x$MIR200cAvgBeta,x$CPM,method='spearman')
+
+pdf(file='COA8_expression_by_MenopauseStatus.pdf',height = 3,width = 3);pWT1;dev.off()
+# ANOVA test
+x$log2_CPM <- log2(x$CPM)
+rstatix::anova_test(x,log2_CPM ~ MenopauseStatus)
+```
+
+## SQLE
+SQLE is A top deg in pre v post by FDR with pos fold change
+
+```{r SQLE_expr,eval=FALSE}
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE); dim(meta00)
+x <- readRDS('cpm_N104.Rds')['ENSG00000104549',meta00$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta00) 
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+x$groupBRCA <- factor(x$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+x$MIR200cAvgBeta <- as.numeric(x$MIR200cAvgBeta)
+x$MenopauseStatus = factor(ifelse(x$Postpartum,'Postpartum',as.character(x$ReproductiveStatus)),levels=c('Pre','Post','Postpartum'))
+pWT1 <- x %>%
+  ggplot(aes(x=MenopauseStatus,y=log2(CPM))) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=MenopauseStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF","#545454")) +
+  xlab('') + ggtitle('SQLE expression') + 
+  # ylim(c(0,30)) +
+  theme(legend.position = 'none') 
+pWT1
+
+p9WT1 <- ggplot(x,aes(x=MIR200cAvgBeta,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'WT1',subtitle='') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+p9WT1
+
+pAgeWT1 <- ggplot(x,aes(x=`Age at time of surgery`,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'WT1',subtitle='') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+pAgeWT1
+
+cor.test(x$`Age at time of surgery`,x$CPM,method='spearman')
+cor.test(x$MIR200cAvgBeta,x$CPM,method='spearman')
+
+pdf(file='SQLE_expression_by_MenopauseStatus.pdf',height = 3,width = 3);pWT1;dev.off()
+
+# ANOVA test
+x$log2_CPM <- log2(x$CPM)
+rstatix::anova_test(x,log2_CPM ~ MenopauseStatus)
+```
+
+## KIAA1841
+KIAA1841 is the top downregulated deg in pre v post by FDR 
+
+```{r KIAA1841_expr,eval=FALSE}
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE); dim(meta00)
+x <- readRDS('cpm_N104.Rds')['ENSG00000162929',meta00$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta00) 
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+x$groupBRCA <- factor(x$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+x$MIR200cAvgBeta <- as.numeric(x$MIR200cAvgBeta)
+x$MenopauseStatus = factor(ifelse(x$Postpartum,'Postpartum',as.character(x$ReproductiveStatus)),levels=c('Pre','Post','Postpartum'))
+pWT1 <- x %>%
+  ggplot(aes(x=MenopauseStatus,y=log2(CPM))) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=MenopauseStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF","#545454")) +
+  xlab('') + ggtitle('KIAA1841 expression') + 
+  # ylim(c(0,30)) +
+  theme(legend.position = 'none') 
+pWT1
+
+p9WT1 <- ggplot(x,aes(x=MIR200cAvgBeta,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'WT1',subtitle='') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+p9WT1
+
+pAgeWT1 <- ggplot(x,aes(x=`Age at time of surgery`,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'WT1',subtitle='') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+pAgeWT1
+
+cor.test(x$`Age at time of surgery`,x$CPM,method='spearman')
+cor.test(x$MIR200cAvgBeta,x$CPM,method='spearman')
+
+pdf(file='KIAA1841_expression_by_MenopauseStatus.pdf',height = 3,width = 3);pWT1;dev.off()
+
+
+# ANOVA test
+x$log2_CPM <- log2(x$CPM)
+rstatix::anova_test(x,log2_CPM ~ MenopauseStatus)
+```
+
+## TRNP1
+TRNP1 is the top downregulated deg in pre v post by FDR 
+
+```{r TRNP1_expr,eval=FALSE}
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE); dim(meta00)
+x <- readRDS('cpm_N104.Rds')['ENSG00000253368',meta00$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta00) 
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+x$groupBRCA <- factor(x$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+x$MIR200cAvgBeta <- as.numeric(x$MIR200cAvgBeta)
+x$MenopauseStatus = factor(ifelse(x$Postpartum,'Postpartum',as.character(x$ReproductiveStatus)),levels=c('Pre','Post','Postpartum'))
+pWT1 <- x %>%
+  ggplot(aes(x=MenopauseStatus,y=log2(CPM))) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=MenopauseStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF","#545454")) +
+  xlab('') + ggtitle('TRNP1 expression') + 
+  # ylim(c(0,30)) +
+  theme(legend.position = 'none') 
+pWT1
+
+p9WT1 <- ggplot(x,aes(x=MIR200cAvgBeta,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'WT1',subtitle='') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+p9WT1
+
+pAgeWT1 <- ggplot(x,aes(x=`Age at time of surgery`,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'WT1',subtitle='') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+pAgeWT1
+
+cor.test(x$`Age at time of surgery`,x$CPM,method='spearman')
+cor.test(x$MIR200cAvgBeta,x$CPM,method='spearman')
+
+pdf(file='TRNP1_expression_by_MenopauseStatus.pdf',height = 3,width = 3);pWT1;dev.off()
+
+# ANOVA test
+x$log2_CPM <- log2(x$CPM)
+rstatix::anova_test(x,log2_CPM ~ MenopauseStatus)
+```
+
+## STING1
+
+```{r STING_expr,eval=FALSE}
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE); dim(meta00)
+x <- readRDS('cpm_N104.Rds')['ENSG00000184584',meta00$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta00) 
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+x$groupBRCA <- factor(x$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+x$MIR200cAvgBeta <- as.numeric(x$MIR200cAvgBeta)
+x$MenopauseStatus = factor(ifelse(x$Postpartum,'Postpartum',as.character(x$ReproductiveStatus)),levels=c('Pre','Post','Postpartum'))
+pWT1 <- x %>%
+  ggplot(aes(x=MenopauseStatus,y=log2(CPM))) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=MenopauseStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF","#545454")) +
+  xlab('') + ggtitle('STING1 expression') + 
+  # ylim(c(0,30)) +
+  theme(legend.position = 'none') 
+pWT1
+
+p9WT1 <- ggplot(x,aes(x=MIR200cAvgBeta,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'WT1',subtitle='') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+p9WT1
+
+pAgeWT1 <- ggplot(x,aes(x=`Age at time of surgery`,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'WT1',subtitle='') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+pAgeWT1
+
+cor.test(x$`Age at time of surgery`,x$CPM,method='spearman')
+cor.test(x$MIR200cAvgBeta,x$CPM,method='spearman')
+
+pdf(file='STING1_expression_by_MenopauseStatus.pdf',height = 3,width = 3);pWT1;dev.off()
+
+```
+
+## KDM1B
+KDM1B is the second top deg in pre v post by FDR with pos fold change. the top deg only has 5 samples expressing it and doesn't look real; probably should've done more filtering on RNA, blame adam's group not me.
+
+```{r KDM1B_expr,eval=FALSE}
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE); dim(meta00)
+x <- readRDS('cpm_N104.Rds')['ENSG00000165097',meta00$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta00) 
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+x$groupBRCA <- factor(x$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+x$MIR200cAvgBeta <- as.numeric(x$MIR200cAvgBeta)
+x$MenopauseStatus = factor(ifelse(x$Postpartum,'Postpartum',as.character(x$ReproductiveStatus)),levels=c('Pre','Post','Postpartum'))
+pWT1 <- x %>%
+  ggplot(aes(x=MenopauseStatus,y=log2(CPM))) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=MenopauseStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF","#545454")) +
+  xlab('') + ggtitle('KDM1B expression') + 
+  # ylim(c(0,30)) +
+  theme(legend.position = 'none') 
+pWT1
+
+p9WT1 <- ggplot(x,aes(x=MIR200cAvgBeta,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'WT1',subtitle='') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+p9WT1
+
+pAgeWT1 <- ggplot(x,aes(x=`Age at time of surgery`,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'WT1',subtitle='') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw() + theme(legend.position = 'none') 
+pAgeWT1
+
+cor.test(x$`Age at time of surgery`,x$CPM,method='spearman')
+cor.test(x$MIR200cAvgBeta,x$CPM,method='spearman')
+
+pdf(file='KDM1B_expression_by_MenopauseStatus.pdf',height = 3,width = 3);pWT1;dev.off()
+
+# ANOVA test
+x$log2_CPM <- log2(x$CPM)
+rstatix::anova_test(x,log2_CPM ~ MenopauseStatus)
+
+```
+
+## MUC16 -> CA125  
+Hi Ian,
+
+Are you able to extract the CA125 expression levels in the FT from Black versus White women?
+There is data coming out suggesting that Black patients do not elaborate as much CA125 in the cancer setting and that CA125 may not be useful in that population. I wonder whether the Mullerian tissue (reproductive tract) of Black patients expresses less CA125 normally.
+
+```{r MUC16_expr,eval=FALSE}
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE); dim(meta00)
+x <- readRDS('cpm_N104.Rds')['ENSG00000181143',meta00$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta00) 
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+x$groupBRCA <- factor(x$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+x$MIR200cAvgBeta <- as.numeric(x$MIR200cAvgBeta)
+x$MenopauseStatus = factor(ifelse(x$Postpartum,'Postpartum',as.character(x$ReproductiveStatus)),levels=c('Pre','Post','Postpartum'))
+
+pMUC16_meno <- x %>%
+  ggplot(aes(x=MenopauseStatus,y=log2(CPM))) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=MenopauseStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF","#545454")) +
+  xlab('') + ggtitle('MUC16 expression') + 
+  # ylim(c(0,30)) +
+  theme(legend.position = 'none') 
+
+
+pMUC16_race <- x %>%
+  ggplot(aes(x=Race,y=log2(CPM))) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=MenopauseStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF","#545454")) +
+  xlab('') + ggtitle('MUC16 expression') # + 
+  # ylim(c(0,30)) +
+  # theme(legend.position = 'none') 
+pMUC16_race
+
+
+# pdf(file='MUC16_expression_by_MenopauseStatus.pdf',height = 3,width = 3);pMUC16_meno;dev.off()
+pdf(file='MUC16_expression_by_Race.pdf',height = 6,width = 6);pMUC16_race;dev.off()
+
+```
+
+## WFDC2 -> HE4
+Interesting. So, by bulk RNA-Seq there are no differences in CA125 expression in the FT epithelium, right? Please remind me, how many samples in each group?
+Could the same be done for HE4 (the other FDA approved biomarker. Gene name: WFDC2) and the LINE-1 retrotransposable element ORF1p?
+
+```{r WFDC2_expr,eval=FALSE}
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE); dim(meta00)
+x <- readRDS('cpm_N104.Rds')['ENSG00000101443',meta00$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta00) 
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+x$groupBRCA <- factor(x$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+x$MIR200cAvgBeta <- as.numeric(x$MIR200cAvgBeta)
+x$MenopauseStatus = factor(ifelse(x$Postpartum,'Postpartum',as.character(x$ReproductiveStatus)),levels=c('Pre','Post','Postpartum'))
+table(x$Race)
+pMUC16_meno <- x %>%
+  ggplot(aes(x=MenopauseStatus,y=log2(CPM))) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=MenopauseStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF","#545454")) +
+  xlab('') + ggtitle('WFDC2 expression') + 
+  # ylim(c(0,30)) +
+  theme(legend.position = 'none') 
+
+
+pMUC16_race <- x %>%
+  ggplot(aes(x=Race,y=log2(CPM))) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=MenopauseStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF","#545454")) +
+  xlab('') + ggtitle('MUC16 expression') # + 
+  # ylim(c(0,30)) +
+  # theme(legend.position = 'none') 
+pMUC16_race
+
+
+# pdf(file='MUC16_expression_by_MenopauseStatus.pdf',height = 3,width = 3);pMUC16_meno;dev.off()
+pdf(file='WFDC2_expression_by_Race.pdf',height = 6,width = 6);pMUC16_race;dev.off()
+
+```
+
+## ORF1p
+
+```{r ORF1p_expr,eval=FALSE}
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE); dim(meta00)
+x <- readRDS('cpm_N104.Rds')['ENSG00000101443',meta00$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta00) 
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+x$groupBRCA <- factor(x$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+x$MIR200cAvgBeta <- as.numeric(x$MIR200cAvgBeta)
+x$MenopauseStatus = factor(ifelse(x$Postpartum,'Postpartum',as.character(x$ReproductiveStatus)),levels=c('Pre','Post','Postpartum'))
+
+pMUC16_meno <- x %>%
+  ggplot(aes(x=MenopauseStatus,y=log2(CPM))) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=MenopauseStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF","#545454")) +
+  xlab('') + ggtitle('WFDC2 expression') + 
+  # ylim(c(0,30)) +
+  theme(legend.position = 'none') 
+
+
+pMUC16_race <- x %>%
+  ggplot(aes(x=Race,y=log2(CPM))) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=MenopauseStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF","#545454")) +
+  xlab('') + ggtitle('MUC16 expression') # + 
+  # ylim(c(0,30)) +
+  # theme(legend.position = 'none') 
+pMUC16_race
+
+
+# pdf(file='MUC16_expression_by_MenopauseStatus.pdf',height = 3,width = 3);pMUC16_meno;dev.off()
+pdf(file='WFDC2_expression_by_Race.pdf',height = 6,width = 6);pMUC16_race;dev.off()
+
+```
+
+## AID Expression  - Gene: AICDA ENSG00000111732
+
+main conclusion of Bartlett paper
+
+```{r AID_expr,eval=FALSE}
+
+x <- readRDS('cpm_N104.Rds')['ENSG00000111732',meta$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta) 
+
+pB2 <- x %>%
+  ggplot(aes(x=groupBRCA,y=CPM)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 1, alpha = 1, width = 0.1) +
+  theme_minimal() +
+  xlab('BRCA germline') + ggtitle('AID aka AICDA expression') #+ ylim(c(0,30))
+
+library(rstatix)
+x %>%
+  pairwise_wilcox_test(CPM ~ groupBRCA)
+
+pdf(file='AID_cpm_by_BRCAgroup.pdf',height = 3,width = 3);pB2;dev.off()
+
+
+pC2 <- x %>%
+  ggplot(aes(x=MIR200cAvgBeta,y=CPM))+#,color=ReproductiveStatus)) + 
+  geom_point() +
+  theme_minimal() +
+  geom_smooth() +
+  xlab('Stromal Fraction') + ggtitle('AID') #+ ylim(c(0,30))
+
+
+cor.test(x$MIR200cAvgBeta,x$CPM,method='spearman') 
+pdf(file='AID_mir200c_v_cpm.pdf',height = 3,width = 3);pC2;dev.off()
+
+```
+
+## HOXC4 Expression  - ENSG00000198353
+
+main conclusion of Bartlett paper
+
+```{r HOXC4_expr,eval=FALSE}
+
+x <- readRDS('cpm_N104.Rds')['ENSG00000198353',meta$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta) 
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+pB2 <- x %>%
+  ggplot(aes(x=groupBRCA,y=CPM))+#,color=ReproductiveStatus)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 1, alpha = 1, width = 0.1) +
+  theme_minimal() +
+  xlab('BRCA germline') + ggtitle('HOXC4 expression') #+ ylim(c(0,30))
+pB2
+library(rstatix)
+x %>%
+  pairwise_wilcox_test(CPM ~ groupBRCA)
+
+pB3 <- x %>%
+  ggplot(aes(x=groupBRCA,y=CPM,color=ReproductiveStatus)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 1, alpha = 1, width = 0.1) +
+  theme_minimal() +
+  xlab('BRCA germline') + ggtitle('HOXC4 expression') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) 
+pB3
+
+pC2 <-  x %>%
+  ggplot(aes(x=MIR200cAvgBeta,y=CPM))+#,color=ReproductiveStatus)) + 
+  geom_point() +
+  theme_void() +
+  geom_smooth() +
+  xlab('Stromal Fraction') + ggtitle('HOXC4') #+ ylim(c(0,30))
+
+
+cor.test(x$MIR200cAvgBeta,x$CPM,method='spearman') 
+pdf(file='HOXC4_mir200c_v_cpm.pdf',height = 3,width = 3);pC2;dev.off()
+
+```
+
+## PAR2 expression
+
+main conclusion of Jeetendra Kumar Nag 2024 paper
+
+https://useast.ensembl.org/Homo_sapiens/Gene/Summary?g=ENSG00000164251;r=5:76818933-76835315
+
+Gene is F2RL1
+
+```{r PAR2_expr,eval=FALSE}
+
+x <- readRDS('cpm_N104.Rds')['ENSG00000164251',meta.rna$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta.rna) 
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+pB2 <- x %>%
+  ggplot(aes(x=groupBRCA,y=CPM))+#,color=ReproductiveStatus)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 1, alpha = 1, width = 0.1) +
+  theme_minimal() +
+  xlab('BRCA germline') + ggtitle('PAR2 aka F2RL1 (ENSG00000164251) expression') #+ ylim(c(0,30))
+pB2
+library(rstatix)
+x %>%
+  pairwise_wilcox_test(CPM ~ groupBRCA)
+
+pB3 <- x %>%
+  ggplot(aes(x=ReproductiveStatus,y=CPM,color=ReproductiveStatus)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 1, alpha = 1, width = 0.1) +
+  theme_minimal() +
+  xlab('BRCA germline') + ggtitle('PAR2 aka F2RL1 (ENSG00000164251) expression') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) 
+pB3
+
+pB4 <- x %>%
+  ggplot(aes(x=`Age at time of surgery`,y=CPM,color=ReproductiveStatus)) + 
+  geom_point() +
+  theme_minimal() +
+  xlab('BRCA germline') + ggtitle('PAR2 aka F2RL1 (ENSG00000164251) expression') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) 
+pB4
+
+
+
+
+pdf(file='PAR2_cpm_by_BRCAgroup.pdf',height = 3,width = 5);pB2;dev.off()
+pdf(file='PAR2_cpm_by_ReproductiveStatus.pdf',height = 3,width = 5);pB3;dev.off()
+pdf(file='PAR2_v_Age.pdf',height = 3,width = 5);pB4;dev.off()
+
+```
+
+## MMD expression - from top DMR  - ENSG00000108960
+
+```{r MMD_expr,eval=FALSE}
+
+x <- readRDS('cpm_N104.Rds')['ENSG00000108960',meta.rna$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta.rna) 
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+x$group = ifelse(x$groupBRCA=='NON-BRCA','NON-BRCA','BRCAmut')
+pB2 <- x %>%
+  ggplot(aes(x=group,y=CPM))+#,color=ReproductiveStatus)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 1, alpha = 1, width = 0.1) +
+  theme_minimal() +
+  xlab('') + ggtitle('') #+ ylim(c(0,30))
+pB2
+library(rstatix)
+x %>%
+  pairwise_wilcox_test(CPM ~ groupBRCA)
+
+
+pb4 <- ggplot(x,aes(x=`Age at time of surgery`,y=CPM)) + geom_point() + theme_classic() 
+cor.test(x$`Age at time of surgery`,x$CPM,method='spearman')
+cor.test(x$`Age at time of surgery`,x$CPM,method='pearson')
+
+
+# now get the methylation!
+# readRDS('')
+
+pB3 <- x %>%
+  ggplot(aes(x=groupBRCA,y=CPM,color=ReproductiveStatus)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 1, alpha = 1, width = 0.1) +
+  theme_minimal() +
+  xlab('BRCA germline') + ggtitle('HOXC4 expression') +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) 
+pB3
+
+
+pdf(file='MMD_cpm_by_BRCAgroup.pdf',height = 3,width = 3);pB2;dev.off()
+pdf(file='MMD_cpm_vs_age.pdf',height = 3,width = 3);pb4;dev.off()
+
+```
+
+## DEGs identified in this study
+
+Three of the BRCAmut vs. NON-BRCA DEGs look "real". These are RNLS, SRGAP1, and PTPRQ
+```{r DEGs_RNLS,eval=FALSE}
+genes <- data.frame(
+  ENSEMBL = c('ENSG00000184719','ENSG00000196935','ENSG00000139304','ENSG00000227521','ENSG00000108950','ENSG00000101336','ENSG00000012048','ENSG00000139618'),
+  SYMBOL = c('RNLS','SRGAP1','PTPRQ','TUBB4BP8','FAM20A','HCK','BRCA1','BRCA2')
+)
+						
+x <- readRDS('cpm_N104.Rds')[genes$ENSEMBL,meta.rna$SVC] 
+x$ENSEMBL <- rownames(x) 
+x$SYMBOL <- genes$SYMBOL
+x <- x %>% tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = -matches(c('ENSEMBL','SYMBOL'))) %>%
+  dplyr::left_join(y=meta.rna) 
+
+x$SYMBOL <- factor(x$SYMBOL,levels=genes$SYMBOL)
+
+pB2 <- x %>%
+  ggplot(aes(x=groupBRCA,y=CPM)) + 
+  geom_boxplot() +
+  # geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 1, alpha = 1, width = 0.1) +
+  theme_minimal() +
+  # scale_color_manual(values=c("#FB8022FF","#28BBECFF")) +
+  theme_bw() +
+  xlab('') + ylab('') + theme(legend.position = 'none') + 
+  facet_wrap(~SYMBOL,scales='free',ncol = 3)
+
+pB2
+
+pdf(file='cpm_by_groupBRCA.pdf',height = 5,width = 5);pB2;dev.off()
+
+```
+
+
+
+## Epithelial/Stroma markers
+
+```{r RBMS1_Expr}
+
+# ENSG00000153250
+x <- readRDS('cpm_N104.Rds')['ENSG00000153250',meta.rna$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta) 
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+x$groupBRCA <- factor(x$groupBRCA,levels=levels(meta$groupBRCA))
+pB2 <- x %>%
+  ggplot(aes(x=groupBRCA,y=CPM)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=ReproductiveStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) +
+  xlab('BRCA germline') + ggtitle('BRCA2 expression (HGNC:1101)') + ylim(c(0,30)) +
+  theme(legend.position = 'none') 
+
+library(rstatix)
+x %>%
+  pairwise_wilcox_test(CPM ~ groupBRCA)
+
+cor.test(x$`Age at time of surgery`,x$CPM,method='spearman')
+
+ggplot(x,aes(x=`Age at time of surgery`,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'RBMS1',subtitle='rho=0.29; Pval=0.00368') + scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw()
+
+cor.test(x$MIR200cAvgBeta,x$CPM,method='spearman')
+ggplot(x,aes(x=MIR200cAvgBeta,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'RBMS1',subtitle='rho=0.002; Pval=0.9817') + scale_color_manual(values=c("#28BBECFF","#FB8022FF"))
+
+
+# pdf(file='BRCA2_cpm_by_BRCAgroup.pdf',height = 3,width = 3);pB2;dev.off()
+
+
+```
+
+this one positively correlates so well with MIR200C beta
+```{r ASAP1_Expr}
+
+# ENSG00000153317
+x <- readRDS('cpm_N104.Rds')['ENSG00000153317',meta.rna$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta) 
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+x$groupBRCA <- factor(x$groupBRCA,levels=levels(meta$groupBRCA))
+x$group <- factor(ifelse(x$groupBRCA=='NON-BRCA','NON-BRCA','BRCAmut'),levels=c('NON-BRCA','BRCAmut'))
+pB2 <- x %>%
+  ggplot(aes(x=group,y=CPM)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=ReproductiveStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) +
+  xlab('BRCA germline') + ggtitle('ASAP1') +
+  theme(legend.position = 'none') 
+
+library(rstatix)
+x %>%
+  pairwise_wilcox_test(CPM ~ groupBRCA)
+
+cor.test(x$`Age at time of surgery`,x$CPM,method='spearman')
+
+ggplot(x,aes(x=`Age at time of surgery`,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'ASAP1',subtitle='rho=0.29; Pval=0.00368') + scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw()
+
+cor.test(x$MIR200cAvgBeta,x$CPM,method='spearman')
+ggplot(x,aes(x=MIR200cAvgBeta,y=log2(CPM),color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'ASAP1',subtitle='rho=0.69; Pval=2.045e-14') + scale_color_manual(values=c("#28BBECFF","#FB8022FF"))
+
+
+# pdf(file='BRCA2_cpm_by_BRCAgroup.pdf',height = 3,width = 3);pB2;dev.off()
+pB2
+rstatix::wilcox_test(x,CPM~group)
+```
+
+```{r MARVELD2_Expr}
+
+# ENSG00000152939
+x <- readRDS('cpm_N104.Rds')['ENSG00000152939',meta.rna$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta) 
+x$ReproductiveStatus = factor(x$ReproductiveStatus,levels=c('Pre','Post'))
+x$groupBRCA <- factor(x$groupBRCA,levels=levels(meta$groupBRCA))
+pB2 <- x %>%
+  ggplot(aes(x=groupBRCA,y=CPM)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=ReproductiveStatus)) +
+  theme_minimal() +
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) +
+  xlab('BRCA germline') + ggtitle('BRCA2 expression (HGNC:1101)') + ylim(c(0,30)) +
+  theme(legend.position = 'none') 
+
+library(rstatix)
+x %>%
+  pairwise_wilcox_test(CPM ~ groupBRCA)
+
+cor.test(x$`Age at time of surgery`,x$CPM,method='spearman')
+
+ggplot(x,aes(x=`Age at time of surgery`,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'RBMS1',subtitle='rho=0.29; Pval=0.00368') + scale_color_manual(values=c("#28BBECFF","#FB8022FF")) + theme_bw()
+
+cor.test(x$MIR200cAvgBeta,x$CPM,method='spearman')
+ggplot(x,aes(x=MIR200cAvgBeta,y=CPM,color=ReproductiveStatus)) + geom_point() + ggtitle(label = 'MARVELD2',subtitle='rho=-0.74; Pval=2.2e-16') + scale_color_manual(values=c("#28BBECFF","#FB8022FF"))
+
+
+# pdf(file='BRCA2_cpm_by_BRCAgroup.pdf',height = 3,width = 3);pB2;dev.off()
+
+
+```
+
+
+# Table 1
+
+```{r tableulate_values}
+
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+dim(m0)
+
+
+tmp <- m0 %>% dplyr::filter(useMethylation!=FALSE & useRNA_2!=FALSE & useProteomics!=FALSE); dim(tmp)
+
+stopifnot(nrow(tmp)==92)
+#####################################
+# age by group
+tmp %>%
+dplyr::group_by(groupBRCA) %>%
+  summarize(median_age=median(`Age at time of surgery`,na.rm=TRUE),age_sd=sd(`Age at time of surgery`,na.rm=TRUE))
+
+tmp %>% rstatix::pairwise_wilcox_test(`Age at time of surgery` ~ groupBRCA)
+tmp %>% rstatix::anova_test(`Age at time of surgery` ~ groupBRCA)
+
+
+######################################
+# pre/post menopause status
+tmp$repro <- ifelse(tmp$Postpartum,'Postpartum',tmp$ReproductiveStatus)
+table(tmp$repro,tmp$groupBRCA)
+
+###################################### * only samples with METHYLATION !!! tehrefore using meta not tmp
+# stromal composition
+tmp %>%
+dplyr::group_by(groupBRCA) %>% summarize(strom_comp=median(as.numeric(MIR200cAvgBeta),na.rm=TRUE),strom_sd=sd(MIR200cAvgBeta,na.rm=TRUE))
+
+meta %>% rstatix::anova_test(MIR200cAvgBeta ~ groupBRCA)
+
+
+###################################### 
+# Race
+table(tmp$groupBRCA,tmp$Race)
+
+#######################################
+# reason for surgery
+table(tmp$`Reason for surgery 2`,tmp$groupBRCA)
+
+```
+
+
+# Estrogen/Progesterone Plasma Assay Data
+
+C-21-51 does not have concentration estr+prog
+C-21-79 does not have concentration prog -- estr is VERY high
+C-21-89 does not have concentration prog
+
+bEstradiol & Progesterone are not correlated
+neither is correlated with DaysSinceLMP
+neither is correlated with Age at time of surgery
+
+```{r }
+
+# read in the data & remove the controls/blanks (sample=='')
+estr <- readxl::read_excel('../Copy of 23p-030_17 beta Estradiol_20230912_Excel Report_ZYH.xlsx',sheet='data'); estr <- dplyr::filter(estr,`Patient ID`!=''); dim(estr)
+prog <- readxl::read_excel('../Copy of 23p-030_Progesterone_20230912_Excel Report_ZYH.xlsx',sheet='data'); prog <- dplyr::filter(prog,`Patient ID`!=''); dim(estr)
+
+# check that those samples exist
+table(estr$`Patient ID`%in%master.meta$`Patient ID`)
+table(prog$`Patient ID`%in%master.meta$`Patient ID`)
+
+# if some samples are missing find which ones
+
+##########
+# C-21-95 does not have methylation data due to low coverage
+#########
+# estr$`Patient ID`[which(! estr$`Patient ID` %in% meta$`Patient ID`)]
+# prog$`Patient ID`[which(! prog$`Patient ID` %in% meta$`Patient ID`)]
+
+# reformat the data to numeric
+estr$`Average conc` <- round(as.numeric(estr$`Average conc`),2)
+prog$`Average conc` <- round(as.numeric(prog$`Average conc`),2)
+
+# all of the measurements are in duplicate, so we collapse to the average
+
+# C-21-51 does not have concentration
+estr2 <- estr %>% dplyr::group_by(`Patient ID`) %>% dplyr::summarise(bEstr_conc=log(mean(`Average conc`,na.rm=TRUE))) %>% dplyr::filter(!is.na(bEstr_conc))
+prog2 <- prog %>% dplyr::group_by(`Patient ID`) %>% dplyr::summarise(Progestr_conc=mean(`Average conc`,na.rm=TRUE)) %>% dplyr::filter(!is.na(Progestr_conc))
+
+tmp0 <- dplyr::left_join(master.meta,estr2);dim(tmp)
+tmp0 <- dplyr::left_join(tmp0,prog2)
+
+
+
+
+
+```
+
+```{r estr_prog_plots01}
+
+tmp <- dplyr::filter(tmp0,!is.na(bEstr_conc) | !is.na(Progestr_conc)); dim(tmp)
+tmp$`Age at time of surgery` <- round(tmp$`Age at time of surgery`,0)
+tmp$DaysSinceLMP <- abs(tmp$DaysSinceLMP)
+
+
+a <- ggplot(tmp,aes(x=DaysSinceLMP,y=log2(Progestr_conc))) + geom_point() + theme_bw() + ylab('log2 Progesterone concentration (pg/ml)') + ggrepel::geom_text_repel(mapping = aes(label=paste(`Patient ID`,Race,`Age at time of surgery`,ReproductiveStatus,LMP_explanation),sep="; "),size=1)
+
+a2 <- a + xlim(c(15,50))
+
+
+b <- ggplot(tmp,aes(x=DaysSinceLMP,y=log2(bEstr_conc))) + geom_point() + theme_bw() + ylab('log2 beta Estradiol concentration (pg/ml)') + ggrepel::geom_text_repel(mapping = aes(label=paste(`Patient ID`,Race,`Age at time of surgery`,ReproductiveStatus,LMP_explanation),sep="; "),size=1)
+
+b2 <- b + xlim(c(15,50))
+
+layout <- 'AB
+CD'
+library(patchwork)
+pdf(file='plasma_assay_figure2.pdf',height = 5,width = 5)
+a + b + a2 + b2 +
+    patchwork::plot_layout(design = layout) 
+dev.off()
+```
+
+```{r estr_prog_plots}
+
+# get tmp from chunk above
+# tmp <- dplyr::filter(meta,!is.na(bEstr_conc) | !is.na(Progestr_conc)); dim(tmp)
+# tmp <- tmp %>% dplyr::filter(DaysSinceLMP>-30)
+# table(tmp$groupBRCA)
+# NON-BRCA    BRCA1    BRCA2 
+       # 4        6        2 
+# table(tmp$DaysSinceLMP)
+# table(tmp$ReproductiveStatus)
+
+a <- ggplot(tmp,aes(x=DaysSinceLMP,y=log2(Progestr_conc))) + geom_point() + theme_bw() + ylab('Progesterone concentration (pg/ml)')
+# + scale_color_manual(values = viridis::turbo(n=5)[c(2,4)])
+b <- ggplot(tmp,aes(x=DaysSinceLMP,y=log2(bEstr_conc))) + geom_point() + theme_bw() + ylab('beta Estradiol concentration (pg/ml)') #    ylim(c(0,100)) # + scale_color_manual(values = viridis::turbo(n=5)[c(2,4)]) + geom_jitter() +
+
+c <- ggplot(tmp,aes(x=`Age at time of surgery`,y=log2(Progestr_conc))) + geom_point() + theme_bw() + ylab('Progesterone concentration (pg/ml)')
+d <- ggplot(tmp,aes(x=`Age at time of surgery`,y=log2(bEstr_conc))) + geom_point() + theme_bw() + ylab('beta Estradiol concentration (pg/ml)')
+
+
+# rstatix::pairwise_wilcox_test(tmp,formula = Progestr_conc ~ groupBRCA)
+e <- tmp %>% ggplot(aes(x=groupBRCA,y=log2(Progestr_conc))) + 
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 1, alpha = 1, width = 0.1) +
+  theme_minimal() + ylab('Progesterone concentration (pg/ml)')
+# rstatix::pairwise_wilcox_test(tmp,formula = bEstr_conc ~ groupBRCA)
+f <- tmp %>% ggplot(aes(x=groupBRCA,y=log2(bEstr_conc))) + 
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 1, alpha = 1, width = 0.1) +
+  theme_minimal() + ylab('beta Estradiol concentration (pg/ml)')
+
+tmp <- droplevels(tmp)
+# rstatix::pairwise_wilcox_test(tmp,formula = Progestr_conc ~ Race)
+g <- tmp %>% ggplot(aes(x=Race,y=log2(Progestr_conc))) + 
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 1, alpha = 1, width = 0.1) +
+  theme_minimal() + ylab('Progesterone concentration (pg/ml)')
+# rstatix::pairwise_wilcox_test(tmp,formula = bEstr_conc ~ Race)
+h <- tmp %>% ggplot(aes(x=Race,y=log2(bEstr_conc))) + 
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 1, alpha = 1, width = 0.1) +
+  theme_minimal() + ylab('beta Estradiol concentration (pg/ml)')
+
+
+# cor.test(tmp$bEstr_conc,tmp$Progestr_conc,method='spearman')
+# 	Spearman's rank correlation rho
+# 
+# data:  meta$bEstr_conc and meta$Progestr_conc
+# S = 144, p-value = 0.7329
+# alternative hypothesis: true rho is not equal to 0
+# sample estimates:
+#       rho 
+# 0.1272727 
+
+# cor.test(tmp$DaysSinceLMP,tmp$Progestr_conc,method='spearman')
+# cor.test(tmp$DaysSinceLMP,tmp$bEstr_conc,method='spearman')
+# cor.test(tmp$`Age at time of surgery`,tmp$Progestr_conc,method='spearman')
+# cor.test(tmp$`Age at time of surgery`,tmp$bEstr_conc,method='spearman')
+
+
+
+layout <- 'AB
+CD
+EF
+GH'
+library(patchwork)
+pdf(file='plasma_assay_figure.pdf',height = 10,width = 5)
+a + b + c + d + e + f + g + h +
+    patchwork::plot_layout(design = layout) 
+dev.off()
+```
+
+
+
+
+
+# Checking DMRcate regions
+
+```{r load_iscream_bsseq}
+
+# Load in the DMRs of interest
+
+
+# Jame's finally did smth useful, gave me this:
+test0 <- readRDS('/Volumes/researchtemp/hpctmp/james.eapen/ians_bs.rds')
+# bsseq::getCoverage(test,type='M')
+
+myGRANGES <- GenomicRanges::makeGRangesFromDataFrame(df = data.frame(
+  seqnames='chr2',
+  start = 176146606,
+  end = 176166316
+))
+
+test1 <- subsetByOverlaps(test0,myGRANGES)
+
+test2 <- bsseq::getMeth(test1,type='raw')
+
+dim(test2)
+class(test2)
+
+test3 <- as.data.frame(test2)
+colnames(test3) <- gsub('../data/canary/','',colnames(test3))
+colnames(test3) <- gsub('_mergecg.bed.gz','',colnames(test3))
+
+test4 <- dplyr::select(test3,one_of(meta$SVC))
+dim(test4)
+
+# rownames(test4) <- paste(test@rowRanges@seqnames,test@rowRanges@ranges@start)
+# not needed b/c we did subsetbyoverlaps, so we know we are working with this DMR only
+# but do want it for making tidy... as a column
+test4$position <- paste(test1@rowRanges@seqnames,test1@rowRanges@ranges@start)
+
+test5 <- tidyr::pivot_longer(test4,cols=one_of(meta$SVC),names_to = 'SVC',values_to = 'beta')
+colnames(test5)
+
+test6 <- dplyr::left_join(test5,dplyr::select(meta,one_of(c('SVC','ReproductiveStatus','MIR200cAvgBeta','Race'))))
+dim(test6)
+
+
+ggplot(test6,aes(x=ReproductiveStatus,y=beta)) + geom_boxplot()
+
+test6 |> dplyr::group_by(ReproductiveStatus) |> summarize(mean_beta=mean(beta,na.rm=TRUE))
+
+x <- 0.3208052	
+y <- 0.4296805	
+y-x # 10.8% beta difference in raw
+log2(0.1088) # -3.20025
+log10(0.1088) # -0.9633711
+# now roll this log
+10^-0.963
+10^-0.407
+
+  
+```

@@ -1,0 +1,4358 @@
+---
+title: "Canary RNAseq adjusting for covariates"
+author: "Ian Beddows"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+params:
+  rmd: ""
+output:
+  html_document:
+    dev: png
+    code_folding: hide
+    self_contained: yes
+    toc: true
+    toc_depth: 2
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    df_print: paged
+    css: styles.css
+---
+
+```{r setup,echo=FALSE}
+# 
+# knitr::opts_chunk$set(
+# 	echo = TRUE,
+# 	message = FALSE,
+# 	warning = FALSE,
+# 	cache = TRUE,
+# 	cache.lazy = FALSE
+# )
+
+```
+
+```{r loadlibs}
+# > library(clusterProfiler)
+# Error: package or namespace load failed for ‘clusterProfiler’:
+#  object ‘get_fun_from_pkg’ is not exported by 'namespace:rvcheck'
+# require(devtools)
+# install_version("rvcheck", version = "0.1.8", repos = "http://cran.us.r-project.org")
+# library(rvcheck)
+# 
+suppressPackageStartupMessages({
+    library(yaml)
+    library(xtable)
+    library(kableExtra)
+    library(tidyverse)
+    library(reshape2)
+    library(matrixStats)
+    library(SummarizedExperiment)
+    library(DESeq2)
+    library(ggrepel)
+    library(gridExtra)
+    require(grid)
+    library(pheatmap)
+    library(cowplot)
+    library(RColorBrewer)
+    library(edgeR)
+    library(clusterProfiler)
+    library(enrichplot)
+    library(msigdbr)
+    library(biomaRt)
+    library(org.Hs.eg.db)
+    # library(vegan)
+    library(ComplexHeatmap)
+    library(patchwork)
+    library(viridis)
+})
+
+
+# library(org.Rn.eg.db)
+
+```
+
+```{r load_Rds}
+
+setwd('~/Desktop/currentProjects/canary_WGBS_Snakemake/canary_meth_Rproj/')
+meta <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data'); dim(meta)
+meta <- dplyr::filter(meta,useRNA_2==TRUE); dim(meta)
+
+dim(meta)
+t2g_no_dup_genes <- readRDS('t2g_no_dup_genes_human.Rds')
+fdr.filter <- 0.05; logfc.filter <- 0
+
+config <- NULL
+config$species <- 'Homo sapiens'
+config$org.db <- 'org.Hs.eg.db'
+
+
+
+
+
+meta$MIR200cAvgBeta <- as.numeric(meta$MIR200cAvgBeta)
+# Filter so they have matched MIR200C data
+meta <- dplyr::filter(meta,!is.na(MIR200cAvgBeta))
+dim(meta)
+# important
+meta$sample <- meta$SVC
+
+# for pro v sec
+# meta$use_pro_v_sec <- ifelse(meta$menstrPh_by_Endom%in%c('Proliferative','Secretory') & meta$MIR200cAvgBeta<0.7,TRUE,FALSE)
+# table(meta$use_pro_v_sec)
+```
+
+# Diff. Expr.
+
+The individual contrasts run are recorded in contrasts.tsv. This is the same as what powers the DMR analyses, so the contrasts are the same except adjustment of covariates is done either in this document of in 'dmrcate_workflow_Singularity_contrasts.tsv.Rmd' for DMRcate.
+
+
+Contrasts:
+
+  BRCAmut vs. NON-BRCA adjusting for <depends on contrast see below>
+
+# dge intitialize
+```{r dge_initialize,cache=FALSE}
+
+# table(meta$Clone.Tumor.Name,meta$group)
+
+contrast_master.df <- read.delim('contrasts.tsv',sep="\t",check.names = FALSE)
+
+cat(nrow(contrast_master.df),'contrasts available!\n')
+
+index2run <- 19
+
+cat(paste0("\n\n## Diff. Expr.",contrast_master.df$name[index2run]), "\n\n")
+
+DT::datatable(contrast_master.df[index2run,])
+
+```
+
+# load counts
+
+```{r load_counts}
+
+# raw_counts <- readRDS('raw_counts_N104.Rds')
+# raw_counts <- readRDS('raw_counts_adjusted_N94.Rds')
+raw_counts <- readRDS('../canary_meth_Rproj/raw_counts_adjusted_N94.Rds')
+# > dim(raw_counts)
+# [1] 58302    96
+table(rowSums(raw_counts[,-c(1:2)],na.rm=TRUE)>100)
+
+mapper <- raw_counts[,c(1,2)]
+keep <- which(rowSums(raw_counts[,-c(1:2)],na.rm=TRUE)>100)
+filtered_counts <- raw_counts[keep,-c(1:2)]
+dim(filtered_counts)
+head(filtered_counts,1)
+
+cpm <- edgeR::cpm(filtered_counts,log=TRUE)
+
+dim(cpm)
+
+```
+
+```{r explore_counts,eval=FALSE}
+
+countSums <- data.frame(colSums(raw_counts))
+countSums$SVC <- gsub('_pilot[BC]','',rownames(countSums))
+colnames(countSums)[1] <- 'Counts'
+# countSums <- dplyr::left_join(countSums,meta)
+
+
+# ggplot(countSums,aes(x=groupBRCA,y=Counts,color=groupBRCA)) +
+#       # geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+#       geom_violin(fill=NA) +
+#       geom_jitter(size = 1, alpha = 1, width = 0.1) +
+#       xlab('') +
+#       ylab('Counts') +
+#       # ylim(c(0,1)) +
+#       theme_bw() +
+#       # viridis::scale_color_viridis(discrete = TRUE) +
+#       scale_color_manual(values=viridis::mako(n=4)[1:3]) +
+#       theme(legend.position="none") +
+#       theme(plot.title = element_text(size=12)) +
+#       theme(axis.text.x = element_text(angle=45,hjust=1))
+# 
+# ggplot(countSums,aes(x=Pilot,y=Counts,fill=Pilot)) +
+#       # geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+#       geom_violin(fill=NA) +
+#       geom_jitter(size = 1, alpha = 1, width = 0.1) +
+#       xlab('') +
+#       ylab('Counts') +
+#       # ylim(c(0,1)) +
+#       theme_bw() +
+#       # viridis::scale_color_viridis(discrete = TRUE) +
+#       scale_fill_viridis_d(option='turbo') +
+#       theme(legend.position="none") +
+#       theme(plot.title = element_text(size=12)) +
+#       theme(axis.text.x = element_text(angle=45,hjust=1))
+# 
+# ggplot(countSums,aes(x=Race,y=Counts)) +
+#       # geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+#       geom_violin(fill=NA) +
+#       geom_jitter(size = 1, alpha = 1, width = 0.1) +
+#       xlab('') +
+#       ylab('Counts') +
+#       # ylim(c(0,1)) +
+#       theme_bw() +
+#       # viridis::scale_color_viridis(discrete = TRUE) +
+#       scale_fill_viridis_d(option='turbo') +
+#       theme(legend.position="none") +
+#       theme(plot.title = element_text(size=12)) +
+#       theme(axis.text.x = element_text(angle=45,hjust=1))
+# 
+# ggplot(countSums,aes(x=ReproductiveStatus,y=Counts)) +
+#       # geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+#       geom_violin(fill=NA) +
+#       geom_jitter(size = 1, alpha = 1, width = 0.1) +
+#       xlab('') +
+#       ylab('Counts') +
+#       # ylim(c(0,1)) +
+#       theme_bw() +
+#       # viridis::scale_color_viridis(discrete = TRUE) +
+#       scale_fill_viridis_d(option='turbo') +
+#       theme(legend.position="none") +
+#       theme(plot.title = element_text(size=12)) +
+#       theme(axis.text.x = element_text(angle=45,hjust=1))
+```
+
+# functions
+```{r, RNAseq_v2}
+
+preRank = function(table){
+# calculate rankings
+# use inverse sign of log change so that upregulated genes are at the left of the plots
+table$FCsign <- sign(table$logFC)
+table$logP <- -log10(table$PValue)
+table$metric <- table$logP/table$FCsign
+table$metric=ifelse(table$metric==Inf,0,table$metric) # if logFC==0, then rank goes to Inf but should be 0) 
+ranks <- table[,c("ext_gene","metric")]
+ranks[,"ext_gene"] <- as.character(ranks[,"ext_gene"])
+
+# remove samples with duplicate gene symbols, metrics, and NAs, NaNs for "metric"
+# sort by metric: positive values first.
+ranks <- dplyr::distinct(.data = ranks, ext_gene, .keep_all=TRUE) %>% dplyr::filter( !is.na(ext_gene)) %>% arrange(-metric)
+
+
+# format frame for fgsea
+ranks <- deframe(ranks)
+if(any(is.na(ranks))){ranks=ranks[-which(is.na(ranks))]}
+return(ranks)
+}
+
+volcano = function(log2FC,pval,qval,fdr.filter,title){
+  if(missing(title)){
+    title=''
+  }
+  x = as.data.frame(cbind(log2FC,pval,qval))
+  x$signif = ifelse(qval>fdr.filter,'Not Significant',
+              ifelse((log2FC>0 & (abs(log2FC)>logfc.filter)),'Significant Upregulated',
+                ifelse((log2FC<0 & (abs(log2FC)>logfc.filter)),'Significant Downregulated',
+                  'Not Significant'
+                )
+              )
+            )
+  n.signif = length(which(x$signif%in%c('Significant Upregulated','Significant Downregulated')))
+  plot = ggplot(x,aes(x=log2FC,y=-log10(pval))) +
+    geom_point(aes(color=signif)) +
+    # scale_colour_brewer(palette = 'Paired') +
+    scale_colour_manual(values = c('Gray','Blue','Red')) +
+    # geom_vline(xintercept = logfc.filter) +
+    # geom_vline(xintercept = -logfc.filter) +
+    # geom_hline(yintercept = -log(fdr.filter)) +
+    ggtitle(paste(title,'Volcano plot.',n.signif,'Significant Tags'))
+  return(plot)
+}
+
+## For this function to work:
+
+# Need a design matrix.
+# Need a contrast matrix that works with the design.
+# Need a predefined df called 'meta' with columns 'sample' and 'genotype'.
+# Need a predefined logfc.filter, fdr.filter, and t2g_no_dup_genes.
+# Need a Formal class 'DGEList' with the filtered count data (default to the filtered.data obj from the project Rmd)
+
+RNAseq = function(design,contrast,.meta,block,filtered.data){
+
+  # Check that filtered.data is a DGEList object!
+  # if(class(filtered.data)!='DGEList'){
+  #   stop('Error - filtered.data NOT a DGEList Object\n')
+  # }
+
+  cat('FDR Filter:',fdr.filter,'\n\nlogFC Filter',logfc.filter,'\n\n')
+  # Format design
+  rownames(design) <- .meta$sample # do not make these names, make meta names in 'load data' tab
+  colnames(design)=make.names(colnames(design))
+  # check if anything in the design is non-estimable:
+  nonEstimable(design)
+
+  # Print the design:
+  print( htmltools::tagList(
+    DT::datatable(design,
+                  caption = htmltools::tags$caption( style = 'caption-side: top; text-align: center; color:black; font-size:200% ;','Table 1: Diff. Gene Expr. Analysis Design')
+    )
+  ))
+
+  # Print the contrast matrix:
+  print( htmltools::tagList(
+    DT::datatable(contrast,
+                  caption = htmltools::tags$caption( style = 'caption-side: top; text-align: center; color:black; font-size:200% ;','Table 2: Contrast Matrix')
+    )
+  ))
+
+
+  ##Generate the DGEList object from the filtered data
+  y <- filtered.data[,rownames(design)]
+
+  #Normalize based on library size and composition biases in the sample - trimmed mean of M-values (TMM) method
+  #The normalization factors of all the libraries multiply to unity. A normalization factor below one indicates that a small
+  #number of high count genes are monopolizing the sequencing, causing the counts for other genes to be lower than
+  #would be usual given the library size. As a result, the effective library size will be scaled down for that sample.
+  cat('Normalizing for library size and composition biases in the samples using trimmed mean of M-values (TMM) method\n')
+  y <- edgeR::calcNormFactors(y)
+
+  #Check norm.factors:
+  # print(
+  #   y$samples %>% knitr::kable() %>% kable_styling(bootstrap_options = c("striped", "hover","condensed"),font_size = 12)
+  # )
+    print( htmltools::tagList(
+    DT::datatable(y$samples,
+                  caption = htmltools::tags$caption( style = 'caption-side: top; text-align: center; color:black; font-size:200% ;','Table 3: edgeR::calcNormFactors Library Sizes')
+    )
+  ))
+
+  #Check MDS plot:
+#   cat('In the MDS plot, the distance between each pair of samples can be interpreted as the leading log-fold
+# change between the samples for the genes that best distinguish that pair of samples. By default, leading fold-change is defined as the root-mean-square of the largest 500 log2-fold changes between that pair of samples.\n'
+#   )
+  # plotMDS(y)
+
+  #Calc dispersions
+  y <- estimateDisp(y, design, robust = TRUE)
+
+  #Check the dispersion estimates
+  cat('\n\n')
+  cat('Common dispersion:',y$common.dispersion,'.\n\n\n')
+  #The square root of dispersion is the common coefficient of biological variation (BCV):
+  cat('Biological Coefficient of Variation:',sqrt(y$common.dispersion),'.\n\n\n')
+  cat('Typical values for the common BCV (square-root-dispersion) for datasets arising from well-controlled experiments are 0.4 for human data, 0.1 for data on genetically identical model organisms or 0.01 for technical replicates.\n\n\n')
+
+  #Plot the BCV dispersions
+  plotBCV(y)
+
+
+  # Duplicate correlations if e.g. blocking for random effects - not implemented in current version
+  # if(! missing(block)){
+  #   cor=duplicateCorrelation(y$counts,design,block=block)
+  #   fit <- glmQLFit(y, design, robust=TRUE,block=block,correlation=cor$consensus.correlation) # fit is a DGEGLM object
+  # }else{
+
+
+  # Fit the model ####
+    # The quasi-liklihood dispersions can be estimated using the glmQLFit function
+  fit <- glmQLFit(y, design, robust=TRUE) # fit is a DGEGLM object
+  # }
+
+  #Plot the quasi-liklihood dispersions.
+  plotQLDisp(fit)
+
+  # Differential expression testing
+  # Default: glmQLFtest
+
+  # method 1:
+  #working if design ~genotype+covariates not ~0+genotype+covariates
+  #The coef argument corresponds to the column in the design matrix
+  #glmQLFTest(fit, coef = 1) # method 1 ()
+
+  #method 2 (working if design ~0+genotype):
+  #contrast1 = makeContrasts(genotypeOfInterest-genotypeControl,levels=design) # an example with 1 contrast
+
+  # When you pass multiple coefficients or contrasts to glmQLFTest, it will do an ANOVA-like test of the combined null hypothesis that all of them are equal to zero.
+  qlf <- glmTreat(fit, contrast = contrast, lfc= logfc.filter)
+
+  # Get topTags ####
+  Table <- topTags(qlf, n = Inf, p.value =1)$table # Get all genes
+  Table$ens_gene <- rownames(Table)
+  Table = dplyr::left_join(Table,t2g_no_dup_genes,by='ens_gene')
+  Table.filtered = dplyr::filter(Table,FDR<=fdr.filter) # Filtere on qval
+  cat("\n\nTotal tags: ",nrow(Table),".\n")
+  cat(paste0("\n\n\n\n\nTags with FDR<",fdr.filter,": ",nrow(Table.filtered)),".\n\n\n\n")
+  # Because there can be multiple contrasts, need to filter on logFC in the following way:
+  logfold.columns = grep('^logFC',colnames(Table.filtered)) # get columns for logFC
+  if(length(logfold.columns)==1){
+    Table.filtered = Table.filtered[ifelse(lapply(Table.filtered[,logfold.columns],FUN=function(x){return(max(abs(x)))})>logfc.filter,TRUE,FALSE),]
+  }else{
+    Table.filtered = Table.filtered[ifelse(apply(Table.filtered[,logfold.columns],1,FUN=function(x){return(max(abs(x)))})>logfc.filter,TRUE,FALSE),]
+  }
+  cat(paste0("\n\n\n\n\nDifferentially expressed tags (FDR<",fdr.filter," & logFC>",round(logfc.filter,2),"): ",nrow(Table.filtered)),".\n\n\n\n")
+
+
+  #Histogram of PValue for all genes
+  print(
+    ggplot(Table) + geom_histogram(aes(x=PValue),bins=100) + labs(title='PValue Distribution')
+  )
+
+  #Volcano Plot:
+  for(i in logfold.columns){
+    print(
+      volcano(log2FC = Table[,i],pval=Table$PValue,qval=Table$FDR,fdr.filter = fdr.filter,title=colnames(Table)[i])
+    )
+    cat('\n\n')
+  }
+
+  # Top DGE
+  topN=100
+  print( htmltools::tagList(
+    DT::datatable(head(Table,topN),
+                 caption = htmltools::tags$caption( style = 'caption-side: top; text-align: center; color:black; font-size:200% ;',paste('Table 4: Top',topN,'Differentially Expressed Genes By Adjusted Pvalue')
+                  )
+    )
+  ))
+
+  #Write out the table
+  #write.table(Table, "Controls.dge.txt", quote = F, sep = "\t", row.names = F, col.names = T)
+
+  returnList = list(
+    table=Table,
+    de.genes = Table.filtered$ens_gene
+  )
+  return(returnList)
+
+  # Limma is the only package that has the ability to use random effects to correlate repeated
+  # samples from the same subject. None of the negative binomial packages, including edgeR, can do that.
+
+}
+
+```
+
+# masterchunk
+```{r DGE_analysis.masterChunk, results='asis',eval=TRUE,cache=TRUE,dev=c('png')}
+
+metaMasterChunk <- dplyr::filter(data.frame(meta),SVC %in% colnames(filtered_counts))
+dim(metaMasterChunk)
+
+stopifnot(is.numeric(metaMasterChunk$MIR200cAvgBeta))
+# metaMasterChunk <- dplyr::filter(metaMasterChunk,!is.na(MIR200cAvgBeta)) # b/c 2 samples don't have this so can't adjust with them!!
+
+
+
+# join PC1 for adjustment!
+# metaMasterChunk <- dplyr::left_join(metaMasterChunk,pr_comps[,c('PC1','PC2','SVC')])
+# metaMasterChunk <- dplyr::filter(metaMasterChunk,is.na(LMP_explanation))
+# drop samples that have an LMP_explanation (i.e. drop pregnant pre NON-BRCA samples that result in cilium as most enriched term for BRCA)
+
+
+
+
+dim(metaMasterChunk)
+
+for(i in index2run){
+# for(i in 1:1){
+  groupRelative <- contrast_master.df[i,'relative']; print(cat(paste('Group Relative:',groupRelative,"\n")))
+  groupBaseline <- contrast_master.df[i,'baseline']; print(cat(paste('Group Baseline:',groupBaseline,"\n")))
+  groupColumn <- contrast_master.df[i,'meta_col']
+  groupColumnIndex <- which(colnames(metaMasterChunk)==groupColumn)
+  contrast.name = contrast_master.df[i,'name']
+  
+  stopifnot(length(groupColumnIndex)==1)
+  filterColumn <- contrast_master.df[i,'filterColumn']
+  filterColumnIndex <- which(colnames(meta)==filterColumn);
+  samplesInIndex <- which(metaMasterChunk[,groupColumnIndex] %in% c(groupRelative,groupBaseline) & metaMasterChunk[,filterColumnIndex] == contrast_master.df[i,'filterArg'])
+  metaFilt <- droplevels(metaMasterChunk[samplesInIndex,])
+   
+  # metaFilt <- droplevels(metaMasterChunk[which(metaMasterChunk[,groupColumnIndex] %in% c(groupRelative,groupBaseline)),])
+  stopifnot(nrow(metaFilt)>0)
+  print(cat(nrow(metaFilt),"samples\n"))
+  
+  # design = model.matrix(~0 + Treatment, data = droplevels(metaFilt))
+  # design = model.matrix(formula(paste("~0 + ",groupColumn)),  data = metaFilt)
+  design = model.matrix(formula(paste("~0 + ",groupColumn," + MIR200cAvgBeta")),  data = metaFilt)
+  # design = model.matrix(formula(paste("~0 + ",groupColumn," + PC1 + PC2")),  data = metaFilt)
+  # design = model.matrix(formula(paste("~0 + ",groupColumn," + MIR200cAvgBeta + Race")),  data = metaFilt)
+  
+  stopifnot(paste0(groupColumn,groupRelative) %in% colnames(design))
+  stopifnot(paste0(groupColumn,groupBaseline) %in% colnames(design))
+  
+  colnames(design) <- gsub(groupColumn,'',colnames(design)); colnames(design) <- make.names(colnames(design))
+  
+  # Divide iterations of this loop in the report.
+  cat(paste0("\n\n## ",contrast.name), "\n\n")
+  # write.table(file = paste0('delete_',contrast.name),x=NULL)
+  # contrast = do.call(makeContrasts, myargs)
+  
+  contrast = makeContrasts(
+      paste(make.names(groupRelative),'-',make.names(groupBaseline)),
+      levels=design
+  )
+    
+    
+  filtered.data <- edgeR::DGEList(counts=filtered_counts)
+  class(filtered.data)
+  # [1] "DGEList"
+  # attr(,"package")
+  # [1] "edgeR"
+  
+  
+  # Do the RNAseq analysis--------------------------------------------------------
+  list = RNAseq(
+      design = design,
+      contrast = contrast,
+      filtered.data = filtered.data,
+      .meta <- metaFilt
+  )
+  
+  
+  # knitr::knit_exit()
+  # save results to file
+  write_delim(list$table,
+                  paste0(contrast.name,".DGE.tsv"),
+                  delim="\t"
+  )
+  
+    
+  # print( htmltools::tagList(DT::datatable(head(dplyr::arrange(list$table,FDR),100))))
+    
+  if(nrow(dplyr::filter(list$table,FDR<fdr.filter))>0){
+      
+      # Functional Enrichment --------------------------------------------------------
+      cat("\n\n### Functional Enrichment \n\n")
+    
+      ## Hypergeometric Test for GO-------------------------------
+      cat("\n\n#### Hypergeometric Test \n\n ")
+    
+      cat("Hypergeometric tests were performed with ClusterProfiler's `enrichGO` function. \n\n")
+    
+      # are the non-unique ext_gene values all NAs? yes if TRUE
+      nrow(list$table) - nrow(list$table %>% filter(!is.na(ext_gene))) == nrow(list$table) - length(unique(list$table$ext_gene))
+      # prepare the genelist
+      # get all significant genes from glmTREAT (ext_gene symbols)
+      DE <- (list$table %>%
+        dplyr::select(c(ens_gene,ext_gene,FDR)) %>%
+        dplyr::filter(FDR < fdr.filter))$ext_gene
+    
+      GO.BP = enrichGO(gene=DE,
+                    OrgDb=config$org.db,
+                    ont ="BP",
+                    keyType = "SYMBOL",
+                    pAdjustMethod = "BH")
+      GO.MF = enrichGO(gene=DE,
+                    OrgDb= config$org.db,
+                    ont ="MF",
+                    keyType = "SYMBOL",
+                    pAdjustMethod = "BH")
+      GO.CC = enrichGO(gene=DE,
+                    OrgDb= config$org.db,
+                    ont ="CC",
+                    keyType = "SYMBOL",
+                    pAdjustMethod = "BH")
+    
+      # plot top 30 for each GO category
+      cat("\n\n##### GO: Biological Process \n\n")
+      if(!is.null(GO.BP) && nrow(GO.BP)>0){print(enrichplot::dotplot(GO.BP, showCategory=30) + ggtitle("DotPlot - GO:Biological Process"))}
+      cat("\n\n##### GO: Molecular Function \n\n")
+      if(!is.null(GO.MF) && nrow(GO.MF)>0){print(enrichplot::dotplot(GO.MF, showCategory=30) + ggtitle("DotPlot - GO:Molecular Function"))}
+      cat("\n\n##### GO: Cellular Compartment \n\n")
+      if(!is.null(GO.CC) && nrow(GO.CC)>0){print(enrichplot::dotplot(GO.CC, showCategory=30) + ggtitle("DotPlot - GO:Cellular Compartment"))}
+  }else{
+      cat('No significant DE genes according to FDR<',fdr.filter,'\n')  
+  }
+  
+  
+  
+      ## GSEA: Reactome and KEGG ---------------------------------
+      cat("\n\n#### GSEA \n\n")
+      cat("GSEA testing was performed with ClusterProfiler's wrapper for the `fgsea` function. \n\n")
+    
+      # assign ranks based upon current contrast
+      geneRanks <- preRank(list$table)
+    
+      # REACTOME
+        cat("\n\n##### Reactome Pathways \n\n")
+        # assign pathways
+        m_t2g <- msigdbr(species = config$species, category = "C2", subcategory = "CP:REACTOME") %>%
+          dplyr::select(gs_name, gene_symbol)
+        # run fGSEA
+        if(any(is.na(geneRanks))){geneRanks=geneRanks[-which(is.na(geneRanks))]}
+        gsea_res <- clusterProfiler::GSEA(geneRanks, nPerm= 10000, TERM2GENE = m_t2g, by="fgsea",pvalueCutoff = 1)
+        # print results
+        if (nrow(gsea_res@result) >=1){
+          cat(paste("Significantly Enriched Reactome Pathways:", nrow(gsea_res@result),
+                      "\n\nTop 30 pathways visualized below:"))
+          # RidgePlot
+          print(ridgeplot(gsea_res) +
+                  theme(axis.text.y = element_text(size=8)) +
+                  theme(axis.text.x = element_text(size=8)) +
+                  theme(axis.title = element_text(size=8)) +
+                  scale_y_discrete(label=function(x) abbreviate(x, minlength=40)) +
+                  ggtitle("RidgePlot - GSEA: Reactome"))
+    
+          # GSEA plots
+          for (i in 1:min(30,length(gsea_res$Description))){
+            print(gseaplot2(gsea_res, geneSetID = i, title = gsea_res$Description[i]))
+          }
+          # Full Table
+          # print(knitr::kable(gsea_res@result %>% dplyr::select(-c("ID","Description")), caption='Enriched Reactome Pathways:') %>%
+          #         kable_styling(bootstrap_options = c("striped", "hover","condensed"),font_size = 12))
+          print( htmltools::tagList((DT::datatable(
+                  (gsea_res@result %>% dplyr::select(-c("ID","Description"))),
+                  caption = htmltools::tags$caption( style = 'caption-side: top; text-align: center; color:black; font-size:200% ;','Table. Enriched Reactome Pathways')
+          ))))
+          write_delim(
+              gsea_res@result,
+              paste0(contrast.name,".Reactome.tsv"),
+              delim="\t"
+          )
+        }else{
+          print(paste("Significantly Enriched Reactome Pathways:", nrow(gsea_res@result)))
+        }
+    
+      # KEGG
+        cat("\n\n##### KEGG Pathways \n\n")
+        # assign pathways
+        m_t2g <- msigdbr(species = config$species, category = "C2", subcategory = "CP:KEGG") %>%
+          dplyr::select(gs_name, gene_symbol)
+        # run fGSEA
+        if(any(is.na(geneRanks))){geneRanks=geneRanks[-which(is.na(geneRanks))]}
+        gsea_res <- clusterProfiler::GSEA(geneRanks, nPerm= 10000, TERM2GENE = m_t2g, by="fgsea", seed = TRUE,pvalueCutoff = 1)
+        nrow(gsea_res@result)
+        # print results
+        if (nrow(gsea_res@result) >=1){
+          cat(paste("Significantly Enriched KEGG Pathways:", nrow(gsea_res@result),
+                      "\n\nTop 30 pathways visualized below:"))
+          # RidgePlot
+          print(ridgeplot(gsea_res) +
+                  theme(axis.text.y = element_text(size=8)) +
+                  theme(axis.text.x = element_text(size=8)) +
+                  theme(axis.title = element_text(size=8)) +
+                  scale_y_discrete(label=function(x) abbreviate(x, minlength=40)) +
+                  ggtitle("RidgePlot - GSEA: KEGG"))
+    
+          # GSEA plots
+          for (i in 1:min(30,length(gsea_res$Description))){
+            print(gseaplot2(gsea_res, geneSetID = i, title = gsea_res$Description[i]))
+          }
+          # Full Table
+          # print(knitr::kable(gsea_res@result %>% dplyr::select(-c("ID","Description")), caption='Enriched KEGG Pathways:') %>%
+          #         kable_styling(bootstrap_options = c("striped", "hover","condensed"),font_size = 12))
+          print( htmltools::tagList((DT::datatable(
+                  (gsea_res@result %>% dplyr::select(-c("ID","Description"))),
+                  caption = htmltools::tags$caption( style = 'caption-side: top; text-align: center; color:black; font-size:200% ;','Table. Enriched KEGG Pathways')
+          ))))
+          write_delim(
+              gsea_res@result,
+              paste0(contrast.name,".KEGG.tsv"),
+              delim="\t"
+          )
+        }else{
+          print(paste("Significantly Enriched KEGG Pathways:", nrow(gsea_res@result)))
+        }
+  
+  
+  list$table$contrast <- rep(contrast.name,nrow(list$table))
+  if(! exists("masterList")){
+    masterList <- list(list$table)
+    names(masterList) <- contrast.name
+  }else{
+    masterList <- rlist::list.append(masterList,list$table)
+    names(masterList)[length(masterList)] <- contrast.name
+  }
+
+}
+
+
+
+```
+
+
+```{r knitExit_57ge5rdwewedrf,cache=FALSE}
+
+knitr::knit_exit()
+
+```
+
+# PCA
+
+```{r PCA_get_data,fig.height=9,fig.width=9,dev=c('png'),eval=FALSE,eval=TRUE}
+
+# pca_plots <- plot_PCA(bbc_obj, color_by="group", shape_by="group", adonis_by="group")
+
+# PCA plot by hand:
+# samps <- dplyr::filter(meta,is.na(LMP_explanation))$SVC
+samps <- meta$SVC
+norm_counts <- cpm[,samps]
+
+
+dim(meta)
+dim(cpm)
+# Filter them for the correct samples
+
+# norm_counts <- norm_counts[,]
+
+set.seed(5443546)
+pca <- prcomp(t(norm_counts))
+pr_comps <- data.frame(pca$x)
+dim(pr_comps)
+# pr_comps$SVC <- gsub('_pilot[BC]','',rownames(pr_comps))
+pr_comps$SVC <- rownames(pr_comps)
+pr_comps$sample <- rownames(pr_comps)
+# column_meta <- as.data.frame(colData(bbc_obj), stringsAsFactor = FALSE)
+pr_comps <- dplyr::left_join(pr_comps, meta,by='SVC')
+dim(pr_comps)
+prop_var <- data.frame(t(summary(pca)$importance))
+names(prop_var) = c("sd", "prop", "cum")
+prop_var$num = 1:nrow(prop_var)
+  
+
+
+# add in the raw counts
+x <- data.frame(colSums(raw_counts[,3:ncol(raw_counts)],na.rm=TRUE))
+x$SVC <- rownames(x)
+colnames(x)[1] <- 'total_reads_RNA'
+
+pr_comps <- left_join(pr_comps,x)
+# PC1 vs. MIR200C for RNA
+xx <- ggplot(pr_comps,aes(x=PC1,y=MIR200cAvgBeta)) + geom_point(size=2) + theme_minimal() +
+  ggtitle('') + ylim(c(0.15,0.9)) + scale_y_continuous(breaks = c(0.2,0.4,0.6,0.8))
+xx + geom_smooth(se = FALSE)
+cor.test(pr_comps$PC1,pr_comps$MIR200cAvgBeta,method='spearman')
+pdf('Composition_PC1_RNA.pdf',height = 3,width = 3); xx; dev.off()
+
+
+```
+
+```{r first_go_at_plots,eval=FALSE}
+ggplot(pr_comps, aes_string(x = "PC1", y = "PC2", 
+    label = "sample.x",pch="groupBRCA")) + geom_point(size = 7, aes_string()) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  scale_color_viridis_c() +
+  # scale_color_viridis_d() +
+    ggtitle('') + geom_text_repel(aes(label=sample.x))
+
+ggplot(pr_comps, aes_string(x = "PC1", y = "PC2", 
+    label = "sample.x",pch="groupBRCA", color="total_reads_RNA")) + geom_point(size = 7, aes_string()) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  scale_color_viridis_c() +
+  # scale_color_viridis_d() +
+    ggtitle('') + geom_text_repel(aes(label=sample.x))
+
+
+ggplot(pr_comps, aes_string(x = "PC1", y = "PC2", 
+    label = "sample.x",pch="ReproductiveStatus", color="MIR200cAvgBeta")) + geom_point(size = 12, aes_string()) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  scale_color_viridis_c() +
+  # scale_color_viridis_d() +
+    ggtitle('') + geom_text_repel(aes(label=sample.x))
+
+ggplot(pr_comps, aes_string(x = "PC1", y = "PC2", 
+    label = "sample.x",pch="ReproductiveStatus", color="DaysSinceLMP")) + geom_point(size = 12, aes_string()) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  scale_color_viridis_c() +
+  # scale_color_viridis_d() +
+    ggtitle('') + geom_text_repel(aes(label=sample.x))
+
+ggplot(pr_comps, aes_string(x = "PC1", y = "PC2", 
+    label = "sample.x",pch="ReproductiveStatus", color="DaysSinceLMP_clean")) + geom_point(size = 12, aes_string()) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  scale_color_viridis_c() +
+  # scale_color_viridis_d() +
+    ggtitle('') + geom_text_repel(aes(label=sample.x))
+
+ggplot(pr_comps, aes_string(x = "PC1", y = "PC2", 
+    label = "sample.x",pch="ReproductiveStatus", color="`Age at time of surgery`")) + geom_point(size = 7, aes_string()) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  scale_color_viridis_c() +
+  # scale_color_viridis_d() +
+    ggtitle('') + geom_text_repel(aes(label=sample.x))
+
+ggplot(pr_comps, aes_string(x = "PC1", y = "PC2", 
+    label = "sample.x",pch="groupBRCA", color="ReproductiveStatus")) + geom_point(size = 7, aes_string()) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  scale_color_viridis_d(option='mako') +
+  # scale_color_viridis_d() +
+    ggtitle('') + geom_text_repel(aes(label=sample.x))
+
+pr_comps$LMP_expl_2 <- ifelse(is.na(pr_comps$LMP_explanation),'none',pr_comps$LMP_explanation)
+ggplot(pr_comps, aes_string(x = "PC1", y = "PC2", 
+    label = "sample.x",pch="ReproductiveStatus", color="LMP_expl_2")) + geom_point(size = 12, aes_string()) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  # scale_color_viridis_c() +
+  scale_color_viridis_d() +
+    ggtitle('') + geom_text_repel(aes(label=sample.x))
+
+ggplot(pr_comps, aes_string(x = "PC1", y = "PC2", 
+    label = "sample.x",pch="groupBRCA", color="Race")) + geom_point(size = 7, aes_string()) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  # scale_color_viridis_c() +
+  scale_color_viridis_d() +
+    ggtitle('') + geom_text_repel(aes(label=sample.x))
+
+ggplot(pr_comps, aes_string(x = "PC1", y = "PC2", 
+    label = "sample.x",pch="groupBRCA", color="Pilot")) + geom_point(size = 7, aes_string()) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  # scale_color_viridis_c() +
+  scale_color_viridis_d() +
+    ggtitle('') + geom_text_repel(aes(label=sample.x))
+
+ggplot(pr_comps, aes_string(x = "PC1", y = "PC2", 
+    label = "sample.x",pch="groupBRCA", color="DaysSinceLMP_clean")) + geom_point(size = 7, aes_string()) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  scale_color_viridis_c() +
+  # scale_color_viridis_d() +
+    ggtitle('') + geom_text_repel(aes(label=sample.x))
+
+ggplot(pr_comps, aes(x=PC1,y=PC2,label=sample.x,pch=LMP_expl_2,color=abs(DaysSinceLMP))) + geom_point(size = 7) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  scale_color_viridis_c() +
+  # scale_color_viridis_d() +
+    ggtitle('') + geom_text_repel(aes(label=DaysSinceLMP))
+
+
+
+# variance plot
+varPlot <- ggplot(prop_var %>% dplyr::filter(.data$num <= 
+    12), aes_string(x = "num", y = "prop")) + geom_point(size = 1.5) + 
+    geom_line() + scale_x_continuous(breaks = seq(1, 100, 
+    2)) + xlab("Principal Component") + ylab("Proportion of Variance") + 
+    ggtitle("") + theme_minimal() + 
+    theme(axis.title.y = element_text(vjust = 1), plot.margin = unit(c(0, 
+      0, 0, 6), "mm"))
+varPlot
+
+
+cor.test(pr_comps$Counts,pr_comps$PC1,method='spearman')
+cor.test(pr_comps$age_in_years,pr_comps$PC1,method='spearman')
+cor.test(pr_comps$MIR200c_CPM,pr_comps$PC1,method='spearman')
+cor.test(pr_comps$MIR200cAvgBeta,pr_comps$PC1,method='spearman')
+
+```
+
+```{r final_pca_rna_plots,eval=FALSE}
+
+saveRDS(pr_comps,'pr_comps_RNA_N94.Rds')
+
+pr_comps$one_group <- rep(1,nrow(pr_comps))
+  mp_main <- ggplot(pr_comps, aes(x=PC1,y=PC2,label=sample.x,pch=ReproductiveStatus,color=MIR200cAvgBeta)) + geom_point(size = 5) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  scale_color_viridis_c(option='cividis',limits = c(0, 1)) +
+    ggtitle('')
+
+  myValuesBRCAcol <- viridis::mako(n=4)[1:3]
+  
+  xbox <- axis_canvas(mp_main, axis = "x", coord_flip = TRUE) + 
+    geom_boxplot(data = pr_comps, aes(y = PC1, x = groupBRCA, fill = groupBRCA)) + 
+    scale_x_discrete() + coord_flip() +
+    # viridis::scale_fill_viridis(option='mako',discrete = TRUE)
+    ggplot2::scale_fill_manual(values=myValuesBRCAcol)
+  
+  ybox <- axis_canvas(mp_main, axis = "y") + 
+    geom_boxplot(data = pr_comps, aes(y = PC2, x = groupBRCA, fill = groupBRCA)) +
+    scale_x_discrete() +
+    # viridis::scale_fill_viridis(option='mako',discrete = TRUE) +
+    ggplot2::scale_fill_manual(values=myValuesBRCAcol) +
+    scale_x_discrete()
+  
+  
+  # xbox with MIR200C not groupBRCA
+  # first get binned values for avg mir200c along the x
+  pr_comps <- pr_comps %>% mutate(pc1_bin = cut(pr_comps$PC1,breaks=seq(from = min(pr_comps$PC1)-100, to = max(pr_comps$PC1)+100,length.out=25),labels=F))
+  
+  dd <- pr_comps %>% dplyr::group_by(pc1_bin,one_group) %>% summarize(meanMIR200C=mean(MIR200cAvgBeta,na.rm=TRUE))
+  
+  # xbox <-  axis_canvas(mp_main, axis = "x", coord_flip = TRUE) +
+  # ggplot() + geom_bar(data = dd, aes(y = pc1_bin, x = meanMIR200C, group = one_group,fill=one_group),stat='identity',position = "stack") + coord_flip()
+  
+  p1 <- insert_xaxis_grob(mp_main, xbox, grid::unit(1, "in"), position = "top")
+  
+  p2 <- insert_yaxis_grob(p1, ybox, grid::unit(1, "in"), position = "right")
+  
+  layout <- '
+  A
+  A
+  A
+  A
+  A
+  B
+  '
+   
+  pdf('RNA_PCA_with_groupBRCA_boxplots_MIR200Cbeta_color.pdf',height=5,width=7); ggdraw(p2); dev.off() #+ #varPlot +
+    #plot_layout(design = layout) + plot_annotation(tag_levels = 'A',title = '')
+
+  
+  # do BRCA groups differ based on PC1 values
+  # rstatix::pairwise_wilcox_test(pr_comps,formula=PC1~groupBRCA)
+  # rstatix::pairwise_wilcox_test(pr_comps,formula=PC2~groupBRCA)
+
+```
+
+# HEATMAPS
+
+## Marker Gene 
+
+```{r get_markers,eval=TRUE}
+
+# meta.rna <- readRDS('meta.rna_N94.Rds')
+markers_Lengyel <- readxl::read_excel('~/Desktop/MasterMarkers.xlsx',sheet='Lengyel_2022_CancerResearch'); markers_Lengyel$pub <- rep('Lengyel2023',nrow(markers_Lengyel))
+markers_Weigert <- readxl::read_excel('~/Desktop/MasterMarkers.xlsx',sheet='Weigert_Medrxiv_markers'); markers_Weigert$pub <- rep('Weigert2024',nrow(markers_Weigert))
+markers_Ulrich <- readxl::read_excel('~/Desktop/MasterMarkers.xlsx',sheet='Ulrich_2022_DevCell'); markers_Ulrich$pub <- rep('Ulrich2022',nrow(markers_Ulrich))
+# check overlap of Lengyel and Weigert markers
+markers0.1 <- dplyr::bind_rows(markers_Lengyel,markers_Weigert,markers_Ulrich) 
+
+markers0 <- markers0.1 %>% group_by(SYMBOL,ENSEMBL,Marker) |> reframe(pub2 = paste(unique(pub),collapse='; ')) %>% distinct(); dim(markers0)
+# this is not the reconciled table, which we will output as a supplementary table
+# write.table(markers0,file="~/Desktop/FT_Markers.tsv",sep="\t",row.names=FALSE,quote=FALSE)
+
+markers1 <- readxl::read_excel('~/Desktop/MasterMarkers.xlsx',sheet='canary_FT_cellType_markers') %>% filter(Marker=='Hormone Receptor')
+
+# markers <- dplyr::bind_rows(markers0,markers1,markers2)
+markers <- dplyr::bind_rows(markers0,markers1)
+markers <- dplyr::filter(markers,Marker!='OV Risk')
+markers <- dplyr::filter(markers,Marker!='Cell cycle - G2/M phase')
+markers <- dplyr::filter(markers,Marker!='Cell cycle - S phase')
+
+## |> dplyr::distinct(); dim(markers0)
+
+####### DO INFO GATHERING MARKERS COMPARING PUBS
+table(markers$Marker)
+length(unique(markers$SYMBOL))
+length(markers$SYMBOL)
+stopifnot(length(unique(markers$SYMBOL))==length(markers$SYMBOL))
+
+## Factor markers for heatmap row split!
+markers$Marker <- factor(markers$Marker,levels=c(
+  # Hormone Receptor & Cell Cycle
+   "Hormone Receptor",
+   # "Cell cycle - G2/M phase",
+   # "Cell cycle - S phase", 
+  # Epithelial
+   "Epithelial",              
+   "Ciliated Epithelial",     
+   "Secretory Epithelial",   
+  # Stromal
+  "Stromal",
+  ## Endothelial
+  "Endothelial",
+  "Lymphatic Endothelial",
+  "Smooth Muscle",
+  "Pericyte/Smooth Muscle",
+  "Pericyte",
+  "Fibroblast",  
+  ## Immune
+  "T and NK",               
+  "B and Plasma",    
+  "Macrophage",  
+  "Mast" 
+))
+
+
+table(markers$ENSEMBL %in% rownames(cpm))
+
+# remove those markers not expressed in our dataset!!
+markers <- markers[-which(!markers$ENSEMBL%in%rownames(cpm)),]; dim(markers)
+
+
+saveRDS(file = 'markers_from_nurDGE_Fig5a.Rds',markers)
+```
+
+```{r build_heatmap_anno_7424,eval=TRUE}
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE); dim(meta00)
+# meta00 <- dplyr::arrange(meta00,Pregnancy,`Age at time of surgery`)
+meta00 <- dplyr::arrange(meta00,`Age at time of surgery`)
+meta00$MenoStatus <- ifelse(meta00$Postpartum,'Postpartum',meta00$ReproductiveStatus)
+meta00$MIR200cAvgBeta <- as.numeric(meta00$MIR200cAvgBeta)
+meta00$MenoStatus <- factor(meta00$MenoStatus, levels=c('Pre','Post','Postpartum'))
+meta00$menstrPh_by_Endom <- factor(meta00$menstrPh_by_Endom, levels=c('Weakly Proliferative','Proliferative','Late Proliferative/Early Secretory','Secretory','Inactive'))
+
+mat <- cpm[markers$ENSEMBL,meta00$SVC]
+dim(mat)
+rownames(mat) <- markers$SYMBOL
+
+library(ComplexHeatmap)
+# markerRowAnno <- rowAnnotation(
+  # Marker = markers$Marker
+# ) 
+
+
+heatmapColorPal <- viridis::viridis(n=100)
+pal = c(
+  viridis::viridis(n=4),
+  viridis::rocket(n=5)[2:4],
+  viridis::turbo(n=5)[c(2,4)]
+)
+# pal2 = viridis::mako(n=5)
+pal2 = viridis::turbo(n=5)
+
+####==== get current contraception use with progestin exposure
+tmp <- readxl::read_excel('../hormone_use.xlsx',sheet='secbyCurrentuse ')[,c('SVC','progestin_exposure')]
+meta00 <- dplyr::right_join(tmp,meta00,by='SVC')
+####
+
+haCol_rna_markers <- HeatmapAnnotation(
+  # `Path Report Menstrual Phase` = meta00$menstrPh_by_Endom,
+  # `Progestin Exposure` = meta00$progestin_exposure,
+  `Age` = meta00$`Age at time of surgery`,
+  `Stromal Content` = meta00$MIR200cAvgBeta,
+  `Menopause Status` = meta00$MenoStatus,
+  `BRCAm` = meta00$groupBRCA,
+  # `Race` = meta00$Race,
+  # `Days since LMP` = meta00$`Days since LMP`,
+  # DaysSinceLMP_categ = meta00$DaysSinceLMP_categ,
+  `Surgical Indication` = meta00$`Reason for surgery 3`,
+  # `Number of Pregnancies` = as.numeric(meta00$`# of Pregnancies`),
+
+  # `Immune Score` = meta00$ImmuneScore,
+  col = list(
+    `Stromal Content` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 1, length = 20),
+                              colors = viridis::cividis(20)
+    ),
+    `Age` = circlize::colorRamp2(
+                              breaks = seq(from = 20, to = 72, length = 20),
+                              colors = colorRampPalette(c("gray75", "black"))(20)
+    ),
+    `Progestin Exposure` = c(
+      'Likely' = 'pink',
+      'Certain' = 'red'
+    ),
+    `Menopause Status` = c(
+      'Pre' = "#28BBECFF",
+      'Post' = "#FB8022FF",
+      'Postpartum' = 'grey33'
+    ),
+    `BRCAm` = c(
+      # 'BRCA1' = '#40498e',
+      'BRCA1' = '#7df5f5',
+      'BRCA2' = '#38aaac',
+      'NON-BRCA' = 'black'
+    ),
+    Race = c(
+      'Asian' = '#30123BFF',
+      'Black' = "#28BBECFF",
+      'East Indian' = "#A2FC3CFF",
+      'Hispanic Latino/White' = "#FB8022FF",
+      'White' = "#7A0403FF",
+      'Other' = 'gray48'
+    ),
+    DaysSinceLMP_categ=c(
+      '[0,12]' = '#67001F',
+      '(12,16]' = '#92C5DE',
+      '(16,30]' = '#053061',
+      '(30,60]' = 'black'
+    ),
+    `Path Report Menstrual Phase` = c(
+      'Weakly Proliferative'='#92C5DE',
+      'Proliferative' = '#0096FF',
+      'Late Proliferative/Early Secretory'='dodgerblue4',
+      'Secretory'= "#CA0020",
+      'Inactive'='black'
+    ),
+    `Surgical Indication` = c(
+      'Benign Uterine'='#8DD3C7',
+      'Cesarean Section'='#FCCDE5',
+      'Cervical Dysplasia'='#BEBADA',
+      'Menorrhagia'='#FB8072',
+      'Endometriosis'='#80B1D3',
+      'Ovarian Serous Cystadenoma'='#FDB462',
+      # 'Ovarian Cyst (Sex chord stromal tumor)'='#B3DE69',
+      'Ovarian Cyst'='pink3',
+      'Pelvic mass'='#D9D9D9',
+      'Adnexal Mass' = '#BC80BD',
+      # 'Tubal Sterilization' = '#CCEBC5',
+      'Tubal Sterilization' = '#0BDA51',
+      'Gender Affirmation'='#FFED6F',
+      # 'Risk Reduction' = '#B3DE69'
+      'Risk Reduction' = 'green'
+    ),
+    `contraception use` = c(
+      'NA'='grey66',
+      'Former'='purple',
+      'Current'='blue',
+      'Y'='blue3',
+      'Y - BTL'='darkblue',
+      'N' = 'red'
+    )
+  ),na_col='white'
+)
+
+
+```
+
+```{r marker_gene_heatmap,fig.height=7,fig.width=7,eval=FALSE}
+
+scaled_mat = t(scale(t(mat))); dim(scaled_mat)
+scaled_mat[scaled_mat>2] <- 2
+scaled_mat[scaled_mat<(-2)] <- -2
+matFinal <- scaled_mat[,meta00$SVC]
+colnames(matFinal) <- meta00$patientID
+
+hm00_w_markers <- ComplexHeatmap::Heatmap(matFinal,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  cluster_column_slices = FALSE,
+  cluster_row_slices = FALSE,
+  col=viridis::viridis(n=100),
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  heatmap_legend_param = list(title='Zscore CPM'),
+  row_title_gp = gpar(fontsize = 12),
+  row_names_gp = gpar(fontsize = 7),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 8#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 12),
+  # right_annotation = markerRowAnno,
+  top_annotation = haCol_rna_markers,
+  heatmap_width = unit(8, "in"),  
+  heatmap_height = unit(9, "in"),  
+  column_split = meta00$MenoStatus,
+  # column_split = meta00$menstrPh_by_Endom,
+  # column_split = paste(meta00$MenoStatus,meta00$groupBRCA),
+  row_split = markers$Marker,
+  row_title_rot = 0
+)
+
+# pdf('MasterMarkers_NormalFTs_free2.pdf',width = 25,height = 12); hm00; dev.off()
+# pdf('Fig5a_cell_type_markers.pdf',width = 15,height = 12); hm00_w_markers; dev.off()
+pdf('Fig5a_cell_type_markers_by_menstr_phase.pdf',width = 15,height = 12); hm00_w_markers; dev.off()
+
+
+# get the order from hm00_w_markers for use with the secretory markers heatmap
+column_order <- column_order(hm00_w_markers)
+
+```
+
+## Ciliated and/or Secretory Markers 
+
+```{r ciliated_secretory_markers, fig.height=11,fig.width=11}
+
+# meta00 from 'get_markers' chunk above
+markers1 <- read.csv('top50_geneIDs_ciliated_secretory_and_others_use_this.csv')
+markers1 <- markers1[,1:3]
+# markers1 <- dplyr::filter(markers1,cell_type!='stem cells')
+markers1 <- dplyr::filter(markers1,cell_type%in%c('ciliated','secretory')) # this matches what was done for the CCOC/ENOC/HGSOC data
+
+# markers for Hui
+markers33 <- data.frame(
+  # ext_gene = c('ESR1','PGR','HNF1B'),
+  ext_gene = c('ESR1','PGR'),
+  # ens_gene = c('ENSG00000091831','ENSG00000082175','ENSG00000275410'),
+  ens_gene = c('ENSG00000091831','ENSG00000082175'),
+  cell_type = c(rep('',2))
+)
+
+# markers <- markers1
+markers <- rbind(markers1,markers33)
+
+# filter to just secretory!
+markers <- dplyr::filter(markers,cell_type == 'secretory' | cell_type=='')
+# markers <- dplyr::filter(markers,cell_type == 'secretory' | cell_type=='' | cell_type=='ciliated')
+
+# remove those markers not present in the sec/pro/histotype RNAseq data
+markers <- dplyr::filter(markers,!ext_gene %in% c("C1orf194","EFCAB1","TTC25"))
+
+# markers <- rbind(markers1,markers2,markers22)
+length(unique(markers$ens_gene))
+length(unique(markers$ext_gene))
+dim(markers)
+
+# which(duplicated(markers$ens_gene))
+table(markers$ens_gene %in% rownames(cpm))
+stopifnot(length(markers$ext_gene[which(! markers$ens_gene %in% rownames(cpm))])==0)
+
+cpm2 <- cpm[which(rownames(cpm) %in% markers$ens_gene),]
+markersFilt <- dplyr::filter(markers,ens_gene %in% rownames(cpm)); dim(markersFilt)
+dim(cpm2)
+cpm2 <- cpm2[markersFilt$ens_gene,meta00$SVC]
+rownames(cpm2) <- markersFilt$ext_gene
+stopifnot(all(colnames(cpm2)==meta00$SVC))
+# colnames(cpm2) <- m1$`Reason for surgery 2`
+colnames(cpm2) <- meta00$patientID
+
+# write.table(file='CiliatedSecretoryMarkers.tsv',
+# (markersF %>% dplyr::rename('ensemblID'='ens_gene','geneSymbol'='ext_gene') %>%
+#   dplyr::select(one_of(c('geneSymbol','cell_type')))),
+# quote=FALSE,row.names=FALSE,sep="\t"
+# )
+
+mat <- cpm2
+matScaled <- t(scale(t(mat),center = TRUE))
+matScaled[matScaled>2] <- 2
+matScaled[matScaled<(-2)] <- -2
+# mat <- dplyr::select(mat,one_of(meta$SVC))
+dim(matScaled)
+
+
+myHM <- ComplexHeatmap::Heatmap(
+    # matLogCPM,
+    matScaled,
+    show_column_names = TRUE,
+    # col=heatmapColorPal,
+    col=viridis::viridis(20),
+    cluster_rows = FALSE,
+    cluster_columns = TRUE,
+    # column_order =  unlist(column_order_uChicago),
+    # heatmap_legend_param = list(title='log2(CPM)'),
+    heatmap_legend_param = list(title='Z-Score'),
+    row_title_gp = gpar(fontsize = 9),
+    row_names_gp = gpar(fontsize = 4),
+    column_names_rot = 90,
+    column_names_gp = gpar(
+      fontsize = 8#,
+      # col = myPosColors
+    ),
+    # column_title = nameArg, 
+    column_title_gp = gpar(fontsize = 12),
+    column_title_rot = 0,
+    top_annotation = haCol_rna_markers,
+    heatmap_width = unit(8, "in"),  
+    heatmap_height = unit(6, "in"),  
+    row_title_rot = 0,
+    # column_split = meta00$MenoStatus,
+    row_split = markersFilt$cell_type,
+    show_row_dend = TRUE,
+    cluster_column_slices = FALSE,
+    column_km = 5 # when you set column_km this clusters it specifically with different splits
+  ); myHM
+
+# pdf('CiliatedSecretoryMarkersByAge_Zscore.pdf',width = 15,height = 13); myHM; dev.off()
+pdf('SecretoryMarkers_grouped_by_MenoStatus_clustered.pdf',width = 15,height = 13); myHM; dev.off()
+# pdf('CiliatedSecretoryMarkers_grouped_by_MenoStatus.pdf',width = 15,height = 13); myHM; dev.off()
+
+
+
+
+
+```
+
+### with normal endometrium
+
+```{r ciliated_secretory_with_Pro_Sec_Normals,fig.height=11,fig.width=18}
+# now do the two heatmaps next to each other
+# hm2 <- readRDS('/Users/ianbeddows/Desktop/currentProjects/Hui_CCOC_ENOC_HGSC_Rproj/ciliated_secretory_markers_heatmap.Rds')
+hm2 <- readRDS('/Users/ian.beddows/Desktop/currentProjects/Hui_CCOC_ENOC_HGSC_Rproj/secretory_markers_heatmap.Rds')
+
+cat('Missing in canary data\n')
+rownames(hm2@matrix)[which(! rownames(hm2@matrix) %in% rownames(myHM@matrix))]
+cat('Missing in sec/pro data\n')
+rownames(myHM@matrix)[which(! rownames(myHM@matrix) %in% rownames(hm2@matrix))]
+
+# pdf('CiliatedSecretoryMarkers_Zscore_with_sec_pro_data2.pdf',width = 20,height = 13); hm2 + myHM; dev.off()
+# pdf('SecretoryMarkers_Zscore_with_sec_pro_data2.pdf',width = 20,height = 13); hm2 + myHM; dev.off()
+# pdf('SecretoryMarkers_Zscore_with_sec_pro_data2_grouped_by_MenoStatus.pdf',width = 20,height = 13); hm2 + myHM; dev.off()
+pdf('CiliatedSecretoryMarkers_Zscore_with_sec_pro_data2_grouped_by_MenoStatus.pdf',width = 20,height = 13); hm2 + myHM; dev.off()
+
+
+# cluster 1 from Fig 5b; proliferative phase FTs
+pdf('CiliatedSecretoryMarkers_Zscore_with_sec_pro_data2_grouped_by_MenoStatus_column_km_DiffProteinExprClusters.pdf',height = 12,width = 18); draw(hm2 + myHM); dev.off()
+draw(hm2 + myHM)
+c <- column_order(hm2 + myHM)
+
+# cluster 2 from Fig 5b; pre high sec markers
+cluster1 <- colnames(matScaled)[c$matrix_21$`2,Pre`] # 2,Pre is high sec
+cluster2 <- colnames(matScaled)[c$matrix_21$`3,Pre`] # 2,Pre is high pro
+
+saveRDS(file = 'Fig5b_cluster_2_preFTs_highSec_cluster2.Pre.Rds',cluster1) # 2,Pre is high sec
+saveRDS(file = 'Fig5b_preFTs_highPro_cluster3.Pre.Rds',cluster2) # 3,Pre is high pro
+
+# save order for Diff Protein Expr with pre clusters that are pro & sec
+# saveRDS(myHM,'SecretoryMarkers_grouped_by_MenoStatus_clustered.columnOrder.Rds')
+# saveRDS(colnames(matScaled),'SecretoryMarkers_grouped_by_MenoStatus_clustered.names.Rds')
+colOrder <-  colNames <- readRDS('../canary_meth_Rproj/SecretoryMarkers_grouped_by_MenoStatus_clustered.names.Rds')
+column_order(colOrder)$Pre[1]
+
+```
+
+## DEGs
+
+```{r deg54_hm}
+
+degTable <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Table2_Tables/rna_BRCA1_and_BRCA2_vs_WT_nonPreg_wRaceAdj.DGE_N54.tsv',sep="\t"); dim(degTable)
+
+degTable <- dplyr::filter(degTable,FDR<0.05); dim(degTable)
+
+mat <- cpm[degTable$ens_gene,meta00$SVC]
+dim(mat)
+rownames(mat) <- ifelse(degTable$ext_gene=='',degTable$ens_gene,degTable$ext_gene)
+
+scaled_mat = t(scale(t(mat))); dim(scaled_mat)
+scaled_mat[scaled_mat>3] <- 3
+scaled_mat[scaled_mat<(-3)] <- -3
+matFinal <- scaled_mat[,meta00$SVC]
+# matFinal <- mat[,meta00$SVC]
+colnames(matFinal) <- meta00$patientID
+
+hm00_degs54 <- ComplexHeatmap::Heatmap(matFinal,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  cluster_column_slices = FALSE,
+  cluster_row_slices = FALSE,
+  col=viridis::viridis(n=100),
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  heatmap_legend_param = list(title='Zscore log2(CPM)'),
+  row_title_gp = gpar(fontsize = 12),
+  row_names_gp = gpar(fontsize = 7),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 8#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 12),
+  # right_annotation = markerRowAnno,
+  top_annotation = haCol_rna_markers,
+  heatmap_width = unit(8, "in"),  
+  heatmap_height = unit(9, "in"),  
+  column_split = factor(ifelse(meta00$groupBRCA=='NON-BRCA','Non-BRCAm','BRCAmut'),
+                        levels=c('Non-BRCAm','BRCAmut')),
+  # column_split = meta00$menstrPh_by_Endom,
+  # column_split = paste(meta00$MenoStatus,meta00$groupBRCA),
+  # row_split = markers$Marker,
+  row_title_rot = 0
+)
+
+# pdf('MasterMarkers_NormalFTs_free2.pdf',width = 25,height = 12); hm00; dev.off()
+# pdf('Fig5a_cell_type_markers.pdf',width = 15,height = 12); hm00_w_markers; dev.off()
+# pdf('Fig4_hm00_degs54.pdf',width = 15,height = 12); hm00_degs54; dev.off()
+pdf('Fig4_hm00_degs54_groupedBRCA.pdf',width = 15,height = 12); hm00_degs54; dev.off()
+
+
+
+```
+
+## with markers from Pro v Sec Normal Endom.
+
+```{r separate_with_highPro_highSec_markers_normal_endometrium}
+
+markersSP <- readxl::read_excel('~/Desktop/MasterMarkers.xlsx',sheet='Table S4 Beddows 2024')
+markersSP <- dplyr::arrange(markersSP,logFC)
+markersSP2 <- markersSP
+# markersSP2 <- rbind(markersSP[1:20,],markersSP[780:799,])
+
+cpm2 <- cpm[which(rownames(cpm) %in% markersSP2$ENSEMBL),]
+markersFilt <- dplyr::filter(markersSP2,ENSEMBL %in% rownames(cpm)); dim(markersFilt)
+dim(cpm2)
+cpm2 <- cpm2[markersFilt$ENSEMBL,]
+rownames(cpm2) <- ifelse(is.na(markersFilt$SYBMOL),markersFilt$ENSEMBL,markersFilt$SYBMOL)
+stopifnot(all(colnames(cpm2)==m1$SVC))
+# colnames(cpm2) <- m1$`Reason for surgery 2`
+colnames(cpm2) <- m1$patientID
+
+mat <- cpm2
+matScaled <- t(scale(t(mat),center = TRUE))
+matScaled[matScaled>2] <- 2
+matScaled[matScaled<(-2)] <- -2
+# mat <- dplyr::select(mat,one_of(meta$SVC))
+dim(matScaled)
+r <- which(rownames(matScaled)=='NA')
+if(length(r)){
+  matScaled <- matScaled[-r,]
+}
+# remove NAs
+# matScaled <- matScaled[rowSums(is.na(matScaled)) != ncol(matScaled), ]
+
+myHM_sec_pro <- ComplexHeatmap::Heatmap(
+    # matLogCPM,
+    matScaled,
+    show_column_names = TRUE,
+    # col=heatmapColorPal,
+    col=viridis::viridis(20),
+    cluster_rows = TRUE,
+    cluster_columns = TRUE,
+    # heatmap_legend_param = list(title='log2(CPM)'),
+    heatmap_legend_param = list(title='Z-Score'),
+    row_title_gp = gpar(fontsize = 9),
+    row_names_gp = gpar(fontsize = 4),
+    column_names_rot = 90,
+    column_names_gp = gpar(
+      fontsize = 8#,
+      # col = myPosColors
+    ),
+    # column_title = nameArg, 
+    column_title_gp = gpar(fontsize = 12),
+    column_title_rot = 0,
+    top_annotation = haCol_ciliatedSec,
+    heatmap_width = unit(8, "in"),  
+    heatmap_height = unit(10, "in"),  
+    row_title_rot = 0,
+    column_split = meta00$MenoStatus,
+    row_split = markersFilt$cell_type,
+    show_row_dend = TRUE,
+    cluster_column_slices = FALSE,
+    # right_annotation = rowANNO
+  )
+# myHM_sec_pro
+```
+
+```{r ciliated_secretory_with_HGSOC_using_sec_pro_markers}
+## now do the two heatmaps next to each other
+hm44 <- readRDS('/Users/ianbeddows/Desktop/currentProjects/Hui_CCOC_ENOC_HGSC_Rproj/ciliated_secretory_markers_heatmap_pro_sec.Rds')
+
+cat('Missing in canary data\n')
+rownames(hm44@matrix)[which(! rownames(hm44@matrix) %in% rownames(myHM_sec_pro@matrix))]
+cat('Missing in sec/pro data\n')
+rownames(myHM_sec_pro@matrix)[which(! rownames(myHM_sec_pro@matrix) %in% rownames(hm44@matrix))]
+
+pdf('Sec_v_Pro_NormalEndom_DEGs.pdf',width = 20,height = 13); hm44 + myHM_sec_pro; dev.off()
+pdf('Sec_v_Pro_NormalEndom_DEGs_without_normals.pdf',width = 15,height = 13); myHM_sec_pro; dev.off()
+
+```
+
+## DEG heatmap with indications - N54
+
+```{r build_heatmap_anno_degs,eval=TRUE}
+# use meta00 from build_heatmap_anno_7424 chunk
+
+# meta00 <- meta
+# meta00 <- dplyr::filter(meta00,Pregnancy=='Normal'); dim(meta00)
+# meta00 <- left_join(meta00,x)
+
+heatmapColorPal <- viridis::viridis(n=100)
+pal = c(
+  viridis::viridis(n=4),
+  viridis::rocket(n=5)[2:4],
+  viridis::turbo(n=5)[c(2,4)]
+)
+# pal2 = viridis::mako(n=5)
+pal2 = viridis::turbo(n=5)
+haCol_deg <- HeatmapAnnotation(
+# haRowMaster <- rowAnnotation(
+  `BRCA Germline` = meta00$groupBRCA,
+  `Stromal Content` = meta00$MIR200cAvgBeta,
+  # `Postpartum` = meta00$Postpartum,
+  `Age` = meta00$`Age at time of surgery`,
+
+  # Pilot = meta00$Pilot,
+  # `Reproductive Status` = meta00$ReproductiveStatus,
+  `Menopause Status` = meta00$MenoStatus,
+  `Race` = meta00$Race,
+
+  # `Days since LMP` = meta00$DaysSinceLMP_clean,
+
+  # `Number of Pregnancies` = as.numeric(meta00$`# of Pregnancies`),
+
+  # `Immune Score` = meta00$ImmuneScore,
+  col = list(
+    `Stromal Content` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 1, length = 20),
+                              colors = viridis::cividis(20)
+    ),
+    `Days since LMP` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 50, length = 20),
+                              colors = colorRampPalette(c("gray100", "black"))(20)
+    ),
+    `Age` = circlize::colorRamp2(
+                              breaks = seq(from = 20, to = 72, length = 20),
+                              colors = colorRampPalette(c("gray75", "gray10"))(20)
+    ),
+    `Nanodrop yield` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 25000, length = 20),
+                              colors = colorRampPalette(c("white", "black"))(20)
+    ),
+    Pilot = c(
+      'A' = pal[1],
+      'B' = pal[2],
+      'C' = pal[3],
+      'D' = pal[4]
+    ),
+    `Menopause Status` = c(
+      'Pre' = pal[8],
+      'Post' = pal[9],
+      'Postpartum' = 'pink'
+    ),
+    `BRCA Germline` = c(
+      'BRCA1' = '#40498e',
+      'BRCA2' = '#38aaac',
+      'NON-BRCA' = 'black'
+    ),
+    Race = c(
+      'Asian' = pal2[1],
+      'Black' = pal2[2],
+      'East Indian' = pal2[3],
+      'Hispanic Latino/White' = pal2[4],
+      'White' = pal2[5],
+      'Other' = 'gray48'
+    )
+  ),na_col='white'
+)
+
+
+
+```
+
+```{r deg_gene_heatmap,fig.height=7,fig.width=7,eval=FALSE}
+# get DEGs
+degs <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Table2_Tables/rna_BRCA1_and_BRCA2_vs_WT_nonPreg_wRaceAdj.DGE_N54.tsv',sep="\t")
+degs <- dplyr::filter(degs,FDR<0.05)
+# stopifnot(all(colnames(cpm)%in%meta.rna$SVC))
+
+## get new indications - already done now in the first chunk where meta is loaded
+# tmp <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Canary_Manuscript_Tables.xlsx',sheet='Table S1 Clinical Data')
+# add new indication to meta
+# table(meta$`Patient ID` %in% tmp$`Patient ID`)
+# meta <- dplyr::left_join(meta,tmp[,c('Patient ID','Reason for surgery 2')])
+mat <- cpm[degs$ens_gene,meta$SVC]
+dim(mat)
+rownames(mat) <- ifelse(degs$ext_gene!='',degs$ext_gene,degs$ens_gene)
+colnames(mat) <- meta$`Reason for surgery 2`
+
+scaled_mat = t(scale(t(mat))); dim(scaled_mat)
+scaled_mat[scaled_mat>2] <- 2
+scaled_mat[scaled_mat<(-2)] <- -2
+
+
+hm00 <- ComplexHeatmap::Heatmap(scaled_mat,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  col=viridis::viridis(n=100),
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  heatmap_legend_param = list(title='Zscore CPM'),
+  row_title_gp = gpar(fontsize = 9),
+  row_names_gp = gpar(fontsize = 4),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 5#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 22),
+  # right_annotation = markerRowAnno,
+  top_annotation = haCol_deg,
+  heatmap_width = unit(5, "in"),  
+  heatmap_height = unit(9, "in"),  
+  # row_split = paste0(meta$ReproductiveStatus,'\n',meta$groupBRCA),
+  # row_split = markers$Marker,
+  row_title_rot = 0
+)
+
+pdf('DEGs_54_free2.pdf',width = 10,height = 11); hm00; dev.off()
+
+
+# ciliated markers vs. age at time of surgery faceted by LMP_explanation
+
+
+```
+
+## DEG heatmap with indications - N159
+
+```{r deg_gene_heatmap2,fig.height=7,fig.width=7,eval=FALSE}
+# get DEGs
+degs <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Table2_Tables/rna_BRCA1_and_BRCA2_vs_WT_nonPreg.DGE_N159.tsv',sep="\t")
+# degs <- dplyr::filter(degs,FDR<0.05)
+degs <- dplyr::filter(degs,FDR<0.05); dim(degs)
+degs$ext_gene[which(is.na(degs$ext_gene))] <- degs$ens_gene[which(is.na(degs$ext_gene))] # do this because 144 was NA
+# degs <- dplyr::filter(degs,logCPM>as.numeric(summary(degs$logCPM)[3])); nrow(degs)
+# degs <- dplyr::filter(degs,abs(logFC)>log2(2)); nrow(degs)
+# stopifnot(all(colnames(cpm)%in%meta.rna$SVC))
+
+## get new indications - already done now in the first chunk where meta is loaded
+# tmp <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Canary_Manuscript_Tables.xlsx',sheet='Table S1 Clinical Data')
+# add new indication to meta
+# table(meta$`Patient ID` %in% tmp$`Patient ID`)
+# meta <- dplyr::left_join(meta,tmp[,c('Patient ID','Reason for surgery 2')])
+mat <- cpm[degs$ens_gene,meta00$SVC]
+dim(mat)
+
+#----------------------==========
+#----------------------========== post hoc filtering of DEGs to remove low expressed FPs
+# see raw counts for these <----- = = = = = ----->
+tmpCPMnotLog <- edgeR::cpm(raw_counts[,meta00$SVC],log=FALSE)
+tmp <- tmpCPMnotLog[degs$ens_gene,]
+# summary(rowMeans(tmp))
+x1 <- rowMeans(tmp)
+x1[x1>8] <- 8
+x2 <- apply(tmp,1,FUN=quantile,probs=0.95)
+# x2Control <- apply(tmpCPMnotLog,1,FUN=quantile,probs=0.95) # control for those already filtered tags
+# summary(x2)
+x2[x2>8] <- 8
+# apply the filter here, requiring the 95th percentile to have
+summary(x2Control)
+# keepDegs <- which(x2>1); length(keepDegs) # final filter for 117
+keepDegs <- which(x2>=0); length(keepDegs) # filter for all (supp figure) all 159
+# x <- apply(raw_counts[degs$ens_gene,meta00$SVC],1,FUN=function(x){
+#   return(length(which(x==0)))
+# })
+# View(raw_counts[names(which(x>80)),])
+#----------------------==========
+#----------------------==========
+
+rownames(mat) <- ifelse(degs$ext_gene!='',degs$ext_gene,degs$ens_gene)
+colnames(mat) <- meta00$`Reason for surgery 2`
+mat <- mat[keepDegs,]
+# add row annotation with the average logCPM
+haRow <- rowAnnotation(
+  `AvgCPM` = anno_barplot(x1[keepDegs],gp = gpar(fill='gray45'), width = unit(0.5, "in"),border=FALSE),
+  `logFC` = anno_barplot(degs$logFC[keepDegs],gp = gpar(fill='gray45'), width = unit(0.5, "in"),border=FALSE),
+  `95thCPM` = anno_barplot(x2[keepDegs],gp = gpar(fill='gray45'), width = unit(0.5, "in"),border=FALSE)
+)
+
+scaled_mat = t(scale(t(mat))); dim(scaled_mat)
+scaled_mat[scaled_mat>2] <- 2
+scaled_mat[scaled_mat<(-2)] <- -2
+
+# factor levels
+meta00$groupBRCA <- factor(meta00$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+meta00$groupBRCApostpartum <- ifelse(meta00$Postpartum==TRUE,'Postpartum',as.character(meta00$groupBRCA))
+meta00$groupBRCApostpartum <- factor(meta00$groupBRCApostpartum,levels=c('NON-BRCA','BRCA1','BRCA2','Postpartum'))
+hm00 <- ComplexHeatmap::Heatmap(scaled_mat,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  col=viridis::viridis(n=100),
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  cluster_column_slices = FALSE,
+  clustering_distance_rows = 'euclidean',
+  heatmap_legend_param = list(title='Zscore CPM'),
+  row_title_gp = gpar(fontsize = 9),
+  row_names_gp = gpar(fontsize = 4),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 5#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 22),
+  right_annotation = haRow,
+  top_annotation = haCol_rna_markers,
+  heatmap_width = unit(5, "in"),  
+  heatmap_height = unit(9, "in"),  
+  # column_split = meta00$Race,
+  column_split = meta00$groupBRCApostpartum,
+  # row_split = paste0(meta$ReproductiveStatus,'\n',meta$groupBRCA),
+  # row_split = markers$Marker,
+  row_split = ifelse(degs$logFC[keepDegs]>0,'UP','DN'),
+  row_title_rot = 0
+)
+
+pdf('DEGs_159_free2.pdf',width = 10,height = 11); hm00; dev.off()
+# pdf('DEGs_159_free2_showing_117_Fig3.pdf',width = 10,height = 11); hm00; dev.off()
+
+degs159 <- degs[keepDegs,]; dim(degs159)
+# ciliated markers vs. age at time of surgery faceted by LMP_explanation
+
+
+```
+
+## DEG heatmap with indications - inactive vs. postmeno
+
+```{r deg_gene_heatmap22,fig.height=7,fig.width=7,eval=FALSE}
+# get DEGs
+degs <- read.delim('inactive_vs_postmeno.DGE.tsv',sep="\t")
+# degs <- dplyr::filter(degs,FDR<0.05)
+degs <- dplyr::filter(degs,FDR<0.05); dim(degs)
+degs$ext_gene[which(is.na(degs$ext_gene))] <- degs$ens_gene[which(is.na(degs$ext_gene))] # do this because 144 was NA
+# degs <- dplyr::filter(degs,logCPM>as.numeric(summary(degs$logCPM)[3])); nrow(degs)
+# degs <- dplyr::filter(degs,abs(logFC)>log2(2)); nrow(degs)
+# stopifnot(all(colnames(cpm)%in%meta.rna$SVC))
+
+## get new indications - already done now in the first chunk where meta is loaded
+# tmp <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Canary_Manuscript_Tables.xlsx',sheet='Table S1 Clinical Data')
+# add new indication to meta
+# table(meta$`Patient ID` %in% tmp$`Patient ID`)
+# meta <- dplyr::left_join(meta,tmp[,c('Patient ID','Reason for surgery 2')])
+mat <- cpm[degs$ens_gene,meta00$SVC]
+dim(mat)
+
+#----------------------==========
+#----------------------========== post hoc filtering of DEGs to remove low expressed FPs
+# see raw counts for these <----- = = = = = ----->
+tmpCPMnotLog <- edgeR::cpm(raw_counts[,meta00$SVC],log=FALSE)
+tmp <- tmpCPMnotLog[degs$ens_gene,]
+# summary(rowMeans(tmp))
+x1 <- rowMeans(tmp)
+x1[x1>8] <- 8
+x2 <- apply(tmp,1,FUN=quantile,probs=0.95)
+# x2Control <- apply(tmpCPMnotLog,1,FUN=quantile,probs=0.95) # control for those already filtered tags
+# summary(x2)
+x2[x2>8] <- 8
+# apply the filter here, requiring the 95th percentile to have
+summary(x2Control)
+# keepDegs <- which(x2>1); length(keepDegs) # final filter for 117
+keepDegs <- which(x2>=0); length(keepDegs) # filter for all (supp figure) all 159
+# x <- apply(raw_counts[degs$ens_gene,meta00$SVC],1,FUN=function(x){
+#   return(length(which(x==0)))
+# })
+# View(raw_counts[names(which(x>80)),])
+#----------------------==========
+#----------------------==========
+
+rownames(mat) <- ifelse(degs$ext_gene!='',degs$ext_gene,degs$ens_gene)
+colnames(mat) <- meta00$`Reason for surgery 2`
+mat <- mat[keepDegs,]
+# add row annotation with the average logCPM
+haRow <- rowAnnotation(
+  `AvgCPM` = anno_barplot(x1[keepDegs],gp = gpar(fill='gray45'), width = unit(0.5, "in"),border=FALSE),
+  `logFC` = anno_barplot(degs$logFC[keepDegs],gp = gpar(fill='gray45'), width = unit(0.5, "in"),border=FALSE),
+  `95thCPM` = anno_barplot(x2[keepDegs],gp = gpar(fill='gray45'), width = unit(0.5, "in"),border=FALSE)
+)
+
+scaled_mat = t(scale(t(mat))); dim(scaled_mat)
+scaled_mat[scaled_mat>2] <- 2
+scaled_mat[scaled_mat<(-2)] <- -2
+
+# factor levels
+meta00$groupBRCA <- factor(meta00$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+meta00$groupBRCApostpartum <- ifelse(meta00$Postpartum==TRUE,'Postpartum',as.character(meta00$groupBRCA))
+meta00$groupBRCApostpartum <- factor(meta00$groupBRCApostpartum,levels=c('NON-BRCA','BRCA1','BRCA2','Postpartum'))
+hm00 <- ComplexHeatmap::Heatmap(scaled_mat,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  col=viridis::viridis(n=100),
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  cluster_column_slices = FALSE,
+  clustering_distance_rows = 'euclidean',
+  heatmap_legend_param = list(title='Zscore CPM'),
+  row_title_gp = gpar(fontsize = 9),
+  row_names_gp = gpar(fontsize = 4),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 5#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 7),
+  right_annotation = haRow,
+  top_annotation = haCol_rna_markers,
+  heatmap_width = unit(9, "in"),  
+  heatmap_height = unit(9, "in"),  
+  # column_split = meta00$groupBRCApostpartum,
+  column_split = meta00$clusterMembership,
+  row_split = ifelse(degs$logFC[keepDegs]>0,'UP','DN'),
+  row_title_rot = 0
+)
+
+pdf('DEGs_inactive_vs_postmeno.pdf',width = 15,height = 11); hm00; dev.off()
+
+```
+
+## BRCA signatures from previous pubs
+
+```{r press41_signature_take1,fig.height=7,fig.width=7,eval=FALSE}
+# get DEGs
+markers <- readxl::read_excel('~/Desktop/MasterMarkers.xlsx',sheet='BRCAsignatures')
+stopifnot(all(colnames(cpm)%in%meta00$SVC))
+
+## get new indications
+tmp <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add new indication to meta
+
+# which markers from brca-signatures are in our data?
+table(markers$ENSEMBL %in% rownames(cpm))
+# remove the 1 that is not
+markers <- dplyr::filter(markers,ENSEMBL %in% rownames(cpm)); dim(markers)
+
+# Filter for Press signature
+# markers <- dplyr::filter(markers,Marker=='Press41'); dim(markers)
+# markers <- dplyr::filter(markers,Marker=='George2011'); dim(markers)
+
+mat <- cpm[markers$ENSEMBL,meta00$SVC]
+dim(mat)
+rownames(mat) <- markers$SYMBOL
+# colnames(mat) <- meta$`Reason for surgery 2`
+
+scaled_mat = t(scale(t(mat))); dim(scaled_mat)
+scaled_mat[scaled_mat>2] <- 2
+scaled_mat[scaled_mat<(-2)] <- -2
+
+# make row anno with the signature
+haRow_sig <- ComplexHeatmap::rowAnnotation(
+  Study = markers$Marker,
+  col = list(
+    Study = c('Press41'='#BEBADA','George2011'='#B3DE69')
+  )
+)
+
+hm00 <- ComplexHeatmap::Heatmap(scaled_mat,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  col=viridis::viridis(n=100),
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  cluster_column_slices = FALSE,
+  heatmap_legend_param = list(title='Zscore CPM'),
+  row_title_gp = gpar(fontsize = 9),
+  row_names_gp = gpar(fontsize = 9),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 8#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 22),
+  right_annotation = haRow_sig,
+  top_annotation = haCol_rna_markers,
+  heatmap_width = unit(5, "in"),  
+  heatmap_height = unit(5, "in"),  
+  column_split = meta00$groupBRCA,
+  row_split = markers$Marker,
+  row_title_rot = 0
+)
+hm00
+pdf('BRCA_signatures_heatmap.pdf',width = 10,height = 7); hm00; dev.off()
+
+```
+
+```{r press41_signature_take2,fig.height=7,fig.width=7,eval=FALSE}
+# get DEGs
+markers <- readxl::read_excel('~/Desktop/MasterMarkers.xlsx',sheet='BRCAsignatures')
+stopifnot(all(colnames(cpm)%in%meta.rna$SVC))
+dim(markers)
+markers <- dplyr::filter(markers,ENSEMBL %in% rownames(cpm)); dim(markers)
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta01 <- dplyr::filter(m0,useRNA_2==TRUE); dim(meta01)
+# build correlation plots
+pList <- list()
+for( i in 1:nrow(markers)){
+
+  # correlate the Z-score to DCN expression
+  mat <- data.frame(
+    CPM = cpm[markers$ENSEMBL[i],meta01$SVC],
+    Stroma = as.numeric(meta01$MIR200cAvgBeta)
+  )
+
+  r1 <- cor.test(mat$CPM,mat$Stroma,method='spearman')
+    
+  g <- ggplot(mat,aes(x=CPM,y=Stroma)) + geom_point(color='grey52') + theme_minimal() + xlab('') + ylab('') + labs(
+      title = paste0(markers$SYMBOL[i],'; ',markers$ENSEMBL[i]),
+      subtitle = paste0('rho=',signif(r1$estimate,2),'; Pval=',signif(r1$p.value,2))
+      ) + theme(plot.subtitle=element_text(size=10,color="black"))
+  pList[[i]] <- g
+}  
+  
+ggsave(
+   filename = "press41_gene_signature_stroma_correlation.pdf", 
+   plot = marrangeGrob(pList, nrow=5, ncol=10), limitsize = FALSE,
+   width = 30, height = 15
+)
+
+```
+
+# 5 clusters: luteal, inactive, follicular, postmeno, postpartum
+
+```{r find_gene_markers_5_groups}
+
+# first load the meta00
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE & useProteomics==TRUE); dim(meta00)
+# meta00 <- dplyr::arrange(meta00,Pregnancy,`Age at time of surgery`)
+meta00 <- dplyr::arrange(meta00,`Age at time of surgery`)
+meta00$MenoStatus <- ifelse(meta00$Postpartum,'Postpartum',meta00$ReproductiveStatus)
+meta00$MIR200cAvgBeta <- as.numeric(meta00$MIR200cAvgBeta)
+meta00$MenoStatus <- factor(meta00$MenoStatus, levels=c('Pre','Post','Postpartum'))
+meta00$menstrPh_by_Endom <- factor(meta00$menstrPh_by_Endom, levels=c('Weakly Proliferative','Proliferative','Late Proliferative/Early Secretory','Secretory','Inactive'))
+
+c1 <- readRDS(file = '../canary_meth_Rproj/Fig5b_cluster_2_preFTs_highSec_cluster2.Pre.Rds') # 2,Pre is high sec - aka Luteal
+c2 <- readRDS(file = '../canary_meth_Rproj/Fig5b_preFTs_highPro_cluster3.Pre.Rds') # 3,Pre is high pro) - aka Follicular
+
+# get the clusters, they are sort of somewhat configured
+meta00$cluster2 <- ifelse(
+  meta00$patientID%in%c1,'Luteal',
+  ifelse(meta00$patientID%in%c2,'Follicular',
+  ifelse(meta00$ReproductiveStatus=='Post','Postmeno',
+  ifelse(meta00$MenoStatus=='Postpartum','Postpartum','Inactive')))
+)
+
+table(meta00$cluster2,meta00$clusterMembership)
+
+library(SingleCellExperiment)
+library(scran)
+
+# first filter out those with 95th CPM<1 as in the DEG analysis
+
+cpm.4.sce <- edgeR::cpm(filtered_counts,log=TRUE)[,meta00$SVC]; dim(cpm.4.sce)
+x2 <- apply(cpm.4.sce,1,FUN=quantile,probs=0.95)
+# filter out those with CPM<1 in 95th quantile
+table(x2>log2(1))
+cpm.4.sce <- cpm.4.sce[which(x2>log2(1)),]; dim(cpm.4.sce)
+cpm.4.sce4protein <- rownames_to_column(data.frame(cpm.4.sce),var='ensemblId') %>% dplyr::left_join(mapper)
+saveRDS(cpm.4.sce4protein,'cpm.4.sce.4protein.Rds')
+stopifnot(all(colnames(cpm.4.sce)==meta00$SVC))
+sce <- SingleCellExperiment(assays = list(logcounts=cpm.4.sce), colData=meta00)
+
+rna.5.markers <- findMarkers(sce, pval.type="some", direction="up",groups = colData(sce)$cluster2,assay.type='logcounts',test.type="t",min.prop=0.5)
+
+length(rna.5.markers)
+names(rna.5.markers)
+# rna.5.markers[[3]]
+
+# get all p.value<0.05 markers for export for Supplemental Table
+all_markers <- data.frame()
+for(i in 1:length(rna.5.markers)){
+  tmp <- data.frame(rna.5.markers[[i]]) %>% dplyr::arrange(p.value) %>% dplyr::filter(FDR<0.05) # FDR filter
+  tmp$marker <- rep(names(rna.5.markers)[i],nrow(tmp))
+  tmp$ensemblId <- rownames(tmp)
+  all_markers <- dplyr::bind_rows(
+    all_markers,
+    # data.frame(
+    #   marker = rep(names(rna.5.markers)[i],nrow(tmp)),
+    #   ensemblId = rownames(tmp)
+    # )
+    tmp
+  )
+}
+
+
+#
+dim(all_markers)
+table(all_markers$marker)
+# all_markers <- tibble::rownames_to_column(all_markers,'ensemblId')
+all_markers <- dplyr::left_join(all_markers,mapper)
+#
+# 
+# all_markers_FDR <- dplyr::filter(all_markers,FDR<0.05)
+# table(all_markers_FDR$marker)
+write.table(all_markers,file="5_expression_groups_Supplemental_Table_pvalType_some.tsv",sep="\t",quote=FALSE,row.names = FALSE)
+
+# get this data to a list for upset
+markersList.RNA <- list(
+  'Follicular' = dplyr::filter(all_markers,marker=='Follicular')$ensemblId,
+  'Luteal' = dplyr::filter(all_markers,marker=='Luteal')$ensemblId,
+  'Inactive' = dplyr::filter(all_markers,marker=='Inactive')$ensemblId,
+  'Postpartum' = dplyr::filter(all_markers,marker=='Postpartum')$ensemblId,
+  'Postmeno' = dplyr::filter(all_markers,marker=='Postmeno')$ensemblId
+)
+library(UpSetR)
+UpSetR::upset(fromList(markersList.RNA))
+
+# now load in protein markers
+all_markers_p <- read.delim(file="../proteomics_Rproj/5_expression_groups_Supplemental_Table_pval_some.tsv",sep="\t")
+all_markers_p$tag <- paste(all_markers_p$marker,all_markers_p$protein,sep="_")
+# get this data to a list for upset
+
+
+
+# get this into a data.frame, so we can add the protein overlap 
+markerDF <- data.frame(
+  ensemblId = unique(all_markers$ensemblId)
+)
+markerDF$Follicular <- ifelse(markerDF$ensemblId %in% dplyr::filter(all_markers,marker=='Follicular')$ensemblId,1,0)
+markerDF$Luteal <- ifelse(markerDF$ensemblId %in% dplyr::filter(all_markers,marker=='Luteal')$ensemblId,1,0)
+markerDF$Inactive <- ifelse(markerDF$ensemblId %in% dplyr::filter(all_markers,marker=='Inactive')$ensemblId,1,0)
+markerDF$Postpartum <- ifelse(markerDF$ensemblId %in% dplyr::filter(all_markers,marker=='Postpartum')$ensemblId,1,0)
+markerDF$Postmeno <- ifelse(markerDF$ensemblId %in% dplyr::filter(all_markers,marker=='Postmeno')$ensemblId,1,0)
+
+markerDF <- dplyr::left_join(markerDF,mapper)
+markerDF <- dplyr::filter(markerDF,geneSymbol!='')
+dim(markerDF)
+# markerDF$protein_detected <- unlist(lapply(markerDF$geneSymbol,FUN = function(x){
+#    return(ifelse(length(grep(x,rownames(protein_data)))>0,1,0))
+# }))
+# markerDF$protein_detected_exact_match <- ifelse(markerDF$geneSymbol %in% rownames(protein_data),1,0)
+# spot check that this worked
+# grep('STK39',rownames(protein_data))
+# table(markerDF$protein_detected,markerDF$protein_detected_exact_match)
+# 0    1 
+# 5423 2762 
+# table(markerDF$protein_detected_exact_match)
+   # 0    1 
+# 5177 2316 
+
+markersList2 <- list(
+  'Follicular' = dplyr::filter(markerDF,Follicular==1)$ensemblId,
+  'Luteal' = dplyr::filter(markerDF,Luteal==1)$ensemblId,
+  'Inactive' = dplyr::filter(markerDF,Inactive==1)$ensemblId,
+  'Postpartum' = dplyr::filter(markerDF,Postpartum==1)$ensemblId,
+  'Postmeno' = dplyr::filter(markerDF,Postmeno==1)$ensemblId
+)
+UpSetR::upset(fromList(markersList2))
+pdf('RNA_markers_FDRfilt_N7493_UpsetR_max_degree2.pdf'); ComplexUpset::upset(markerDF,
+                    # intersect = rev(unique(all_markers$marker)),
+                    intersect = c('Postmeno','Postpartum','Inactive','Luteal','Follicular'),
+                    # group_by = 'degree',
+                    sort_sets = FALSE,
+                    # sort_intersections = 'ascending',
+                    sort_intersections_by = c('cardinality'),
+                    group_by = 'degree',
+                    max_degree = 2
+); dev.off()
+
+dim(all_markers_p)
+
+table(all_markers$geneSymbol %in% all_markers_p$protein)
+table(all_markers_p$protein %in% all_markers$geneSymbol)
+# add it to the rna markers
+all_markers_FDR <- dplyr::left_join(all_markers,all_markers_p,by=c('geneSymbol'='protein')); nrow(all_markers_FDR)
+all_markers_FDR_full_join <- dplyr::full_join(all_markers,all_markers_p,by=c('geneSymbol'='protein')); dim(all_markers_FDR_full_join)
+# save this file for supp
+write.table(all_markers_FDR_full_join,file='rna_and_protein_markers_full_join.tsv',sep="\t",quote=F,row.names=FALSE)
+all_markers_FDR_full_join_matchedMarker <- dplyr::filter(all_markers_FDR_full_join,marker.x==marker.y); dim(all_markers_FDR_full_join_matchedMarker)
+write.table(all_markers_FDR_full_join_matchedMarker,file='rna_and_protein_markers_full_join_matchedMarker.tsv',sep="\t",quote=F,row.names=FALSE)
+
+nrow(all_markers_FDR)
+table(all_markers_FDR_full_join$marker.x,all_markers_FDR_full_join$marker.y,useNA = c("always"))
+all_markers_FDR$tag <- paste(all_markers_FDR$marker.x,all_markers_FDR$geneSymbol,sep="_")
+
+table(all_markers_FDR$tag %in% all_markers_p$tag)
+# filter for those that have match on marker
+all_markers_FDR <- dplyr::filter(all_markers_FDR,marker.x==marker.y)
+table(all_markers_FDR$tag %in% all_markers_p$tag)
+table(all_markers_FDR$marker.x,all_markers_FDR$marker.y)
+
+dim(all_markers_FDR)
+# [1] 424  20 because some are markers for >1 group
+length(unique(all_markers_FDR$ensemblId))
+length(unique(all_markers_FDR$tag))
+# 383 w/ t-test
+
+# markerDF is pure RNA
+# markerDF$tag <- paste(markerDF$marker.x,all_markers_FDR$geneSymbol,sep="_")
+markerDF$protein_status <- ifelse(markerDF$geneSymbol %in% rownames(protein_data),'OneToOneMatchFound','noOneToOneMatch')
+markerDF$protein_status <- ifelse(
+  markerDF$ensemblId %in% all_markers_FDR$ensemblId,'one2oneMatchAndMarker', markerDF$protein_status)
+table(markerDF$protein_status)
+
+
+library(ComplexUpset)
+colValues <- RColorBrewer::brewer.pal(5,'Blues')
+## Upset plots FIGURE 5b ?
+
+# markerDF_filtered <- dplyr::filter(markerDF,protein_color=='one2oneMatchAndMarker'); dim(markerDF_filtered)
+upstrPlot <- ComplexUpset::upset(markerDF,
+# upstrPlot <- ComplexUpset::upset(markerDF_filtered,
+                    # intersect = rev(unique(all_markers$marker)),
+                    intersect = c('Postmeno','Postpartum','Inactive','Luteal','Follicular'),
+                    # group_by = 'degree',
+                    sort_sets = FALSE,
+                    # sort_intersections = 'ascending',
+                    sort_intersections_by = c('cardinality'),
+                    group_by = 'degree',
+                    max_degree = 2,
+        base_annotations=list(
+          'Intersection size'=intersection_size(
+            counts=TRUE,
+            mapping=aes(fill=protein_status)
+          ) +
+            scale_fill_manual(values=c('OneToOneMatchFound'=colValues[3],'noOneToOneMatch'=colValues[5],'one2oneMatchAndMarker'=colValues[2])) + theme_classic()
+        ),
+        intersections = 'observed'
+) 
+upstrPlot
+pdf(file='RNA_protein_markers_upsetR.pdf',height = 5,width = 8); upstrPlot; dev.off()
+
+markerDF_filtered <- dplyr::filter(markerDF,protein_status=='one2oneMatchAndMarker'); dim(markerDF_filtered)
+upstrPlot <- ComplexUpset::upset(markerDF_filtered,
+                    intersect = c('Postmeno','Postpartum','Inactive','Luteal','Follicular'),
+                    sort_sets = FALSE,
+                    sort_intersections_by = c('cardinality'),
+                    group_by = 'degree',
+                    max_degree = 2,
+        base_annotations=list(
+          'Intersection size'=intersection_size(
+            counts=TRUE
+          ) + theme_classic()
+        ),
+        intersections = 'observed'
+) 
+upstrPlot
+pdf(file='RNA_protein_markers_OneToOneMarkerAndMatch_upsetR.pdf',height = 5,width = 8); upstrPlot; dev.off()
+
+length((all_markers_FDR$ensemblId))
+length(unique((all_markers_FDR$ensemblId)))
+saveRDS(all_markers_FDR,'all_markers_rna_FILTERED_for_protein_overlap.Rds')
+saveRDS(markerDF,'markerDF_rna_with_protein_status.Rds')
+
+```
+
+```{r heatmap_rna_5_groups,fig.width=12,fig.height=10}
+all_markers_FDR <- readRDS('all_markers_rna_FILTERED_for_protein_overlap.Rds');
+dim(all_markers_FDR)
+# [1] 424  21
+
+markersList3.fdr <- list(
+  'Follicular' = dplyr::filter(all_markers_FDR,marker.x=='Follicular')$ensemblId,
+  'Luteal' = dplyr::filter(all_markers_FDR,,marker.x=='Luteal')$ensemblId,
+  'Inactive' = dplyr::filter(all_markers_FDR,,marker.x=='Inactive')$ensemblId,
+  'Postpartum' = dplyr::filter(all_markers_FDR,,marker.x=='Postpartum')$ensemblId,
+  'Postmeno' = dplyr::filter(all_markers_FDR,,marker.x=='Postmeno')$ensemblId
+)
+lapply(markersList3.fdr,length)
+
+source('~/Desktop/code_repo/upset_RNAseq_functions_example/upset_RNAseq_functions_example.R')
+# need to assign a grouping for the genes depending on their marker group
+# .intersects = get_intersects(markersList2,numberOfTopSets = 9)
+
+# UpSetR::upset(fromList(markersList3.fdr)); dev.off()
+upstrPlot5c <- ComplexUpset::upset(fromList(markersList3.fdr),
+                    intersect = c('Postmeno','Postpartum','Inactive','Luteal','Follicular'),
+                    sort_sets = FALSE,
+                    sort_intersections_by = c('cardinality'),
+                    group_by = 'degree',
+                    max_degree = 10,
+        base_annotations=list(
+          'Intersection size'=intersection_size(
+            counts=TRUE
+          ) + theme_classic()
+        ),
+        intersections = 'observed'
+) 
+pdf('upset_markers_5c_all_groups.pdf',height=5,width=5); upstrPlot5c; dev.off()
+
+
+.intersects = get_intersects(markersList3.fdr,numberOfTopSets = 7)
+y <- data.frame(t(do.call(rbind, .intersects))) %>% pivot_longer(cols=everything(),names_to='intersect_group',values_to = 'ensemblId')
+y <- tibble::enframe(.intersects) %>% tidyr::unnest(col='value')
+table(y$name)
+# now add this intersect information to the all_markers_FDR
+all_markers_FDR <- dplyr::left_join(all_markers_FDR,y,by=c('ensemblId'='value'))
+
+# > length(unique(paste(y$name,y$value)))
+# [1] 375 # shorter because only top 7 sets are taken so a few are dropped
+# > length(unique(all_markers_FDR$ensemblId))
+# [1] 383 
+
+dim(all_markers_FDR)                                   
+table(all_markers_FDR$name) # $name now has the intersect group!
+all_markers_FDR <- all_markers_FDR %>% arrange(FDR.x) # this ensures duplicates have higher FDR 
+# filter for unique overlaps
+all_markers_FDR_uniq <- all_markers_FDR %>% filter(!is.na(name))
+all_markers_FDR_uniq <- all_markers_FDR_uniq[-which(duplicated(paste(all_markers_FDR_uniq$ensemblId,all_markers_FDR_uniq$ensemblId))),]
+all_markers_FDR_uniq %>% nrow
+# [1] 375
+
+all_markers_FDR_uniq$name <- factor(all_markers_FDR_uniq$name,levels=names(.intersects))
+
+# filter to the top n per group
+n <- 10
+all_markers_FDR_uniq <- all_markers_FDR_uniq %>% group_by(name) %>% arrange(FDR.x) %>%
+  # distinct(pick('ensemblId','name'),.keep_all = TRUE) %>% 
+  slice_head(n=n)
+# filter out the markers for the other groups
+all_markers_FDR_uniq <- dplyr::filter(all_markers_FDR_uniq,!is.na(name)); dim(all_markers_FDR_uniq)
+
+length(unique(all_markers_FDR_uniq$ensemblId))
+all_markers_FDR_uniq$geneSymbol[which(duplicated(all_markers_FDR_uniq$ensemblId))]
+
+scaled_mat = t(scale(t(cpm[all_markers_FDR_uniq$ensemblId,meta00$SVC]))); dim(scaled_mat)
+rownames(scaled_mat) <- ifelse(all_markers_FDR_uniq$geneSymbol!='',all_markers_FDR_uniq$geneSymbol,all_markers_FDR_uniq$ensemblId)
+# scaled_mat = t(scale(t(cpm[all_markers$ensemblId,meta00$SVC]))); dim(scaled_mat)
+# rownames(scaled_mat) <- all_markers$geneSymbol
+colnames(scaled_mat) <- meta00$patientID
+scaled_mat[scaled_mat>2] <- 2
+scaled_mat[scaled_mat<(-2)] <- -2
+
+# factor cluster2
+meta00$cluster2 <- factor(meta00$cluster2,levels=c('Follicular','Luteal','Inactive','Postpartum','Postmeno'))
+# all_markers_FDR$marker.x <- factor(all_markers_FDR_uniq$marker.x,levels=levels(meta00$cluster2))
+#++++++++++++++++++++++++
+#+
+## get anno
+haCol_rna_markers <- HeatmapAnnotation(
+  # `Menstrual Phase` = meta00$menstrPh_by_Endom,
+  `Age` = meta00$`Age at time of surgery`,
+  `Stromal Fraction` = meta00$MIR200cAvgBeta,
+  `Reproductive Status` = meta00$MenoStatus,
+  `BRCA Status` = meta00$groupBRCA,
+  # `Race` = meta00$Race,
+  # `Days since LMP` = meta00$`Days since LMP`,
+  # DaysSinceLMP_categ = meta00$DaysSinceLMP_categ,
+  # `Surgical Indication` = meta00$`Reason for surgery 3`,
+  # `Number of Pregnancies` = as.numeric(meta00$`# of Pregnancies`),
+  # `Immune Score` = meta00$ImmuneScore,
+  col = list(
+    `Stromal Fraction` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 1, length = 20),
+                              colors = viridis::cividis(20)
+    ),
+    `Age` = circlize::colorRamp2(
+                              breaks = seq(from = 20, to = 72, length = 20),
+                              colors = colorRampPalette(c("gray75", "black"))(20)
+    ),
+    `Reproductive Status` = c(
+      'Pre' = "#28BBECFF",
+      'Post' = "#FB8022FF",
+      'Postpartum' = 'grey33'
+    ),
+    `BRCA Status` = c(
+      # 'BRCA1' = '#40498e',
+      'BRCA1' = '#7df5f5',
+      'BRCA2' = '#38aaac',
+      'NON-BRCA' = 'black'
+    ),
+    Race = c(
+      'Asian' = '#30123BFF',
+      'Black' = "#28BBECFF",
+      'East Indian' = "#A2FC3CFF",
+      'Hispanic Latino/White' = "#FB8022FF",
+      'White' = "#7A0403FF",
+      'Other' = 'gray48'
+    ),
+    DaysSinceLMP_categ=c(
+      '[0,12]' = '#67001F',
+      '(12,16]' = '#92C5DE',
+      '(16,30]' = '#053061',
+      '(30,60]' = 'black'
+    ),
+    `Menstrual Phase` = c(
+      'Weakly Proliferative'='#92C5DE',
+      'Proliferative' = '#0096FF',
+      'Late Proliferative/Early Secretory'='dodgerblue4',
+      'Secretory'= "#CA0020",
+      'Inactive'='black'
+    ),
+    `Surgical Indication` = c(
+      'Benign Uterine'='#8DD3C7',
+      'Cesarean Section'='#FCCDE5',
+      'Cervical Dysplasia'='#BEBADA',
+      'Menorrhagia'='#FB8072',
+      'Endometriosis'='#80B1D3',
+      'Ovarian Serous Cystadenoma'='#FDB462',
+      # 'Ovarian Cyst (Sex chord stromal tumor)'='#B3DE69',
+      'Ovarian Cyst'='pink3',
+      'Pelvic mass'='#D9D9D9',
+      'Adnexal Mass' = '#BC80BD',
+      # 'Tubal Sterilization' = '#CCEBC5',
+      'Tubal Sterilization' = '#0BDA51',
+      'Gender Affirmation'='#FFED6F',
+      # 'Risk Reduction' = '#B3DE69'
+      'Risk Reduction' = 'green'
+    ),
+    `contraception use` = c(
+      'NA'='grey66',
+      'Former'='purple',
+      'Current'='blue',
+      'Y'='blue3',
+      'Y - BTL'='darkblue',
+      'N' = 'red'
+    )
+  ),na_col='white',
+  show_legend = c(FALSE,FALSE,FALSE,FALSE),
+  show_annotation_name = FALSE
+)
+#======================================
+#======================================
+# scaled_mat[is.na(scaled_mat)] <- 0
+hm.rna.5 <- Heatmap(scaled_mat,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  col=viridis::viridis(20),
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  heatmap_legend_param = list(title='Z-score'),
+  row_title_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 5),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 5#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 10),
+  top_annotation = haCol_rna_markers,
+  heatmap_width = unit(6, "in"),  
+  heatmap_height = unit(7, "in"),  
+  column_split = meta00$cluster2,
+  row_split = all_markers_FDR_uniq$name,
+  # row_split = all_markers$marker,
+  show_heatmap_legend = FALSE,
+  cluster_row_slices = FALSE,
+  row_title_rot = 0,
+  cluster_column_slices = FALSE
+  # column_km = 5
+)
+
+# export two things, first the scaled_mat so that we can match the protein rownames to this
+saveRDS(rownames(scaled_mat),'rownames_rna_markers_scaled_mat.Rds')
+# and export the rowOrder of hm.rna.5
+saveRDS(row_order(hm.rna.5),'roworder_rna_markers_scaled_mat.Rds')
+saveRDS(column_order(hm.rna.5),'column_order_rna_markers_scaled_mat.Rds')
+saveRDS(all_markers_FDR_uniq,'all_markers_FDR_with_intersect_group.Rds')
+
+hm.rna.5
+pdf('rna_5_RNA_groups_findMarkers_FDR_heatmap.pdf',width=12,height=11); print(hm.rna.5); dev.off()
+```
+
+# Fig. 5 joint + excl. rna markers
+```{r heatmap_OneToOneMatchesThatAreNotMarkers}
+
+scaled_mat = t(scale(t(cpm[dplyr::filter(markerDF,protein_status=='OneToOneMatchFound')$ensemblId,meta00$SVC]))); dim(scaled_mat)
+scaled_mat[scaled_mat>2] <- 2
+scaled_mat[scaled_mat<(-2)] <- -2
+
+# 5a, save order for 5c
+hm.rna23 <- Heatmap(scaled_mat,
+  show_column_names = FALSE,
+  show_row_names = FALSE,
+  col=viridis::viridis(20),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  heatmap_legend_param = list(title='Z-score'),
+  row_title_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 5),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 5#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 10),
+  top_annotation = haCol_rna_markers,
+  heatmap_width = unit(6, "in"),  
+  heatmap_height = unit(7, "in"),  
+  column_split = factor(meta00$clusterMembership,levels=c(
+    'Follicular','Luteal','Inactive','Postpartum','Postmeno'
+  )),
+  # row_split = all_markers_FDR$name,
+  # row_split = all_markers$marker,
+  cluster_row_slices = FALSE,
+  row_title_rot = 0,
+  cluster_column_slices = FALSE,
+  # row_title = paste0('RNA\nExclusive\nMarkers\nN=',nrow(scaled_mat)),
+  show_heatmap_legend = FALSE
+)
+pdf('rna_rnaExclusiveWithMatch.pdf',width=12,height=11); print(hm.rna23); dev.off()
+png('rna_rnaExclusiveWithMatch.png',width=500,height=600,unit='px'); print(hm.rna23); dev.off()
+
+# now get the protein ones and plot RNA
+markerDF_p <- readRDS('../proteomics_Rproj/markerDF_p.Rds')
+markerDF_p <- dplyr::left_join(markerDF_p,mapper)
+scaled_mat = t(scale(t(cpm[dplyr::filter(markerDF_p,rna_status=='OneToOneMatchFound')$ensemblId,meta00$SVC]))); dim(scaled_mat)
+scaled_mat[scaled_mat>2] <- 2
+scaled_mat[scaled_mat<(-2)] <- -2
+
+hm.rna24 <- Heatmap(scaled_mat,
+  show_column_names = FALSE,
+  show_row_names = FALSE,
+  col=viridis::viridis(20),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  heatmap_legend_param = list(title='Z-score'),
+  row_title_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 5),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 5#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 10),
+  # top_annotation = haCol_rna_markers,
+  heatmap_width = unit(6, "in"),  
+  heatmap_height = unit(7, "in"),  
+  column_split = factor(meta00$clusterMembership,levels=c(
+    'Follicular','Luteal','Inactive','Postpartum','Postmeno'
+  )),
+  # row_split = markerDF_p$name,
+  cluster_row_slices = FALSE,
+  row_title_rot = 0,
+  cluster_column_slices = FALSE,
+  # row_title = paste0('Protein\nExclusive\nMarkers\nN=',nrow(scaled_mat)),
+  show_heatmap_legend = FALSE
+)
+pdf('rna_proteinExclusiveWithMatch.pdf',width=12,height=11); print(hm.rna24); dev.off()
+png('rna_proteinExclusiveWithMatch.png',width=500,height=600,unit='px'); print(hm.rna24); dev.off()
+
+```
+
+# Supp Fig. - rna markers all
+```{r heatmap_allRNA_markers}
+dim(markerDF)
+scaled_mat = t(scale(t(cpm[markerDF$ensemblId,meta00$SVC]))); dim(scaled_mat)
+rownames(scaled_mat) <- markerDF$geneSymbol
+scaled_mat[scaled_mat>2] <- 2
+scaled_mat[scaled_mat<(-2)] <- -2
+
+
+
+top25 <- all_markers %>% group_by(marker) %>% slice_min(FDR,n=10,with_ties=FALSE); dim(top25)
+length(unique(top25$geneSymbol))
+index <- which(rownames(scaled_mat) %in% top25$geneSymbol); length(index)
+topGenesLabel <- anno_mark(at = index, 
+        labels = rownames(scaled_mat)[index],
+        # labels_gp = gpar(fontsize = 5), padding = unit(1, "mm"),
+        which = "row"
+)
+
+
+
+
+hm.rna27 <- Heatmap(scaled_mat,
+  show_column_names = FALSE,
+  show_row_names = FALSE,
+  col=viridis::viridis(20),
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  heatmap_legend_param = list(title='Z-score'),
+  row_title_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 5),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 5#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 10),
+  top_annotation = haCol_rna_markers,
+  heatmap_width = unit(6, "in"),  
+  heatmap_height = unit(7, "in"),  
+  column_split = factor(meta00$clusterMembership,levels=c(
+    'Follicular','Luteal','Inactive','Postpartum','Postmeno'
+  )),
+  right_annotation = rowAnnotation(mark = topGenesLabel),
+  # row_split = all_markers_FDR$name,
+  # row_split = all_markers$marker,
+  cluster_row_slices = FALSE,
+  row_title_rot = 0,
+  cluster_column_slices = FALSE,
+  # row_title = paste0('RNA\nExclusive\nMarkers\nN=',nrow(scaled_mat)),
+  show_heatmap_legend = FALSE,
+  use_raster = FALSE
+)
+# hm.rna27
+# pdf('rnaMarkers_all.pdf',width=12,height=11); print(hm.rna27); dev.off()
+png('rnaMarkers_all_7493.png',width=1200,height=1500,unit='px',res=140); print(hm.rna27); dev.off()
+
+# save the column order for hte protein one
+saveRDS(column_order(hm.rna27),'column_order_rna_all_markers_N7493.Rds')
+
+```
+
+
+```{r go_enrichment_on_5grp_markers}
+# GO enrichment 
+##on follicular 
+follicular_GO = enrichGO(gene=dplyr::filter(all_markers_FDR,marker=='Follicular')$ensemblId,
+              OrgDb=org.Hs.eg.db,
+              ont ="BP",
+              keyType = "ENSEMBL",
+              pAdjustMethod = "BH"
+)
+
+# now barplot
+# barplots of GO results - Down
+blues <- RColorBrewer::brewer.pal(9,'Blues')
+xx <- data.frame(follicular_GO) %>% dplyr::arrange(p.adjust) %>% head(n=30); 
+xx$Description <- factor(xx$Description,levels=rev(xx$Description))
+g_foll <- ggplot(xx,aes(y=Description,x=-log10(p.adjust))) +   geom_bar(stat='identity',fill=blues[6]) + theme_minimal() + ylab('') #+
+  # scale_x_continuous(limits = c(0,40),breaks=c(10,20,30,40))
+g_foll
+pdf('FollicularMarkersN382_GO_BP.pdf'); g_foll ; dev.off()
+
+##and on postpartum markers
+# GO enrichment 
+##on follicular 
+postp_GO = enrichGO(gene=dplyr::filter(all_markers_FDR,marker=='Postpartum')$ensemblId,
+              OrgDb=org.Hs.eg.db,
+              ont ="BP",
+              keyType = "ENSEMBL",
+              pAdjustMethod = "BH"
+)
+
+# now barplot
+# barplots of GO results - Down
+reds <- RColorBrewer::brewer.pal(9,'Reds')
+xx <- data.frame(postp_GO) %>% dplyr::arrange(p.adjust) %>% head(n=30); 
+xx$Description <- factor(xx$Description,levels=rev(xx$Description))
+g_postp <- ggplot(xx,aes(y=Description,x=-log10(p.adjust))) +   geom_bar(stat='identity',fill='grey33') + theme_minimal() + ylab('') #+
+  # scale_x_continuous(limits = c(0,40),breaks=c(10,20,30,40))
+g_postp
+pdf('PostpartumMarkersN105_GO_BP.pdf'); g_postp ; dev.off()
+```
+
+# KEGG pathway heatmap (from enriched terms from DEG analysis)
+
+```{r marker_gene_heatmap_with_KEGG,eval=FALSE}
+
+# path <- 'KEGG_PATHWAYS_IN_CANCER'
+path <- 'KEGG_ALLOGRAFT_REJECTION'
+h_gene_sets = msigdbr(species = "human",category = 'C2') # canonical pathways CP
+# gss <- unique(h_gene_sets$gs_name)
+gene_sets <- filter(h_gene_sets,gs_name==path)
+length(unique(gene_sets$ensembl_gene))
+
+keepers <- which(gene_sets$ensembl_gene %in% rownames(cpm))
+mat <- cpm[gene_sets$ensembl_gene[keepers],meta00$SVC] # using meta00 initialized with col anno in chunk build_heatmap_anno_7424
+colnames(mat) <- meta00$`Patient ID`
+dim(mat)
+rownames(mat) <- gene_sets$gene_symbol[keepers]
+
+library(ComplexHeatmap)
+
+
+scaled_mat = t(scale(t(mat))); dim(scaled_mat)
+scaled_mat[scaled_mat>3] <- 3
+scaled_mat[scaled_mat<(-3)] <- -3
+
+colnames(scaled_mat)
+hm01 <- ComplexHeatmap::Heatmap(scaled_mat,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  col=viridis::viridis(n=100),
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  heatmap_legend_param = list(title='Zscore CPM'),
+  row_title_gp = gpar(fontsize = 9),
+  row_names_gp = gpar(fontsize = 4),
+  column_names_rot = 90,
+  column_title_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 6#,
+    # col = myPosColors
+  ),
+  column_title = "",
+  row_title = path,
+  column_title_gp = gpar(fontsize = 5),
+  # right_annotation = markerRowAnno,
+  top_annotation = haCol,
+  heatmap_width = unit(7, "in"),  
+  heatmap_height = unit(11, "in"),  
+  # row_split = paste0(meta$ReproductiveStatus,'\n',meta$groupBRCA),
+  # row_split = markers$Marker,
+  # column_split = meta00$groupBRCA,
+  # column_split = meta$`Current/Former Contraception Use`,
+  # column_split = meta$SmokingStatus,
+  column_split = meta00$`Reason for surgery`,
+  row_title_rot = 0
+)
+
+pdf(paste0(path,'_Heatmap.pdf'),width = 15,height = 12); hm01; dev.off()
+
+```
+
+# PCA with ciliated marker expression labelled
+
+the answer here is yes, these markers are *strongly* expressed
+```{r are_ciliated_markers_even_expressed,eval=FALSE}
+
+cilM_SYMBOL <- filter(markers2,Marker=='ciliated')$ENSEMBL
+
+table(cilM_SYMBOL %in% rownames(cpm))
+
+cpm[which(rownames(cpm)%in%cilM_SYMBOL),]
+
+```
+
+# PCA with all marker groups
+with pr_comps2 copied from pr_comps
+```{r pca_all_MarkerGroups,eval=FALSE}
+
+require(cowplot)
+
+pr_comps$Pregnant <- ifelse(is.na(pr_comps$LMP_explanation),'not',pr_comps$LMP_explanation)
+pr_comps$Pregnant <- ifelse(pr_comps$Pregnant=='Pregnancy','Pregnant','not')
+table(pr_comps$Pregnant)
+
+for(m in unique(markers$Marker)){
+  c <- dplyr::filter(markers,Marker==m)$ENSEMBL
+  x0 <- data.frame(colSums(cpm[c,]))
+  x0$sample.x <- rownames(x0)
+  colnames(x0)[1] <- 'cpmSum'
+  
+  
+  pr_comps2 <- dplyr::left_join(pr_comps,x0)
+  
+  corRes <- cor.test(pr_comps2$PC1,pr_comps2$cpmSum,method='spearman')
+  
+  
+  mp_main <- ggplot(pr_comps2, aes(x=PC1,y=PC2,label=sample.x,color=log2(cpmSum))) + geom_point(size = 7) + 
+      xlab(paste0("PC1 (", prop_var[prop_var$num == 
+      1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+      2, "prop"] * 100, "%)")) + theme_bw() + 
+    scale_color_viridis_c() +
+      ggtitle(m,subtitle = paste0('rho=',signif(as.numeric(corRes$estimate),2),'; Pval=',signif(corRes$p.value,2))) 
+  
+
+
+  # ggdraw(p2) +
+    # plot_layout(design = layout) + plot_annotation(tag_levels = '',title = '')
+
+
+  pdf(paste0('rna_pca_figures/rna_pca_marker_',m,'.pdf'),height=5,width = 7);print(ggdraw(mp_main));dev.off()
+
+}
+```
+
+# Methylation vs. RNA/Protein dotplots
+
+```{r extract_stromal_markers,eval=FALSE}
+
+stromal <- data.frame(rbind(
+  mat[dplyr::filter(markers,Marker=='Stromal')$SYMBOL,],
+  # cpm['ENSG00000207713',] # this is MIR200C
+  cpm['ENSG00000257084',], # this is MIR200C CHG
+  cpm['ENSG00000174059',], # this is CD34
+  cpm['ENSG00000119888',], # this is EPCAM
+  cpm['ENSG00000091831',], # this is ESR1
+  cpm['ENSG00000085465',], # this is OVGP1
+  cpm['ENSG00000125618',] # this is PAX8
+),check.names=FALSE)
+
+dim(stromal)
+rownames(stromal)[9] <- 'MIR200C_CGH'
+rownames(stromal)[10] <- 'CD34'
+rownames(stromal)[11] <- 'EPCAM'
+rownames(stromal)[12] <- 'ESR1'
+rownames(stromal)[13] <- 'OVGP1'
+rownames(stromal)[14] <- 'PAX8'
+stromal$SYMBOL = rownames(stromal)
+stromalTidyLong0 <- stromal %>% tidyr::pivot_longer(cols=! matches('SYMBOL'),names_to = 'SVC',values_to = 'geneCPM') %>% dplyr::filter(!SYMBOL%in%c('C3','SFRP2'))
+
+stromalTidyLong <- dplyr::left_join(stromalTidyLong0,meta[,c('SVC','MIR200cAvgBeta')])
+stromalTidyLong$SYMBOL <- factor(stromalTidyLong$SYMBOL,levels=c(stromal$SYMBOL))
+
+tmp <- ggplot(stromalTidyLong,aes(x=log2(geneCPM),y=MIR200cAvgBeta)) + geom_point() + facet_wrap(~SYMBOL,scales='free_x') + ylim(c(0,1)) + theme_minimal()
+
+tmp
+
+pdf('RNA_markers_vs_MIR200CGH.pdf',height=5,width = 5); tmp; dev.off()
+```
+
+## pca with stromal marker coloring
+
+```{r pca_colored_stromal_markers,eval=FALSE}
+
+test <- dplyr::left_join(dplyr::filter(stromalTidyLong0,SYMBOL=='NR2F2'),
+                         pr_comps,
+                         by=c('SVC'='sample.x'))
+
+ggplot(test, aes(x=PC1,y=PC2,pch=groupBRCA,color=log(geneCPM))) + geom_point(size = 3) + 
+    xlab(paste0("PC1 (", prop_var[prop_var$num == 
+    1, "prop"] * 100, "%)")) + ylab(paste0("PC2 (", prop_var[prop_var$num == 
+    2, "prop"] * 100, "%)")) + theme_bw() + 
+  scale_color_viridis_c() +
+  # scale_color_viridis_d() +
+    ggtitle('NR2F2') #+ geom_text_repel(aes(label=sample)) 
+
+
+cor.test(test$PC1,test$geneCPM,method='spearman')
+```
+
+```{r path_est_vs_str_markers,eval=FALSE}
+
+
+hne <- readxl::read_excel(path='Stromal % in select Gray Foundation samples.xlsx')
+
+hne <- dplyr::left_join(hne,meta[,c('Original ID','MIR200cAvgBeta')],by=c('Sample ID number'='Original ID'))
+
+test <- cor.test(hne$MIR200cAvgBeta,hne$mean_stromal,method='spearman')
+
+g <- ggplot(hne,aes(y=MIR200cAvgBeta,x=mean_stromal)) + geom_point(size=2) + theme_minimal() +
+  labs(caption=paste(
+            'Pval:',signif(test$p.value,2),
+            test$method,
+            signif(test$estimate,2)
+          )
+  ) +
+  # xlab('Estimate from methylation (MIR200c average beta)') +
+  # ylab('Estimate from pathology (percent stromal)')
+  xlab('') +
+  ylab('') + scale_y_continuous(breaks = c(0.2,0.4,0.6,0.8,1))
+
+g
+pdf('stromal_estimates_comparison_dotplot.pdf',height = 3,width = 3); g; dev.off()
+
+```
+
+# Heatmap with DEP & DEGs
+
+contstruct the metadata:
+```{r deg_and_dep_co_construction}
+
+scaled_mat_dpe <- readRDS('../proteomics_Rproj/DEP_scaled_mat_N9.Rds')
+dim(scaled_mat_dpe)
+
+# get DEGs
+tmp <- read.delim('rna_BRCA1_and_BRCA2_vs_WT_nonPreg_wRaceAdj.DGE.tsv',sep="\t")
+tmp <- dplyr::filter(tmp,FDR<0.05)
+dim(tmp)
+
+# use degs to get scaled dge mat
+scaled_mat_dge = t(scale(t(cpm[tmp$ens_gene,]))); dim(scaled_mat_dge)
+rownames(scaled_mat_dge) <- ifelse(tmp$ext_gene=="",tmp$ens_gene,tmp$ext_gene)
+scaled_mat_dge[scaled_mat_dge>2] <- 2
+scaled_mat_dge[scaled_mat_dge<(-2)] <- -2
+
+stopifnot(all(colnames(scaled_mat_dge)==meta$`Patient ID`))
+# colnames(scaled_mat_dge) <- meta$`Patient ID`
+
+# match column names and subset meta (which has 92 obs)
+keeps <- meta$`Patient ID`[which(meta$`Patient ID` %in% colnames(scaled_mat_dge) & meta$`Patient ID` %in% colnames(scaled_mat_dpe))]
+length(keeps)
+# 90 with all 3!
+
+# scaled mat for expression and protein meta
+meta_ep <- meta[meta$`Patient ID`%in%keeps,]; dim(meta_ep) 
+meta_ep <- left_join(meta_ep,x)
+scaled_mat_dge <- scaled_mat_dge[,meta_ep$`Patient ID`]
+scaled_mat_dpe <- scaled_mat_dpe[,meta_ep$`Patient ID`]
+
+```
+
+```{r deg_dep_hm_anno}
+# build the annotation
+
+heatmapColorPal <- viridis::viridis(n=100)
+pal = c(
+  viridis::viridis(n=4),
+  viridis::rocket(n=5)[2:4],
+  viridis::turbo(n=5)[c(2,4)]
+)
+# pal2 = viridis::mako(n=5)
+pal2 = viridis::turbo(n=5)
+haCol_dep_deg <- HeatmapAnnotation(
+# haRowMaster <- rowAnnotation(
+  `RNA Batch` = meta_ep$Pilot,
+  `Reproductive Status` = meta_ep$ReproductiveStatus,
+  `BRCA Germline` = meta_ep$groupBRCA,
+  `Race` = meta_ep$Race,
+  `Age` = meta_ep$`Age at time of surgery`,
+  # `Days since LMP` = meta_ep$DaysSinceLMP_clean,
+  `MIR200C` = meta_ep$MIR200cAvgBeta,
+  # `Number of Pregnancies` = as.numeric(meta_ep$`# of Pregnancies`),
+  `C-section` = ifelse(meta_ep$Pregnancy=='Pregnant','TRUE',"FALSE"),
+  `Immune Score` = meta_ep$ImmuneScore,
+  col = list(
+    `MIR200C` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 1, length = 20),
+                              colors = viridis::cividis(20)
+    ),
+    `Days since LMP` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 50, length = 20),
+                              colors = colorRampPalette(c("gray100", "black"))(20)
+    ),
+    `Age` = circlize::colorRamp2(
+                              breaks = seq(from = 20, to = 72, length = 20),
+                              colors = colorRampPalette(c("gray75", "gray10"))(20)
+    ),
+    `Nanodrop yield` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 25000, length = 20),
+                              colors = colorRampPalette(c("white", "black"))(20)
+    ),
+    `RNA Batch` = c(
+      'A' = pal[1],
+      'B' = pal[2],
+      'C' = pal[3],
+      'D' = pal[4]
+    ),
+    `C-section` = c('TRUE'='pink','FALSE'='grey22'),
+    `Reproductive Status` = c(
+      'Pre' = pal[8],
+      'Post' = pal[9]
+    ),
+    `BRCA Germline` = c(
+      'BRCA1' = '#40498e',
+      'BRCA2' = '#38aaac',
+      'NON-BRCA' = 'black'
+    ),
+    Race = c(
+      'Asian' = pal2[1],
+      'Black' = pal2[2],
+      'East Indian' = pal2[3],
+      'Hispanic Latino/White' = pal2[4],
+      'White' = pal2[5],
+      'Other' = 'gray48'
+    )
+  )
+)
+
+
+```
+
+```{r now_make_the_heatmap}
+stopifnot(all(colnames(scaled_mat_dge)==colnames(scaled_mat_dpe)))
+stopifnot(all(colnames(scaled_mat_dge)==meta_ep$`Patient ID`))
+merged <- rbind(scaled_mat_dge,scaled_mat_dpe)
+colnames(merged) <- substr(meta_ep$`Reason for surgery`,1,40)
+
+tmp <- data.frame(
+  Data = c(
+    rep('Gene',nrow(scaled_mat_dge)),
+    rep('Protein',nrow(scaled_mat_dpe))
+  )
+)
+rowAnno <- rowAnnotation(
+  Data = tmp$Data
+)
+
+# DEGs
+hm_deg_dep <- ComplexHeatmap::Heatmap(merged,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  col=viridis::magma(n=100),
+  # col=viridis::viridis(n=100),
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  heatmap_legend_param = list(title='Zscore CPM'),
+  row_title_gp = gpar(fontsize = 9),
+  row_names_gp = gpar(fontsize = 4),
+  column_names_rot = 90,
+  column_title_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 6#,
+    # col = myPosColors
+  ),
+  column_title = "",
+  row_title = '',
+  column_title_gp = gpar(fontsize = 5),
+  right_annotation = rowAnno,
+  top_annotation = haCol_dep_deg,
+  heatmap_width = unit(7, "in"),  
+  heatmap_height = unit(11, "in"),  
+  # row_split = paste0(meta$ReproductiveStatus,'\n',meta$groupBRCA),
+  row_split = tmp$Data,
+  column_split = meta_ep$groupBRCA,
+  # column_split = meta$`Current/Former Contraception Use`,
+  # column_split = meta$SmokingStatus,
+  # column_split = meta_ep$`Reason for surgery`,
+  row_title_rot = 0
+)
+
+
+pdf('DEP_DEG_heatmap_magma.pdf',width = 25,height = 20); hm_deg_dep; dev.off()
+
+```
+
+# Protein + RNA marker correlation
+
+```{r }
+
+protein_data <- readRDS(file='../proteomics_Rproj/protein_data_N96.Rds')
+cpm <- edgeR::cpm(readRDS('raw_counts_adjusted_N94.Rds')[,-c(1:2)],log=FALSE)
+
+meta_ep <- dplyr::filter(meta,`Patient ID` %in% colnames(protein_data))
+
+stopifnot(all(meta_ep$SVC%in%colnames(cpm)))
+stopifnot(all(meta_ep$`Patient ID`%in%colnames(protein_data)))
+meta_ep$groupBRCA <- factor(meta_ep$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+protein_data <- protein_data[,meta_ep$`Patient ID`]
+cpm <- cpm[,meta_ep$SVC]
+colnames(cpm) <- meta_ep$`Patient ID`
+
+### now check individual genes
+
+# DCN 1:1 match
+p <- rownames(protein_data); hits_p <- grep('DCN',p)
+p[hits_p]
+tmp <- data.frame(
+  protein_abund = protein_data[hits_p,],
+  expr_cpm = cpm['ENSG00000011465',],
+  MIR200C = meta_ep$MIR200cAvgBeta
+)
+
+pdf('DCN_expression2.pdf',height = 3,width = 4)
+ggplot(tmp,aes(x=expr_cpm,y=protein_abund,color=MIR200C)) + 
+  geom_point(size=2) + theme_bw() +
+  scale_color_viridis_c(option='cividis') + ggtitle('DCN')
+dev.off()
+
+# EPCAM 
+p <- rownames(protein_data); hits_p <- grep('EPCAM',p)
+p[hits_p]
+tmp <- data.frame(
+  protein_abund = protein_data[hits_p,],
+  expr_cpm = cpm['ENSG00000119888',],
+  MIR200C = meta_ep$MIR200cAvgBeta
+)
+
+
+ggplot(tmp,aes(x=expr_cpm,y=protein_abund,color=MIR200C)) + 
+  geom_point(size=2) + theme_bw() +
+  scale_color_viridis_c(option='cividis') + ggtitle('EPCAM')
+
+# NR2F2 
+p <- rownames(protein_data); hits_p <- grep('NR2F2',p)
+p[hits_p]
+tmp <- data.frame(
+  protein_abund = colSums(protein_data[hits_p,],na.rm=TRUE),
+  expr_cpm = cpm['ENSG00000185551',],
+  MIR200C = meta_ep$MIR200cAvgBeta
+)
+
+
+ggplot(tmp,aes(x=expr_cpm,y=protein_abund,color=MIR200C)) + 
+  geom_point(size=2) + theme_bw() +
+  scale_color_viridis_c(option='cividis') + ggtitle('NR2F2')
+
+
+# PAX8 - not found
+
+# POTEE
+p <- rownames(protein_data); hits_p <- grep('POTEE',p)
+p[hits_p] # #7 has POTEE and #8 is POTEE.POTEKP
+tmp <- cbind(data.frame(
+  # protein_abund = colSums(protein_data[hits_p,],na.rm=TRUE),
+  protein_abund = protein_data[hits_p[8],],
+  expr_cpm = cpm['ENSG00000188219',]
+),meta_ep)
+ggplot(tmp,aes(x=Pregnancy,y=protein_abund,color=ReproductiveStatus)) + 
+  geom_point(size=2) + theme_bw() #+
+  # scale_color_viridis_c(option='cividis') + ggtitle('POTEE')
+
+
+# ESR1
+p <- rownames(protein_data); hits_p <- grep('ESR1',p)
+p[hits_p]
+tmp <- data.frame(
+  protein_abund = protein_data[hits_p,],
+  expr_cpm = cpm['ENSG00000091831',],
+  MIR200C = meta_ep$MIR200cAvgBeta,
+  DaysSinceLMP = meta_ep$DaysSinceLMP_clean
+)
+ggplot(tmp,aes(x=expr_cpm,y=protein_abund,color=MIR200C)) + 
+  geom_point(size=2) + theme_bw() +
+  scale_color_viridis_c(option='cividis') + ggtitle('ESR1')
+
+# PGR
+p <- rownames(protein_data); hits_p <- grep('PGR',p)
+p[hits_p]
+tmp <- cbind(data.frame(
+  protein_abund = protein_data[hits_p[3],],
+  expr_cpm = cpm['ENSG00000082175',]
+),meta_ep)
+p234 <- ggplot(tmp,aes(x=expr_cpm,y=protein_abund,color=MIR200cAvgBeta)) + 
+  geom_point(size=2) + theme_bw() +
+  scale_color_viridis_c(option='cividis') + ggtitle('PGR')
+
+
+p236 <- ggplot(tmp,aes(y=protein_abund,x=groupBRCA,color=groupBRCA)) + geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) + geom_jitter(size = 2, alpha = 1, width = 0.1) + theme_bw() + scale_color_manual(values=c('black','#40498e','#38aaac'))
+
+pdf('PGR.pdf',height = 3,width = 5); p234; dev.off()
+pdf('PGR_2.pdf',height = 3,width = 3); p235; p236; dev.off()
+
+
+ggplot(tmp,aes(x=DaysSinceLMP,y=expr_cpm)) + geom_point() + ggtitle('PGR expr cpm')
+ggplot(tmp,aes(x=DaysSinceLMP,y=protein_abund)) + geom_point() + ggtitle('PGR prot expr')
+
+```
+
+# Protein + RNA marker correlation to MIR200C
+```{r }
+
+protein_data <- readRDS(file='../proteomics_Rproj/protein_data_N96.Rds')
+cpm <- edgeR::cpm(readRDS('raw_counts_adjusted_N94.Rds')[,-c(1:2)],log=FALSE)
+
+meta_ep <- dplyr::filter(meta,`Patient ID` %in% colnames(protein_data))
+
+stopifnot(all(meta_ep$SVC%in%colnames(cpm)))
+stopifnot(all(meta_ep$`Patient ID`%in%colnames(protein_data)))
+meta_ep$groupBRCA <- factor(meta_ep$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+protein_data <- protein_data[,meta_ep$`Patient ID`]
+cpm <- cpm[,meta_ep$SVC]
+colnames(cpm) <- meta_ep$`Patient ID`
+stopifnot(all(colnames(cpm)==colnames(protein_data)))
+
+### now check individual genes
+MM_SYMBOL <- c('MIR200C_CGH','PAX8','EPCAM','OVGP1','CD34','DCN','NR2F2')
+MM_ENSEMBL <- c('ENSG00000257084','ENSG00000125618','ENSG00000119888','ENSG00000085465','ENSG00000174059','ENSG00000011465','ENSG00000185551')
+
+# for(i in 1:length(MM_SYMBOL)){
+#   res <- grep(MM_SYMBOL[i],rownames(protein_data))
+#   print(paste(MM_SYMBOL[i],res))
+# }
+protein_index <- c(NA,NA,1491,2887,NA,1130,1300)
+
+for(i in 1:length(MM_SYMBOL)){
+  if(!is.na(protein_index[i])){
+    tmp <- data.frame(
+      protein_abund = protein_data[protein_index[i],],
+      expr_cpm = cpm[MM_ENSEMBL[i],],
+      MIR200C = meta_ep$MIR200cAvgBeta
+    )
+    
+    ggplot(tmp,aes(x=protein_abund,y=MIR200C,color=MIR200C)) + geom_point() + theme_bw() + scale_color_viridis(option='magma',limits=c(0,1))
+  }
+}
+
+stromal$SYMBOL = rownames(stromal)
+stromalTidyLong0 <- stromal %>% tidyr::pivot_longer(cols=! matches('SYMBOL'),names_to = 'SVC',values_to = 'geneCPM') %>% dplyr::filter(!SYMBOL%in%c('C3','SFRP2'))
+
+stromalTidyLong <- dplyr::left_join(stromalTidyLong0,meta[,c('SVC','MIR200cAvgBeta')])
+stromalTidyLong$SYMBOL <- factor(stromalTidyLong$SYMBOL,levels=c(stromal$SYMBOL))
+
+tmp <- ggplot(stromalTidyLong,aes(x=log2(geneCPM),y=MIR200cAvgBeta)) + geom_point() + facet_wrap(~SYMBOL,scales='free_x') + ylim(c(0,1)) + theme_minimal()
+
+tmp
+
+pdf('RNA_markers_vs_MIR200CGH.pdf',height=5,width = 5); tmp; dev.off()
+
+```
+
+# DGE post-analysis plots 
+
+Including Pval distribution, volcano plot
+
+```{r}
+library(bbplot)
+# first load the results
+
+# tmp <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Table2_Tables/rna_BRCA1_and_BRCA2_vs_WT_nonPreg_wRaceAdj.DGE_N54.tsv',sep="\t")
+tmp <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Table2_Tables/rna_BRCA1_and_BRCA2_vs_WT_nonPreg.DGE_N159.tsv',sep="\t")
+g <- ggplot(tmp,aes(PValue)) + geom_histogram(bins=80) + bbc_style()
+pdf('Pvalue_distr_RNA.pdf',height = 3,width = 3); g; dev.off()
+
+# get the proteomics result table
+# tmp2 <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Table2_Tables/DPE_analysis_ResultsTable_BRCAmut_v_NonBRCA_mir200_race_adjusted_excl_postpartum_N0.tsv') # with group var & adjusting for MIR200C == 9 signif values
+tmp2 <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Table2_Tables/DPE_analysis_ResultsTable_BRCAmut_v_NonBRCA_mir200_adjusted_N0.tsv') # with group var & adjusting for MIR200C == 9 signif values
+# tmp2 <- read.delim('../proteomics_Rproj/DPE_analysis_ResultsTable.tsv')
+
+# something not adding up between my BH FDR and their signficiance?
+ggplot(tmp2,aes(x=BRCAmut_vs_NON.BRCA_p.adj,y=adjusted_Pval_BH_method)) + geom_point()
+
+
+g2 <- ggplot(tmp2,aes(BRCAmut_vs_NON.BRCA_p.val)) + geom_histogram(bins=80) + bbc_style()
+pdf('Pvalue_distr_Prot.pdf',height = 3,width = 3); g2; dev.off()
+
+
+g3 <- ggplot(tmp,aes(y=-log10(PValue),x=logFC,color=FDR<0.05)) + 
+  geom_point(size=1) + 
+  scale_color_manual(values=c('dodgerblue4','red3')) +
+  theme_classic() + theme(legend.position='none') + xlim(c(-6,6)) + ylim(c(0,8))
+
+g4 <- ggplot(tmp2,aes(y=-log10(BRCAmut_vs_NON.BRCA_p.val),x=BRCAmut_vs_NON.BRCA_diff,color=adjusted_Pval_BH_method<0.05)) + 
+  geom_point(size=1) + 
+  scale_color_manual(values=c('dodgerblue4','red3')) +
+  theme_classic() + theme(legend.position='none') + xlim(c(-6,6)) + ylim(c(0,8))
+
+pdf('volcano_RNA.pdf',height = 3,width = 3); g3; dev.off()
+pdf('volcano_Prot.pdf',height = 3,width = 3); g4; dev.off()
+```
+
+# Mapping Rates Supplemental Figure
+
+```{r map_rates}
+
+x <- readxl::read_excel('../RNA_alignment_rates.xlsx')
+x$SVC2 <- gsub('_[AD]','',x$SVC)
+# add this to the S1 data 
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data'); m0 <- dplyr::filter(m0,useRNA_2==TRUE); dim(m0)
+
+# m0$SVC[which(!m0$SVC %in% x$SVC2)]
+# m0$patientID[which(!m0$patientID %in% x$sampleId)]
+
+y <- dplyr::left_join(m0[,c('SVC','groupBRCA','ReproductiveStatus')],x[,c('SVC2','percentageMapped','totalRead')],by=c('SVC'='SVC2')); dim(y)
+
+# table(is.na(y$groupBRCA))
+y$groupBRCA <- factor(y$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+y$ReproductiveStatus <- factor(y$ReproductiveStatus,levels=c('Pre','Post'))
+
+a <- 
+  ggplot(y,aes(x=groupBRCA,y=percentageMapped,group=groupBRCA,color=ReproductiveStatus)) +   
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.1) + theme_bw() + 
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) +
+  theme(legend.position='none') + ylab('Percentarge Mapped RNA Reads') +
+  xlab('') 
+
+b <- 
+  ggplot(y,aes(x=groupBRCA,y=totalRead,group=groupBRCA,color=ReproductiveStatus)) +   
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.1) + theme_bw() + 
+  scale_color_manual(values=c("#28BBECFF","#FB8022FF")) +
+  theme(legend.position='none') + ylab('RNA Total Reads Sequenced') +
+  xlab('') 
+      
+pdf('RNA_percentage_reads_mapped.pdf',height = 3,width = 3); a; dev.off()
+pdf('RNA_total_reads_sequenced.pdf',height = 3,width = 3); b; dev.off()
+
+# now do stats
+y$totalReadM <- y$totalRead / 1e6
+y %>% rstatix::anova_test(totalRead ~ groupBRCA)
+# ANOVA Table (type II tests)
+# 
+#      Effect DFn DFd     F     p p<.05   ges
+# 1 groupBRCA   2 100 0.592 0.555       0.012
+y %>% rstatix::anova_test(percentageMapped ~ groupBRCA)
+# ANOVA Table (type II tests)
+# 
+#      Effect DFn DFd     F     p p<.05   ges
+# 1 groupBRCA   2 100 0.614 0.543       0.012
+
+```
+
+
+# Age-associated 
+
+## Genes
+
+referencing https://support.bioconductor.org/p/76638/
+
+```{r lmFit}
+require(splines)
+library(edgeR)
+
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data'); 
+m0 <- dplyr::filter(m0,useRNA_2==TRUE); dim(m0)
+# m0 <- dplyr::filter(m0,ReproductiveStatus=='Pre' & Postpartum==FALSE & `Reason for surgery 2`!='Gender Affirmation'); dim(m0)
+
+# and the fixes for this
+m0$MIR200cAvgBeta <- as.numeric(m0$MIR200cAvgBeta)
+# if adjusting for MIR200
+m0 <- dplyr::filter(m0,MIR200cAvgBeta>0); dim(m0)
+
+counts <- read.delim('../synapse_upload_Jan2024/level3_RNA_counts_N94.tsv',sep="\t",check.names=FALSE)
+rownames(counts) <- counts$ensemblId
+stopifnot(all(m0$SVC%in%colnames(counts)))
+
+X <- ns(m0$`Age at time of surgery`, df=3)
+design <- model.matrix(~X + m0$MIR200cAvgBeta)
+# design <- model.matrix(~X)
+# design <- model.matrix(~m0$`Age at time of surgery` + m0$MIR200cAvgBeta)
+fit <- limma::lmFit(counts[,m0$SVC], design, robust=TRUE) 
+fit <- eBayes(fit)
+results <- topTable(fit, coef=2:ncol(design), n=Inf, sort.by="none")
+dim(results)
+stopifnot(all(rownames(results)==rownames(counts)))
+
+results$geneSymbol <- counts$geneSymbol
+results <- dplyr::filter(results,adj.P.Val<0.05) %>% dplyr::arrange(adj.P.Val)
+dim(results)
+
+head(results)
+
+cat("Found",nrow(results),"DEGs\n")
+
+genesSYMBOL.age <- results$geneSymbol[1:50]
+genesENS.age <- rownames(results)[1:50]
+
+
+```
+
+```{r age_assoc_heatmap_anno}
+meta00 <- dplyr::arrange(m0,`Age at time of surgery`)
+
+haCol_AGE <- HeatmapAnnotation(
+  `Age` = meta00$`Age at time of surgery`,
+  `Stromal Content` = meta00$MIR200cAvgBeta,
+  `Menopause Status` = ifelse(meta00$Postpartum,'Postpartum',meta00$ReproductiveStatus),
+  `BRCAm` = meta00$groupBRCA,
+  `Race` = meta00$Race,
+ 
+  col = list(
+    `Stromal Content` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 1, length = 20),
+                              colors = viridis::cividis(20)
+    ),
+    `Age` = circlize::colorRamp2(
+                              breaks = seq(from = 20, to = 72, length = 20),
+                              colors = colorRampPalette(c("gray75", "black"))(20)
+    ),
+    `Menopause Status` = c(
+      'Pre' = "#28BBECFF",
+      'Post' = "#FB8022FF",
+      'Postpartum' = 'grey33'
+    ),
+    `BRCAm` = c(
+      # 'BRCA1' = '#40498e',
+      'BRCA1' = '#7df5f5',
+      'BRCA2' = '#38aaac',
+      'NON-BRCA' = 'black'
+    ),
+    Race = c(
+      'Asian' = '#30123BFF',
+      'Black' = "#28BBECFF",
+      'East Indian' = "#A2FC3CFF",
+      'Hispanic Latino/White' = "#FB8022FF",
+      'White' = "#7A0403FF",
+      'Other' = 'gray48'
+    )
+  )
+)
+
+```
+
+```{r age_assoc_heatmap}
+# get cpm
+cpm <- edgeR::cpm(counts[,meta00$SVC],log = TRUE)
+
+mat <- cpm[genesENS.age,]; dim(mat)
+do.zscore <- FALSE
+if(do.zscore){
+  scaled_mat = t(scale(t(mat))); dim(scaled_mat)
+  scaled_mat[scaled_mat>2] <- 2
+  scaled_mat[scaled_mat<(-2)] <- -2
+}else{
+  scaled_mat <- mat
+}
+colnames(scaled_mat) <- meta00$patientID
+rownames(scaled_mat) <- ifelse(genesSYMBOL.age=="",genesENS.age,genesSYMBOL.age)
+
+hmAGE <- ComplexHeatmap::Heatmap(scaled_mat,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  cluster_column_slices = FALSE,
+  col=viridis::viridis(n=100),
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  # heatmap_legend_param = list(title='log2 CPM'),
+  heatmap_legend_param = if(do.zscore){list(title='Zscore CPM')}else{list(title='log2 CPM')},
+  row_title_gp = gpar(fontsize = 9),
+  row_names_gp = gpar(fontsize = 4),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 8  
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 22),
+  top_annotation = haCol_AGE,
+  heatmap_width = unit(15, "in"),  
+  heatmap_height = unit(11, "in"),  
+  row_title_rot = 0
+)
+
+pdf('age_markers.pdf',width = 25,height = 12); hmAGE; dev.off()
+
+
+```
+
+# Pro vs. Sec
+
+comparing to table S4 from Beddows et al. 2024
+
+```{r pro_v_sec_}
+
+# endom <- readxl::read_excel('~/Desktop/MasterMarkers.xlsx','Table S4 Beddows 2024')
+# endom <- read.delim('~/Desktop/currentProjects/Hui_CCOC_ENOC_HGSC_Rproj/pro_v_sec.DGE_N133_adj_MIR200c_no_MIR200C_filter.tsv',sep="\t")
+endom <- read.delim('~/Desktop/currentProjects/Hui_CCOC_ENOC_HGSC_Rproj/Sec_v_Pro_DEGs.tsv',sep="\t")
+ft <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Table2_Tables/sec_v_pro.DGE.tsv',sep="\t")
+colnames(endom) <- paste0(colnames(endom),'_','ENDOMETRIUM')
+colnames(ft) <- paste0(colnames(ft),'_','FT')
+
+x <- dplyr::left_join(endom,ft,by=c('ens_gene_ENDOMETRIUM'='ens_gene_FT'))
+dim(x)
+
+x$significance <- ifelse(
+  (x$FDR_FT<fdr.filter & x$FDR_ENDOMETRIUM<fdr.filter),'Both',
+  ifelse(x$FDR_FT<fdr.filter,'FT',ifelse(x$FDR_ENDOMETRIUM<fdr.filter,'Endometrium','None')
+))
+table(x$significance)
+
+cor.test(-x$logFC_ENDOMETRIUM,x$logFC_FT,method='spearman')
+
+# filter(x,significance=='Both') %>% ggplot(aes(x=-logFC_ENDOMETRIUM,y=logFC_FT,label=ext_gene_FT,color=significance)) + 
+s4a <- filter(x,significance!='None') %>% ggplot(aes(x=logFC_ENDOMETRIUM,y=logFC_FT,label=ext_gene_FT,color=significance)) + 
+  geom_point(size=0.75) +
+  theme_bw() + 
+  ggrepel::geom_text_repel(show.legend = FALSE,max.overlaps=35,size=2) + 
+  ggthemes::scale_color_colorblind() + 
+  xlim(c(-5,5)) + 
+  ylim(c(-3,3))
+
+s4b <- filter(x,significance=='Both') %>% ggplot(aes(x=logFC_ENDOMETRIUM,y=logFC_FT,label=ext_gene_FT,color=significance)) + 
+  geom_point(size=0.75) +
+  theme_bw() + 
+  ggrepel::geom_text_repel(show.legend = FALSE,max.overlaps=35,size=2) + 
+  ggthemes::scale_color_colorblind() + 
+  xlim(c(-5,5)) + 
+  ylim(c(-3,3))
+      
+####### density plot
+library(viridis)
+
+get_density <- function(x, y, ...) {
+  dens <- MASS::kde2d(x, y, ...)
+  ix <- findInterval(x, dens$x)
+  iy <- findInterval(y, dens$y)
+  ii <- cbind(ix, iy)
+  return(dens$z[ii])
+}
+
+# remove NAs
+remove <- which(is.na(x$logFC_FT))
+x <- x[-remove,]
+x$density <- get_density(x$logFC_ENDOMETRIUM, x$logFC_FT, n = 100)
+
+densFilt <- 0.001
+x$label = ifelse(x$density<densFilt,x$ext_gene_FT,'')
+x <- dplyr::arrange(x,FDR_ENDOMETRIUM)
+x$label2 <- c(x$ext_gene_ENDOMETRIUM[1:50],rep('',nrow(x)-50))
+# dplyr::filter(merged,density<densFilt) %>%
+# pdf('density_logFC_CvE_Sec_v_Pro.pdf',width=5,height=3)
+s4c <- x %>%
+  ggplot(aes(x=logFC_ENDOMETRIUM,y=logFC_FT,color=density)) +
+  # scale_color_viridis(breaks=c(0.005,1),labels=c("Min","Max"),option = 'plasma') +
+  scale_color_viridis(option = 'plasma') +
+  geom_point(size=0.5) + 
+  theme_bw() +
+  # xlim(c(-6,6)) +
+  # ylim(c(-6,6)) +
+  geom_smooth(se = FALSE,col='black',method = 'lm') +
+  geom_text(aes(label=label2),size=2,color='gray22',check_overlap=FALSE) +
+  theme(axis.line = element_line(colour = "black"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank()
+  ) +
+  xlab('Log2 Fold Change Sec. vs. Pro. Endometrium') +
+  ylab('Log2 Fold Change Sec. vs Pro. FT') +
+  ylim(c(-3,3))
+
+
+pdf('fig_s4_endometrium_and_FT_sec_v_pro.pdf',height = 9,width = 5)
+layout <- '
+a
+b
+c'
+
+s4a + s4b + s4c + plot_layout(design = layout)
+dev.off()
+```
+
+## expression PAX8 in sec. v. pro
+
+```{r PAX8_expr,eval=FALSE}
+# pax8 = ENSG00000125618
+x <- readRDS('cpm_N104.Rds')['ENSG00000125618',meta$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta) 
+
+x %>%
+  ggplot(aes(x=menstrPh_by_Endom,y=CPM)) + 
+  # geom_boxplot() +
+  geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=ReproductiveStatus)) +
+  theme_minimal() +
+  # scale_color_manual(values=c("#28BBECFF","#FB8022FF")) +
+  ggtitle('PAX8') + 
+  # ylim(c(0,30)) + 
+  theme(legend.position = 'none') 
+
+pdf(file='pax8_expression_by_menstrual_phase.pdf',height = 3,width = 3);vmdwe;dev.off()
+
+```
+
+# DEG boxplots
+
+```{r deg54_boxplots}
+
+degTable <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Table2_Tables/rna_BRCA1_and_BRCA2_vs_WT_nonPreg.DGE_N159.tsv',sep="\t"); dim(degTable)
+
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE); dim(meta00)
+meta00$MIR200cAvgBeta <- as.numeric(meta00$MIR200cAvgBeta)
+
+# degTable <- dplyr::filter(degTable,FDR<0.05); dim(degTable)
+
+# genes <- c('RNLS','SRGAP1','PTPRQ','TUBB4BP8','FAM20A','HCK')
+genes <- c('CDK5R2','SLC7A5P2','OTP','RNU1-34P','TBC1D3K','USP17L15')
+# x <- degTable <- dplyr::filter(degTable,ext_gene %in% genes)
+
+List <- list() # boxplots by groupBRCA
+List2 <- list() # stroma vs. expresison
+for(g in genes){
+  degF <- dplyr::filter(degTable,ext_gene==g)
+  x <- readRDS('cpm_N104.Rds')[dplyr::filter(degTable,ens_gene==degF$ens_gene)$ens_gene,meta00$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta00) 
+  p <- x |> 
+  ggplot(aes(x=groupBRCA,y=log2(CPM))) + 
+  geom_boxplot() +
+  # geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  # geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=ReproductiveStatus)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.15) +
+  theme_bw() +
+  # scale_color_manual(values=c("#28BBECFF","#FB8022FF")) +
+  xlab('BRCA Status') + ggtitle(paste(g,'; logFC=',signif(degF$logFC,2),sep='')) +
+  theme(legend.position = 'none') 
+  
+  p2 <- x |> 
+    ggplot(aes(x=MIR200cAvgBeta,y=log2(CPM))) + geom_point() + theme_bw() +
+    xlab('Stromal Fraction') + ggtitle(g)
+  
+  List[[length(List)+1]] = p
+  List2[[length(List2)+1]] = p2
+}
+length(List)
+stopifnot(length(List)==length(genes))
+names(List) <- genes
+
+require(patchwork)
+layout <- '
+abc
+def
+ghi
+jkl'
+  
+pdf(file='degs159_boxplots_by_groupBRCA.pdf',height = 12,width = 9)
+
+List[[1]] + 
+List[[2]] + 
+List[[3]] + 
+List[[4]] + 
+List[[5]] + 
+List[[6]] + 
+List2[[1]] + 
+List2[[2]] + 
+List2[[3]] + 
+List2[[4]] + 
+List2[[5]] + 
+List2[[6]] + 
+plot_layout(design = layout)
+
+dev.off()
+
+
+
+```
+
+# BRCA1 and BRCA2 expression boxplots
+
+```{r deg54_boxplots2}
+
+degTable <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Table2_Tables/rna_BRCA1_and_BRCA2_vs_WT_nonPreg_wRaceAdj.DGE_N54.tsv',sep="\t"); dim(degTable)
+
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE); dim(meta00)
+meta00$MIR200cAvgBeta <- as.numeric(meta00$MIR200cAvgBeta)
+
+# degTable <- dplyr::filter(degTable,FDR<0.05); dim(degTable)
+
+genes <- c('BRCA1','BRCA2')
+# x <- degTable <- dplyr::filter(degTable,ext_gene %in% genes)
+
+List <- list() # boxplots by groupBRCA
+List2 <- list() # stroma vs. expresison
+List3 <- list() # cor.test result
+for(g in genes){
+  x <- readRDS('cpm_N104.Rds')[dplyr::filter(degTable,ens_gene==dplyr::filter(degTable,ext_gene==g)$ens_gene)$ens_gene,meta00$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta00) 
+  p <- x |> 
+  ggplot(aes(x=groupBRCA,y=log2(CPM))) + 
+  geom_boxplot() +
+  # geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  # geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=ReproductiveStatus)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.15) +
+  theme_bw() +
+  # scale_color_manual(values=c("#28BBECFF","#FB8022FF")) +
+  xlab('BRCA Status') + ggtitle(g) +
+  theme(legend.position = 'none') 
+  
+  p2 <- x |> 
+    ggplot(aes(x=MIR200cAvgBeta,y=log2(CPM))) + geom_point() + theme_bw() +
+    xlab('Stromal Fraction') + ggtitle(g) 
+  
+  List[[length(List)+1]] = p
+  List2[[length(List2)+1]] = p2
+  List3[[length(List3)+1]] = cor.test(x$MIR200cAvgBeta,x$CPM,method='spearman')
+  
+  # anova test
+  rstatix::anova_test(x,log2(CPM) ~ groupBRCA)
+  
+}
+length(List)
+stopifnot(length(List)==length(genes))
+names(List) <- genes
+
+require(patchwork)
+layout <- '
+ab
+cd'
+  
+pdf(file='BRCA1_and_2_log2CPM_boxplots_by_groupBRCA.pdf',height = 6,width = 6)
+
+List[[1]] + 
+List[[2]] + 
+List2[[1]] + 
+List2[[2]] + 
+plot_layout(design = layout)
+
+dev.off()
+
+List3[[1]]
+List3[[2]]
+
+```
+
+# Boxplots for non race-adjusted DEG analysis N=159
+
+```{r deg54_boxplots3}
+
+degTable <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Table2_Tables/rna_BRCA1_and_BRCA2_vs_WT_nonPreg.DGE_N159.tsv',sep="\t"); dim(degTable)
+
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+# add in menstrPh_by_Endom
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE); dim(meta00)
+meta00$MIR200cAvgBeta <- as.numeric(meta00$MIR200cAvgBeta)
+
+
+List <- list() # boxplots by groupBRCA
+List2 <- list() # stroma vs. expresison
+List3 <- list() # cor.test result
+for(g in genes){
+  x <- readRDS('cpm_N104.Rds')[dplyr::filter(degTable,ens_gene==dplyr::filter(degTable,ext_gene==g)$ens_gene)$ens_gene,meta00$SVC] %>%
+ tidyr::pivot_longer(names_to = 'SVC',values_to = 'CPM',cols = everything()) %>%
+  dplyr::left_join(y=meta00) 
+  p <- x |> 
+  ggplot(aes(x=groupBRCA,y=log2(CPM))) + 
+  geom_boxplot() +
+  # geom_violin(fill=NA,draw_quantiles = c(0.25, 0.5, 0.75)) +
+  # geom_jitter(size = 2, alpha = 1, width = 0.2,aes(col=ReproductiveStatus)) +
+  geom_jitter(size = 2, alpha = 1, width = 0.15) +
+  theme_bw() +
+  # scale_color_manual(values=c("#28BBECFF","#FB8022FF")) +
+  xlab('BRCA Status') + ggtitle(g) +
+  theme(legend.position = 'none') 
+  
+  p2 <- x |> 
+    ggplot(aes(x=MIR200cAvgBeta,y=log2(CPM))) + geom_point() + theme_bw() +
+    xlab('Stromal Fraction') + ggtitle(g) 
+  
+  List[[length(List)+1]] = p
+  List2[[length(List2)+1]] = p2
+  List3[[length(List3)+1]] = cor.test(x$MIR200cAvgBeta,x$CPM,method='spearman')
+  
+  # anova test
+  rstatix::anova_test(x,log2(CPM) ~ groupBRCA)
+  
+}
+length(List)
+stopifnot(length(List)==length(genes))
+names(List) <- genes
+
+require(patchwork)
+layout <- '
+ab
+cd'
+  
+pdf(file='BRCA1_and_2_log2CPM_boxplots_by_groupBRCA.pdf',height = 6,width = 6)
+
+List[[1]] + 
+List[[2]] + 
+List2[[1]] + 
+List2[[2]] + 
+plot_layout(design = layout)
+
+dev.off()
+
+List3[[1]]
+List3[[2]]
+
+```
+
+# GO enrichment / KEGG for specific contrast
+
+```{r go_and_kegg122}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(msigdbr)
+
+degsF <- degs159
+# degsF <- degs
+
+DE_up <- (degsF %>%
+        # dplyr::select(c(ens_gene,ext_gene,FDR,logFC)) %>%
+        dplyr::filter(logFC > 0))$ens_gene
+    
+      GO.BP_up = enrichGO(gene=DE_up,
+                    OrgDb=org.Hs.eg.db,
+                    ont ="BP",
+                    keyType = "ENSEMBL",
+                    pAdjustMethod = "BH")
+
+DE_dn <- (degsF %>%
+        # dplyr::select(c(ens_gene,ext_gene,FDR,logFC)) %>%
+        dplyr::filter(logFC < 0))$ens_gene
+    
+      GO.BP_dn = enrichGO(gene=DE_dn,
+                    OrgDb=org.Hs.eg.db,
+                    ont ="BP",
+                    keyType = "ENSEMBL",
+                    pAdjustMethod = "BH")
+
+      
+# barplots of GO results - Down
+blues <- RColorBrewer::brewer.pal(9,'Greens')
+xx <- data.frame(GO.BP_dn) %>% dplyr::arrange(p.adjust) %>% head(n=10); 
+xx$Description <- factor(xx$Description,levels=rev(xx$Description))
+g_dn <- ggplot(xx,aes(y=Description,x=-log10(p.adjust))) +   geom_bar(stat='identity',fill=blues[6]) + theme_minimal() + ylab('') +
+  scale_x_continuous(limits = c(0,40),breaks=c(10,20,30,40))
+
+# barplots of GO results - Down
+reds <- RColorBrewer::brewer.pal(9,'Greens')
+xx <- data.frame(GO.BP_up) %>% dplyr::arrange(p.adjust) %>% head(n=10); xx$Description <- factor(xx$Description,levels=rev(xx$Description))
+g_up <- ggplot(xx,aes(y=Description,x=-log10(p.adjust))) + geom_bar(stat='identity',fill=reds[6]) + theme_minimal() + ylab('') +
+  scale_x_continuous(limits = c(0,40),breaks=c(10,20,30,40))
+
+pdf('DEGs_159_GO_BP_DN.pdf'); g_dn ; dev.off()
+pdf('DEGs_159_GO_BP_UP.pdf'); g_up ; dev.off()
+
+      
+# Kegg situation      
+geneRanks <- preRank(degs)
+m_t2g <- msigdbr(species = 'human', category = "C2", subcategory = "CP:KEGG") %>%
+          dplyr::select(gs_name, gene_symbol)
+        # run fGSEA
+        if(any(is.na(geneRanks))){geneRanks=geneRanks[-which(is.na(geneRanks))]}
+        gsea_res <- clusterProfiler::GSEA(geneRanks, nPerm= 10000, TERM2GENE = m_t2g, by="fgsea", seed = TRUE,pvalueCutoff = 1)
+        nrow(gsea_res@result)
+        # print results
+        if (nrow(gsea_res@result) >=1){
+          cat(paste("Significantly Enriched KEGG Pathways:", nrow(gsea_res@result),
+                      "\n\nTop 30 pathways visualized below:"))
+          # RidgePlot
+         xxx <- ridgeplot(gsea_res,showCategory=20) +
+                  theme(axis.text.y = element_text(size=8)) +
+                  theme(axis.text.x = element_text(size=8)) +
+                  theme(axis.title = element_text(size=8)) +
+                  scale_y_discrete(label=function(x) abbreviate(x, minlength=40)) +
+                  ggtitle("RidgePlot - GSEA: KEGG")
+
+         pdf(file='ridgePlot_KEGG_DGEs_159.pdf',height = 3,width = 6); print(xxx); dev.off()
+         
+         
+         
+         
+# now do GO enrichment for the clusters in Fig. 3
+         
+DE <- c('CTSB','TNIP1','MVP','PLEKHO2','IL4R','C2CD4B','TRIM47','CEACAM1','TUBB4BP8','SLC6A14','PI3','SEL1L3','CP','CHI3L1','SLC5A1','CXCL5','ATP10B')    
+
+GO.BP = enrichGO(gene=DE,
+                    OrgDb=org.Hs.eg.db,
+                    ont ="BP",
+                    keyType = "SYMBOL",
+                    pAdjustMethod = "BH")
+View(data.frame(GO.BP)
+     
+table(degsF$logFC>0 & degsF$logCPM>(-1.6))      # these are the 32 in the heatmap
+degs32 <- dplyr::filter(degsF,logFC>0 & logCPM>(-1.6))$ens_gene
+# now the other cluster
+GO.BP = enrichGO(gene=degs32,
+                    OrgDb=org.Hs.eg.db,
+                    ont ="BP",
+                    keyType = "ENSEMBL",
+                    pAdjustMethod = "BH")
+View(data.frame(GO.BP))
+
+
+# link these DE to age
+x <- readRDS('cpm_N104.Rds')
+
+```
+
+
+# logCPM for DEGs vs all expr. genes
+
+```{r degs3223}
+
+degs <- read.delim('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Table2_Tables/rna_BRCA1_and_BRCA2_vs_WT_nonPreg.DGE_N159.tsv',sep="\t")
+degsF <- dplyr::filter(degs,FDR<0.05)
+
+x <- degs$logCPM
+y <- degsF$logCPM
+  
+ggplot() + 
+  geom_boxplot(aes(x="All Genes\n (N=37285)", y=x)) + 
+  geom_boxplot(aes(x= "Significant\nGenes (N=159)", y=y)) +
+  ylab("logCPM") +
+  xlab("") + theme_minimal()
+```
+
+
+
+
+
+# GLMs on PCs
+
+linear models including multiple covariates for PC1 & 2
+
+```{r lmpc}
+
+# load data
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+m0$MIR200cAvgBeta <- as.numeric(m0$MIR200cAvgBeta)
+m0$MenoStatus <- ifelse(m0$Postpartum,'Postpartum',m0$ReproductiveStatus)
+m0$MenoStatus <- factor(m0$MenoStatus, levels=c('Pre','Post','Postpartum'))
+m0$BRCA <- ifelse(m0$groupBRCA=='NON-BRCA','non-BRCAm','BRCAm')
+
+# RNA LMs
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE); dim(meta00)
+
+r1 <- lm(formula = meta00$PC1_RNA ~ meta00$MIR200cAvgBeta + meta00$`Age at time of surgery` + meta00$MenoStatus + meta00$BRCA)
+r2 <- lm(meta00$PC2_RNA ~ meta00$MIR200cAvgBeta + meta00$`Age at time of surgery` + meta00$MenoStatus + meta00$BRCA)
+
+summary(r1)
+summary(r2)
+
+
+# Meth
+meta00 <- dplyr::filter(m0,useMethylation==TRUE); dim(meta00)
+meta00$MIR200cAvgBeta <- as.numeric(meta00$MIR200cAvgBeta)
+
+r1 <- lm(meta00$PC1_Methylation ~ meta00$MIR200cAvgBeta + meta00$`Age at time of surgery` + meta00$MenoStatus + meta00$BRCA)
+r2 <- lm(meta00$PC2_Methylation ~ meta00$MIR200cAvgBeta + meta00$`Age at time of surgery` + meta00$MenoStatus + meta00$BRCA)
+# r <- lm(meta00$PC1_Methylation ~ meta00$MIR200cAvgBeta  + meta00$groupBRCA)
+
+summary(r1)
+summary(r2)
+
+
+# Protein
+meta00 <- dplyr::filter(m0,useProteomics==TRUE); dim(meta00)
+meta00$MIR200cAvgBeta <- as.numeric(meta00$MIR200cAvgBeta)
+
+r1 <- lm(meta00$PC1_Protein ~ meta00$MIR200cAvgBeta + meta00$`Age at time of surgery` + meta00$MenoStatus + meta00$BRCA)
+r2 <- lm(meta00$PC2_Protein ~ meta00$MIR200cAvgBeta + meta00$`Age at time of surgery` + meta00$MenoStatus + meta00$BRCA)
+# r <- lm(meta00$PC1_Methylation ~ meta00$MIR200cAvgBeta  + meta00$groupBRCA)
+
+summary(r1)
+summary(r2)
+
+```
+
+with glms
+```{r glmPCs}
+
+# load data
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+m0$MIR200cAvgBeta <- as.numeric(m0$MIR200cAvgBeta)
+# m0$MenoStatus <- m0$Postpartum
+m0$MenoStatus <- ifelse(m0$Postpartum,'Postpartum',m0$ReproductiveStatus)
+m0$MenoStatus <- factor(m0$MenoStatus, levels=c('Pre','Post','Postpartum'))
+m0$BRCA <- ifelse(m0$groupBRCA=='NON-BRCA','non-BRCAm','BRCAm')
+
+#))))))))))))))))))))
+#))))))))))))))))))))
+#))))))))))))))))))))
+# RNA
+######
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE); dim(meta00)
+meta00$PC1_RNA <- as.numeric(meta00$PC1_RNA)
+meta00$PC2_RNA <- as.numeric(meta00$PC2_RNA)
+
+#______________
+# PC1
+## BRCA1
+# null BRCA - AIC: 1965.9
+r0 <- glm(meta00$PC1_RNA ~ meta00$BRCA);summary(r0)
+# BRCA + mir200 - AIC: 
+r0 <- glm(meta00$PC1_RNA ~ meta00$BRCA + meta00$MIR200cAvgBeta);summary(r0)
+# BRCA + mir200 + age - AIC: 
+r0 <- glm(meta00$PC1_RNA ~ meta00$BRCA + meta00$MIR200cAvgBeta + meta00$`Age at time of surgery`);summary(r0)
+# BRCA + mir200 + age + postpartum - AIC: 
+r0 <- glm(meta00$PC1_RNA ~ meta00$BRCA + meta00$MIR200cAvgBeta + meta00$`Age at time of surgery` + meta00$Postpartum);summary(r0)
+# BRCA + mir200 + age + postpartum + meno - AIC: 
+r0 <- glm(meta00$PC1_RNA ~ meta00$BRCA + meta00$MIR200cAvgBeta + meta00$`Age at time of surgery` + meta00$Postpartum + meta00$ReproductiveStatus);summary(r0)
+
+#______________
+# PC2
+## BRCA1
+# null BRCA - AIC: 
+r0 <- glm(meta00$PC2_RNA ~ meta00$BRCA);summary(r0)
+# BRCA + mir200 - AIC:
+r0 <- glm(meta00$PC2_RNA ~ meta00$BRCA + meta00$MIR200cAvgBeta);summary(r0)
+# BRCA + mir200 + age - AIC: 
+r0 <- glm(meta00$PC2_RNA ~ meta00$BRCA + meta00$MIR200cAvgBeta + meta00$`Age at time of surgery`);summary(r0)
+# BRCA + mir200 + age + postpartum - AIC: 
+r0 <- glm(meta00$PC2_RNA ~ meta00$BRCA + meta00$MIR200cAvgBeta + meta00$`Age at time of surgery` + meta00$Postpartum);summary(r0)
+# BRCA + mir200 + age + postpartum + meno - AIC: 
+r0 <- glm(meta00$PC2_RNA ~ meta00$BRCA + meta00$MIR200cAvgBeta + meta00$`Age at time of surgery` + meta00$Postpartum + meta00$ReproductiveStatus);summary(r0)
+
+
+# now do individual rho values
+# PC1 age & stroma
+cor.test(meta00$PC1_RNA,meta00$`Age at time of surgery`,method='spearman')
+cor.test(meta00$PC1_RNA,meta00$MIR200cAvgBeta,method='spearman')
+# PC2 age & stroma
+cor.test(meta00$PC2_RNA,meta00$`Age at time of surgery`,method='spearman')
+cor.test(meta00$PC2_RNA,meta00$MIR200cAvgBeta,method='spearman')
+
+#))))))))))))))))))))
+#))))))))))))))))))))
+#))))))))))))))))))))
+# Meth
+######
+meta00 <- dplyr::filter(m0,useMethylation==TRUE); dim(meta00)
+meta00$MIR200cAvgBeta <- as.numeric(meta00$MIR200cAvgBeta)
+meta00$PC1_Methylation <- as.numeric(meta00$PC1_Methylation)
+meta00$PC2_Methylation <- as.numeric(meta00$PC2_Methylation)
+
+#______________
+# PC1
+## BRCA1
+# null BRCA - AIC: 376.2
+r0 <- glm(meta00$PC1_Methylation ~ meta00$BRCA);summary(r0)
+# BRCA + mir200 - AIC: 344.25
+r0 <- glm(meta00$PC1_Methylation ~ meta00$BRCA + meta00$MIR200cAvgBeta);summary(r0)
+# BRCA + mir200 + age - AIC: 337.05
+r0 <- glm(meta00$PC1_Methylation ~ meta00$BRCA + meta00$MIR200cAvgBeta + meta00$`Age at time of surgery`);summary(r0)
+# BRCA + mir200 + age + postpartum - AIC: 336.82
+r0 <- glm(meta00$PC1_Methylation ~ meta00$BRCA + meta00$MIR200cAvgBeta + meta00$`Age at time of surgery` + meta00$Postpartum);summary(r0)
+# BRCA + mir200 + age + postpartum + meno - AIC: 338.07
+r0 <- glm(meta00$PC1_Methylation ~ meta00$BRCA + meta00$MIR200cAvgBeta + meta00$`Age at time of surgery` + meta00$Postpartum + meta00$ReproductiveStatus);summary(r0)
+
+#______________
+# PC2
+## BRCA1
+# null BRCA - AIC: 303.48
+r0 <- glm(meta00$PC2_Methylation ~ meta00$BRCA);summary(r0)
+# BRCA + mir200 - AIC: 297.27
+r0 <- glm(meta00$PC2_Methylation ~ meta00$BRCA + meta00$MIR200cAvgBeta);summary(r0)
+# BRCA + mir200 + age - AIC: 294.33
+r0 <- glm(meta00$PC2_Methylation ~ meta00$BRCA + meta00$MIR200cAvgBeta + meta00$`Age at time of surgery`);summary(r0)
+# BRCA + mir200 + age + postpartum - AIC: 285.04
+r0 <- glm(meta00$PC2_Methylation ~ meta00$BRCA + meta00$MIR200cAvgBeta + meta00$`Age at time of surgery` + meta00$Postpartum);summary(r0)
+# BRCA + mir200 + age + postpartum + meno - AIC: 284.86
+r0 <- glm(meta00$PC2_Methylation ~ meta00$BRCA + meta00$MIR200cAvgBeta + meta00$`Age at time of surgery` + meta00$Postpartum + meta00$ReproductiveStatus);summary(r0)
+
+# now do individual rho values
+# PC1 age & stroma
+cor.test(meta00$PC1_Methylation,meta00$`Age at time of surgery`,method='spearman')
+cor.test(meta00$PC1_Methylation,meta00$MIR200cAvgBeta,method='spearman')
+# PC2 age & stroma
+cor.test(meta00$PC2_Methylation,meta00$`Age at time of surgery`,method='spearman')
+cor.test(meta00$PC2_Methylation,meta00$MIR200cAvgBeta,method='spearman')
+
+#))))))))))))))))))))
+#))))))))))))))))))))
+#))))))))))))))))))))
+# Protein
+meta00 <- dplyr::filter(m0,useProteomics==TRUE); dim(meta00)
+meta00$MIR200cAvgBeta <- as.numeric(meta00$MIR200cAvgBeta)
+meta00$PC1_Protein <- as.numeric(meta00$PC1_Protein)
+meta00$PC2_Protein <- as.numeric(meta00$PC2_Protein)
+#______________
+# PC1
+## BRCA1
+# null BRCA - AIC: 
+r0 <- glm(meta00$PC1_Protein ~ meta00$BRCA);summary(r0)
+# BRCA + mir200 - AIC: 
+r0 <- glm(meta00$PC1_Protein ~ meta00$BRCA + meta00$MIR200cAvgBeta);summary(r0)
+# BRCA + mir200 + age - AIC: 
+r0 <- glm(meta00$PC1_Protein ~ meta00$BRCA + meta00$MIR200cAvgBeta + meta00$`Age at time of surgery`);summary(r0)
+# BRCA + mir200 + age + postpartum - AIC: 
+r0 <- glm(meta00$PC1_Protein ~ meta00$BRCA + meta00$MIR200cAvgBeta + meta00$`Age at time of surgery` + meta00$Postpartum);summary(r0)
+# BRCA + mir200 + age + postpartum + meno - AIC: 
+r0 <- glm(meta00$PC1_Protein ~ meta00$BRCA + meta00$MIR200cAvgBeta + meta00$`Age at time of surgery` + meta00$Postpartum + meta00$ReproductiveStatus);summary(r0)
+
+#______________
+# PC2
+## BRCA1
+# null BRCA - AIC: 
+r0 <- glm(meta00$PC2_Protein ~ meta00$BRCA);summary(r0)
+# BRCA + mir200 - AIC:
+r0 <- glm(meta00$PC2_Protein ~ meta00$BRCA + meta00$MIR200cAvgBeta);summary(r0)
+# BRCA + mir200 + age - AIC: 
+r0 <- glm(meta00$PC2_Protein ~ meta00$BRCA + meta00$MIR200cAvgBeta + meta00$`Age at time of surgery`);summary(r0)
+# BRCA + mir200 + age + postpartum - AIC: 
+r0 <- glm(meta00$PC2_Protein ~ meta00$BRCA + meta00$MIR200cAvgBeta + meta00$`Age at time of surgery` + meta00$Postpartum);summary(r0)
+# BRCA + mir200 + age + postpartum + meno - AIC: 
+r0 <- glm(meta00$PC2_Protein ~ meta00$BRCA + meta00$MIR200cAvgBeta + meta00$`Age at time of surgery` + meta00$Postpartum + meta00$ReproductiveStatus);summary(r0)
+
+
+# now do individual rho values
+# PC1 age & stroma
+cor.test(meta00$PC1_Protein,meta00$`Age at time of surgery`,method='spearman')
+cor.test(meta00$PC1_Protein,meta00$MIR200cAvgBeta,method='spearman')
+# PC2 age & stroma
+cor.test(meta00$PC2_Protein,meta00$`Age at time of surgery`,method='spearman')
+cor.test(meta00$PC2_Protein,meta00$MIR200cAvgBeta,method='spearman')
+
+```
+
+# DEGs expr. vs. Protein expr.
+
+filtering the DEGs for >1 CPM for the 95th percentile, get 117 genes
+
+```{r degs159_corr_proteomics}
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data')
+protein_data <- readRDS(file='../proteomics_Rproj/protein_data_N96.Rds')
+cpm <- edgeR::cpm(readRDS('raw_counts_adjusted_N94.Rds')[,-c(1:2)],log=FALSE)
+
+meta_ep <- dplyr::filter(m0,useProteomics==TRUE & useRNA_2==TRUE)
+
+stopifnot(all(meta_ep$SVC%in%colnames(cpm)))
+stopifnot(all(meta_ep$`Patient ID`%in%colnames(protein_data)))
+meta_ep$groupBRCA <- factor(meta_ep$groupBRCA,levels=c('NON-BRCA','BRCA1','BRCA2'))
+protein_data <- protein_data[,meta_ep$`Patient ID`]
+cpm <- cpm[,meta_ep$SVC]
+colnames(cpm) <- meta_ep$`Patient ID`
+stopifnot(all(colnames(cpm)==colnames(protein_data)))
+
+resList <- list()
+for(i in 1:nrow(degs159)){
+  res <- grep(degs159$ext_gene[i],rownames(protein_data))
+  print(paste(degs159$ext_gene[i],length(res)))
+  resList[[i]] <- res
+}
+names(resList) <- degs159$ext_gene
+
+# get the nHits
+nHits <- rep(0,length(resList))
+for(i in 1:length(resList)){
+  # print(length(resList[[i]]))
+  nHits[i] <- length(resList[[i]])
+}
+table(nHits>0)
+keep653t <- which(nHits>0)
+
+resListFIL <- resList[keep653t]; length(resListFIL)
+# and remove "" as the ext_gene because these get blank matches but aren't actually detected because they are not known genes with SYMBOL
+resListFIL <- resListFIL[-which(names(resListFIL)=="")]; length(resListFIL)
+
+# this is ENSEMBL ids to match
+ensList <- degs159$ens_gene[match(names(resListFIL),degs159$ext_gene)]
+
+
+
+# change NA to 0 for computer
+protein_data[is.na(protein_data)] <- 0
+
+
+protein_cor_plots_list <- list()
+stromal_cor_plots_list <- list()
+
+mat_deg_protein <- matrix(nrow=length(resListFIL),ncol=ncol(protein_data))
+for(i in 1:length(resListFIL)){
+    # build the data.frame
+    # get avg protein expression across hits
+    j <- as.numeric(unlist(resListFIL[i]))
+    if(length(j)>1){
+      dfs <- colMeans(protein_data[j,])
+    }else{
+      dfs <- protein_data[j,]
+    }
+    
+    tmp <- data.frame(
+      protein_abund = dfs,
+      expr_cpm = cpm[ensList[i],],
+      MIR200C = as.numeric(meta_ep$MIR200cAvgBeta)
+    )
+    # now do spearman cor for MIR200 and protein
+    
+    r1 <- cor.test(tmp$protein_abund,tmp$expr_cpm,method='spearman')
+    
+    r2 <- cor.test(tmp$expr_cpm,tmp$MIR200C,method='spearman')
+    
+    g <- ggplot(tmp,aes(x=log(protein_abund),y=expr_cpm)) + geom_point(color='grey52') + theme_minimal() + xlab('') + ylab('') + labs(
+      title = paste0(names(resListFIL[i]),'; ',ensList[i]),
+      subtitle = paste0('rho=',signif(r1$estimate,2),'; Pval=',signif(r1$p.value,2))
+      ) + theme(plot.subtitle=element_text(size=10,color="black"))
+    
+    protein_cor_plots_list[[i]] <- g
+    mat_deg_protein[i,] <- dfs
+}
+colnames(mat_deg_protein) <- colnames(protein_data)
+rownames(mat_deg_protein) <- names(resListFIL)
+library(gridExtra)
+
+# pdf("degs159_gene_protein_expr_correlation.pdf", onefile = TRUE)
+# for (i in seq(length(protein_cor_plots_list))) {
+#   do.call("grid.arrange", protein_cor_plots_list[[i]])  
+# }
+# dev.off()      
+ggsave(
+   filename = "degs159_gene_protein_expr_correlation.pdf", 
+   plot = marrangeGrob(protein_cor_plots_list, nrow=4, ncol=7), 
+   width = 20, height = 15
+)
+        
+        
+pdf('RNA_DEGs_159filt_vs_Protein.pdf',height=5,width = 5); tmp; dev.off()
+```
+
+# heatmap with DEG proteins
+
+```{r haCol_protein}
+meta00 <- meta_ep
+
+meta00$MenoStatus <- ifelse(meta00$Postpartum==TRUE,'Postpartum',as.character(meta00$ReproductiveStatus))
+table(meta00$MenoStatus)
+meta00$MenoStatus <- factor(meta00$MenoStatus,levels=c('Pre','Post','Postpartum'))
+
+haCol_protein <- HeatmapAnnotation(
+  `Age` = meta00$`Age at time of surgery`,
+  `Stromal Content` = as.numeric(meta00$MIR200cAvgBeta),
+  `Menopause Status` = meta00$MenoStatus,
+  `BRCAm` = meta00$groupBRCA,
+  `Race` = meta00$Race,
+  # `Days since LMP` = meta00$`Days since LMP`,
+  # DaysSinceLMP_categ = meta00$DaysSinceLMP_categ,
+  `Surgical Indication` = meta00$`Reason for surgery 3`,
+  # `Number of Pregnancies` = as.numeric(meta00$`# of Pregnancies`),
+
+  # `Immune Score` = meta00$ImmuneScore,
+  col = list(
+    `Stromal Content` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 1, length = 20),
+                              colors = viridis::cividis(20)
+    ),
+    `Age` = circlize::colorRamp2(
+                              breaks = seq(from = 20, to = 72, length = 20),
+                              colors = colorRampPalette(c("gray75", "black"))(20)
+    ),
+    `Progestin Exposure` = c(
+      'Likely' = 'pink',
+      'Certain' = 'red'
+    ),
+    `Menopause Status` = c(
+      'Pre' = "#28BBECFF",
+      'Post' = "#FB8022FF",
+      'Postpartum' = 'grey33'
+    ),
+    `BRCAm` = c(
+      # 'BRCA1' = '#40498e',
+      'BRCA1' = '#7df5f5',
+      'BRCA2' = '#38aaac',
+      'NON-BRCA' = 'black'
+    ),
+    Race = c(
+      'Asian' = '#30123BFF',
+      'Black' = "#28BBECFF",
+      'East Indian' = "#A2FC3CFF",
+      'Hispanic Latino/White' = "#FB8022FF",
+      'White' = "#7A0403FF",
+      'Other' = 'gray48'
+    ),
+    DaysSinceLMP_categ=c(
+      '[0,12]' = '#67001F',
+      '(12,16]' = '#92C5DE',
+      '(16,30]' = '#053061',
+      '(30,60]' = 'black'
+    ),
+    `Path Report Menstrual Phase` = c(
+      'Weakly Proliferative'='#92C5DE',
+      'Proliferative' = '#0096FF',
+      'Late Proliferative/Early Secretory'='dodgerblue4',
+      'Secretory'= "#CA0020",
+      'Inactive'='black'
+    ),
+    `Surgical Indication` = c(
+      'Benign Uterine'='#8DD3C7',
+      'Cesarean Section'='#FCCDE5',
+      'Cervical Dysplasia'='#BEBADA',
+      'Menorrhagia'='#FB8072',
+      'Endometriosis'='#80B1D3',
+      'Ovarian Serous Cystadenoma'='#FDB462',
+      # 'Ovarian Cyst (Sex chord stromal tumor)'='#B3DE69',
+      'Ovarian Cyst'='pink3',
+      'Pelvic mass'='#D9D9D9',
+      'Adnexal Mass' = '#BC80BD',
+      # 'Tubal Sterilization' = '#CCEBC5',
+      'Tubal Sterilization' = '#0BDA51',
+      'Gender Affirmation'='#FFED6F',
+      # 'Risk Reduction' = '#B3DE69'
+      'Risk Reduction' = 'green'
+    ),
+    `contraception use` = c(
+      'NA'='grey66',
+      'Former'='purple',
+      'Current'='blue',
+      'Y'='blue3',
+      'Y - BTL'='darkblue',
+      'N' = 'red'
+    )
+  ),na_col='white'
+)
+
+```
+
+```{r hm_deg_proteins}
+
+stopifnot(all(colnames(mat_deg_protein)==meta_ep$`Patient ID`))
+meta_ep$groupBRCApostpartum <- ifelse(meta_ep$Postpartum==TRUE,'Postpartum',as.character(meta_ep$groupBRCA))
+meta_ep$groupBRCApostpartum <- factor(meta_ep$groupBRCApostpartum,levels=c('NON-BRCA','BRCA1','BRCA2','Postpartum'))
+
+scaled_mat = t(scale(t(mat_deg_protein))); dim(scaled_mat)
+scaled_mat[scaled_mat>2] <- 2
+scaled_mat[scaled_mat<(-2)] <- -2
+
+hm00 <- ComplexHeatmap::Heatmap(scaled_mat,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  col=viridis::magma(n=100),
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  cluster_column_slices = FALSE,
+  clustering_distance_rows = 'euclidean',
+  heatmap_legend_param = list(title='Zscore CPM'),
+  row_title_gp = gpar(fontsize = 9),
+  row_names_gp = gpar(fontsize = 4),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 5#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 22),
+  # right_annotation = haRow,
+  top_annotation = haCol_protein,
+  heatmap_width = unit(5, "in"),  
+  heatmap_height = unit(4, "in"),  
+  # column_split = meta00$Race,
+  column_split = meta_ep$groupBRCApostpartum,
+  # row_split = paste0(meta$ReproductiveStatus,'\n',meta$groupBRCA),
+  # row_split = markers$Marker,
+  # row_split = ifelse(degs$logFC[keepDegs]>0,'UP','DN'),
+  row_title_rot = 0
+)
+
+pdf('DEGs_159_free2_PROTEIN.pdf',width = 10,height = 11); hm00; dev.off()
+
+
+```
+
+# ciliated markers vs. BRCA1/2 expression
+
+```{r brcaExprVsCiliatedMarkers}
+
+xxx <- dplyr::filter(markers,Marker=='Ciliated Epithelial')
+xxx <- dplyr::filter(xxx,SYMBOL%in%c('CAPS','FOXJ1')); dim(xxx)
+
+cpm <- edgeR::cpm(filtered_counts,log=FALSE)
+logcpm <- log2(cpm+1)
+
+brca1 <- logcpm['ENSG00000012048',]
+brca2 <- logcpm['ENSG00000139618',]
+# import secretory markers & get BRCA1/2
+plotList <- list()
+for(i in 1:nrow(xxx)){
+    yyy <- data.frame(
+      'BRCA1' = brca1+1,
+      'SecMarker' = logcpm[xxx$ENSEMBL[i],]
+    )
+    yyy$SVC <- rownames(yyy); yyy <- dplyr::left_join(yyy,m0,by='SVC')
+    # yyy$MIR200cAvgBeta <- as.numeric(yyy$MIR200cAvgBeta)
+    corTestResult <- cor.test(yyy$BRCA1,yyy$SecMarker,method='spearman')
+    # try glm adjusting for
+    # summary(lm(yyy$BRCA1 ~ yyy$SecMarker + yyy$MIR200cAvgBeta))
+    
+    # print(
+      p <- ggplot(yyy,aes(y=BRCA1,x=SecMarker)) + theme_bw() + geom_point() + 
+        labs(
+          title = xxx$SYMBOL[i]#,
+          # subtitle = paste0(corTestResult$method,'=',signif(corTestResult$estimate,2),'; Pval=',signif(corTestResult$p.value,2)
+        ) + theme(plot.title = element_text(size=10),plot.subtitle = element_text(size=6)) + xlab(paste0('log2(CPM+1)',xxx$SYMBOL[i])) + facet_wrap(~groupBRCA)
+    # )
+    plotList[[i]] <- p
+    # print(
+      
+    # )
+}
+
+
+# make a boxplot BRCA1 expression
+g0 <- ggplot(yyy,aes(x=paste(ReproductiveStatus,Postpartum),y=BRCA1)) + 
+  geom_boxplot() +
+  # geom_violin(fill=NA) +
+  geom_jitter(size = 1, alpha = 1, width = 0.1) +
+  theme_bw() + ylab('BRCA1 log2(CPM+1)')
+ggsave(
+   filename = "BRCA1_expression_Postpartum.pdf", 
+   plot = g0, limitsize = FALSE,
+   width = 5, height = 5
+)
+
+# getwd()
+library(gridExtra)
+ggsave(
+   filename = "Ciliated_markers_BRCA1_correlation.pdf", 
+   plot = marrangeGrob(plotList, nrow=2, ncol=1), limitsize = FALSE,
+   width = 5, height = 5
+)
+
+```
+
+# sec markers vs. BRCA1/2 
+
+```{r brcaExprVsSecMarkers}
+
+xxx <- dplyr::filter(markers,Marker=='Secretory Epithelial')
+
+brca1 <- cpm['ENSG00000012048',]
+brca2 <- cpm['ENSG00000139618',]
+# import secretory markers & get BRCA1/2
+plotList <- list()
+for(i in 1:nrow(xxx)){
+    yyy <- data.frame(
+      'BRCA2' = brca2,
+      'SecMarker' = cpm[xxx$ENSEMBL[i],]
+    )
+    corTestResult <- cor.test(yyy$BRCA2,yyy$SecMarker,method='spearman')
+    # print(
+      p <- ggplot(yyy,aes(x=BRCA2,y=SecMarker)) + theme_bw() + geom_point() + labs(title = xxx$SYMBOL[i],
+        subtitle = paste0(corTestResult$method,'=',signif(corTestResult$estimate,2),'; Pval=',signif(corTestResult$p.value,2))
+      ) + theme(plot.title = element_text(size=10),plot.subtitle = element_text(size=7)) + ylab(xxx$SYMBOL[i])
+    # )
+    plotList[[i]] <- p
+    # print(
+      
+    # )
+}
+library(gridExtra)
+ggsave(
+   filename = "Secretory_markers_BRCA2_correlation.pdf", 
+   plot = marrangeGrob(plotList, nrow=3, ncol=3), limitsize = FALSE,
+   width = 8.5, height = 8
+)
+
+```
+
+
+# top 2000 most variable genes, heatmap with 5 clustes as anno
+
+```{r get_top_2000}
+
+dim(cpm)
+
+vars <- matrixStats::rowVars(as.matrix(cpm))
+mostVar <- order(vars,decreasing=TRUE)
+
+
+```
+
+```{r build_heatmap_anno_topVar}
+
+# first assign cluster membership
+# Load the RNAseq samples + metadata
+m0 <- readxl::read_excel('~/Dropbox/Ian,\ Svetlana,\ Hui/canary/Tables1-3.xlsx',sheet='Table S1 Clinical Data'); 
+meta00 <- dplyr::filter(m0,useRNA_2==TRUE); dim(META)
+
+#===================================================================
+# also need to load our cluster membership from 5 group clustering!!
+c1 <- readRDS(file = '../canary_meth_Rproj/Fig5b_cluster_2_preFTs_highSec_cluster2.Pre.Rds') # 2,Pre is high sec - aka Luteal
+c2 <- readRDS(file = '../canary_meth_Rproj/Fig5b_preFTs_highPro_cluster3.Pre.Rds') # 3,Pre is high pro) - aka Follicular
+
+# get the clusters, they are sort of somewhat configured
+meta00$five_group_membership <- ifelse(
+  meta00$patientID%in%c1,'Luteal',
+  ifelse(meta00$patientID%in%c2,'Follicular',
+  ifelse(meta00$ReproductiveStatus=='Post','Postmeno',
+  ifelse(meta00$Postpartum,'Postpartum','Inactive')))
+)
+table(meta00$five_group_membership)
+meta00$MIR200cAvgBeta <- as.numeric(meta00$MIR200cAvgBeta)
+meta00$ReproductiveStatus <- ifelse(meta00$Postpartum,'Postpartum',meta00$ReproductiveStatus)
+table(meta00$ReproductiveStatus)
+
+haCol_rna_topVar <- HeatmapAnnotation(
+  `Age` = meta00$`Age at time of surgery`,
+  `Stromal Content` = meta00$MIR200cAvgBeta,
+  `Reproductive Status` = meta00$ReproductiveStatus,
+  `BRCAm` = meta00$groupBRCA,
+  `Path Report Menstrual Phase` = meta00$menstrPh_by_Endom,
+  `Cluster Membership` = meta00$five_group_membership,
+  col = list(
+    `Stromal Content` = circlize::colorRamp2(
+                              breaks = seq(from = 0, to = 1, length = 20),
+                              colors = viridis::cividis(20)
+    ),
+    `Age` = circlize::colorRamp2(
+                              breaks = seq(from = 20, to = 72, length = 20),
+                              colors = colorRampPalette(c("gray75", "black"))(20)
+    ),
+    `Reproductive Status` = c(
+      'Pre' = "#28BBECFF",
+      'Post' = "#FB8022FF",
+      'Postpartum' = 'grey33'
+    ),
+    `BRCAm` = c(
+      # 'BRCA1' = '#40498e',
+      'BRCA1' = '#7df5f5',
+      'BRCA2' = '#38aaac',
+      'NON-BRCA' = 'black'
+    ),
+    Race = c(
+      'Asian' = '#30123BFF',
+      'Black' = "#28BBECFF",
+      'East Indian' = "#A2FC3CFF",
+      'Hispanic Latino/White' = "#FB8022FF",
+      'White' = "#7A0403FF",
+      'Other' = 'gray48'
+    ),
+    `Path Report Menstrual Phase` = c(
+      'Weakly Proliferative'='#92C5DE',
+      'Proliferative' = '#0096FF',
+      'Late Proliferative/Early Secretory'='dodgerblue4',
+      'Secretory'= "#CA0020",
+      'Inactive'='black'
+    ),
+    `Cluster Membership` = c(
+      'Postmeno' = 'grey33',
+      'Postpartum' = '#FB8022FF',
+      'Follicular' = '#0096FF',
+      'Luteal' = '#CA0020',
+      'Inactive' = 'black'
+    ),
+    `Surgical Indication` = c(
+      'Benign Uterine'='#8DD3C7',
+      'Cesarean Section'='#FCCDE5',
+      'Cervical Dysplasia'='#BEBADA',
+      'Menorrhagia'='#FB8072',
+      'Endometriosis'='#80B1D3',
+      'Ovarian Serous Cystadenoma'='#FDB462',
+      # 'Ovarian Cyst (Sex chord stromal tumor)'='#B3DE69',
+      'Ovarian Cyst'='pink3',
+      'Pelvic mass'='#D9D9D9',
+      'Adnexal Mass' = '#BC80BD',
+      # 'Tubal Sterilization' = '#CCEBC5',
+      'Tubal Sterilization' = '#0BDA51',
+      'Gender Affirmation'='#FFED6F',
+      # 'Risk Reduction' = '#B3DE69'
+      'Risk Reduction' = 'green'
+    )
+  ),na_col='white'
+)
+
+```
+
+```{r heatmap_topVar,fig.height=11,fig.width=10}
+matZscore <- t(scale(t(cpm[mostVar[1:2000],meta00$SVC]),center=TRUE))
+matZscore[matZscore>2] <- 2
+matZscore[matZscore<(-2)] <- -2
+
+hm5grp <- ComplexHeatmap::Heatmap(matZscore,
+  show_column_names = TRUE,
+  show_row_names = FALSE,
+  col=viridis::viridis(n=100),
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  cluster_column_slices = FALSE,
+  clustering_distance_rows = 'euclidean',
+  heatmap_legend_param = list(title='Zscore CPM'),
+  row_title_gp = gpar(fontsize = 9),
+  row_names_gp = gpar(fontsize = 4),
+  column_names_rot = 90,
+  column_names_gp = gpar(
+    fontsize = 5#,
+    # col = myPosColors
+  ),
+  column_title = "", 
+  column_title_gp = gpar(fontsize = 10),
+  top_annotation = haCol_rna_topVar,
+  heatmap_width = unit(5, "in"),  
+  heatmap_height = unit(9, "in"),  
+  row_title_rot = 0,
+  # column_split = meta00$clusterMembership
+)
+
+pdf('topVar_genes_5grp.pdf',width = 10,height = 11); hm5grp; dev.off()
+
+
+
+```
+
